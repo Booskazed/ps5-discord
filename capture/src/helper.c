@@ -630,16 +630,21 @@ static int query_buffers(struct capture *c, intptr_t base, uint32_t mode, const 
 }
 #endif
 
-// Firmware 13.60: registers as the 13.00 sequence does (id 12), reads the encoder service's status and buffer
-// descriptors as SceRemotePlay does (logged), then tries each parameter block once, without and then with
-// EnableScanInEncode (SceRemotePlay never calls it): 13.60's block with the descriptors, 13.60's block alone,
-// 13.00's block. Returns 1 once the encoder is open, 0 when all were refused, -1 when the session must end.
+// Firmware 13.60: registers as the 13.00 sequence does (id 12) and calls EnableScanInEncode as it does, then reads
+// the encoder service's status and buffer descriptors as SceRemotePlay does (logged), then tries each parameter
+// block once: 13.60's block with the descriptors, 13.60's block alone, 13.00's block. Without EnableScanInEncode
+// the encoder opens and starts but is not given the display (community.13's Go Live: a 218-byte key frame and
+// 41-byte pictures for three minutes, a black screen). Returns 1 once the encoder is open, 0 when all were
+// refused, -1 when the session must end.
 static int open_1360(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, int64_t *rc)
 {
     struct buffers bufs = {{0}, {0}};
     int have = 0;
     *rc = SL_CALL_ERROR;
     if (arbitrate(c, base, FEATURE, 0)) return -1;
+    const int64_t scan = REMOTE(c, ENABLE_SCAN);
+    if (scan == SL_CALL_ERROR) return -1;
+    if (!good(scan)) log_line("EnableScanInEncode was refused (0x%llx); the picture may be blank", (unsigned long long)scan);
 #ifdef SL_PS5
     probe_status(c, base);
     have = query_buffers(c, base, *mode, req, &bufs) == 0;
@@ -647,15 +652,12 @@ static int open_1360(struct capture *c, intptr_t base, uint32_t *mode, const str
 #endif
     static const enum open_kind plan[] = {OPEN_13_60_BUFFERS, OPEN_13_60, OPEN_13_00};
     static const char *const names[] = {"13.60 block with the service's buffers", "13.60 block", "13.00 block"};
-    for (unsigned scan = 0; scan < 2; scan++) {
-        if (scan && !good(REMOTE(c, ENABLE_SCAN))) return -1;
-        for (unsigned k = 0; k < sizeof plan / sizeof *plan; k++) {
-            if (plan[k] == OPEN_13_60_BUFFERS && !have) continue;
-            const int ok = open_encoder(c, base, mode, req, plan[k], &bufs, 0, rc) == 0;
-            log_line("probe: %s, EnableScanInEncode %s -> 0x%llx", names[k], scan ? "on" : "off", (unsigned long long)*rc);
-            if (ok) { c->kind = plan[k]; c->bufs = bufs; return 1; }
-            if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined) return -1;
-        }
+    for (unsigned k = 0; k < sizeof plan / sizeof *plan; k++) {
+        if (plan[k] == OPEN_13_60_BUFFERS && !have) continue;
+        const int ok = open_encoder(c, base, mode, req, plan[k], &bufs, 0, rc) == 0;
+        log_line("probe: %s -> 0x%llx", names[k], (unsigned long long)*rc);
+        if (ok) { c->kind = plan[k]; c->bufs = bufs; return 1; }
+        if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined) return -1;
     }
     return 0;
 }
@@ -1071,9 +1073,10 @@ static int lab_try(struct capture *c, intptr_t base, uint32_t *mode, const struc
 // Reads pictures from the started encoder and logs what they say about the picture: Annex-B units for a real
 // display are tens of kilobytes for a 720p key frame, a few hundred bytes when the encoder is given nothing to
 // encode (community.13's Go Live: a 218-byte key frame and 41-byte pictures for three minutes, a black screen).
-// Returns 0 when pictures were read, -1 when the session cannot go on.
+// Returns 0 when pictures were read (*largest: the size of the largest), -1 when the session cannot go on.
 #define LAB_PICTURES 60u
-static int lab_pictures(struct capture *c, intptr_t base, const char *what)
+#define LAB_REAL_PICTURE 3000u // a picture bigger than this is not a flat one
+static int lab_pictures(struct capture *c, intptr_t base, const char *what, size_t *biggest)
 {
     uint8_t headers[0x200] = {0};
     if (sl_inject_write_at(&c->ctx, base + 0x2000, headers, sizeof headers) == 0) {
@@ -1113,6 +1116,7 @@ static int lab_pictures(struct capture *c, intptr_t base, const char *what)
     }
     log_line("lab: %s: %u pictures, %u key frames (the first %zu bytes), largest %zu, largest other %zu, %llu bytes in all", what,
              pictures, keys, first_key, largest, largest_p, total);
+    *biggest = largest;
     return 0;
 }
 
@@ -1235,8 +1239,13 @@ static int lab_run(void)
         {"id 0xb9, scan on", 0xb9u, 2, 1},
     };
     int scan_on = 0;
+    size_t biggest = 0; // the largest picture of any test so far
     for (unsigned t = 0; t < sizeof tests / sizeof *tests && result == 0; t++) {
         const struct lab_test *test = &tests[t];
+        if (t >= 2 && biggest > LAB_REAL_PICTURE) { // scan off and on were both seen; a setting that works: the others are not worth the risk of more registrations
+            log_line("lab: pictures of %zu bytes: the remaining settings are not tried", biggest);
+            break;
+        }
         if (c.feature != test->feature && arbitrate(&c, base, test->feature, test->feature == FEATURE ? 0 : (uint64_t)c.ctx.target_pid)) {
             log_line("lab: %s: the arbitrator refused the id", test->what);
             if (c.failed || c.ctx.quarantined) result = -1;
@@ -1256,7 +1265,9 @@ static int lab_run(void)
         }
         const int started = lab_try(&c, base, &mode, &req, test->what);
         if (started < 0) { result = -1; break; }
-        if (started == 1 && (lab_pictures(&c, base, test->what) || lab_stop(&c))) result = -1;
+        size_t largest = 0;
+        if (started == 1 && (lab_pictures(&c, base, test->what, &largest) || lab_stop(&c))) result = -1;
+        if (largest > biggest) biggest = largest;
     }
     // Then how this helper's block compares with SceRemotePlay's for the profiles and bitrates Go Live offers
     // (the differing words are logged; nothing is opened).
