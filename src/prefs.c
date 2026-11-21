@@ -8,6 +8,23 @@
 
 #include "log.h"
 
+#ifdef __PROSPERO__
+#include <stddef.h>
+#include <stdint.h>
+#include <sys/types.h>
+#include <sys/sysctl.h>
+
+// The wireless Go Live (the console's hardware encoder, capture/) was only ever seen to work on
+// firmware 13.00; on 13.60 sceAvcap2OpenVideo answers 0x81950008 (upstream issue #11). Anywhere else,
+// and when the firmware cannot be read, the default method is Remote Play (legacy), which works.
+static int encoder_firmware_validated(void)
+{
+    uint32_t sdk = 0;
+    size_t len = sizeof sdk;
+    return sysctlbyname("kern.sdk_version", &sdk, &len, NULL, 0) == 0 && len == sizeof sdk && (sdk >> 16) == 0x1300;
+}
+#endif
+
 typedef struct {
     const char *key;
     int min, max, def;
@@ -60,6 +77,11 @@ void prefs_load(const char *data_dir, int32_t user)
 {
     pthread_mutex_lock(&lock);
     snprintf(file, sizeof file, "%s/prefs-%08x", data_dir, (unsigned)user);
+#ifdef __PROSPERO__
+    pref *method = find("golive_method"); // a choice saved in the file below still wins
+    if (method)
+        method->def = encoder_firmware_validated() ? 0 : 1;
+#endif
     for (int i = 0; i < COUNT; i++)
         prefs[i].value = prefs[i].def;
     FILE *f = fopen(file, "r");
