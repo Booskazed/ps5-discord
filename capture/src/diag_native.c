@@ -14,7 +14,7 @@
 #include "diag_scan.h"
 
 #define PAGE 0x4000u
-#define IMAGE_CAP (96u << 20) // how much of the main module's image is looked at
+#define IMAGE_CAP (96u << 20) // how much of a module's image is looked at
 #define HOLES_MAX 32u         // unmapped pages tolerated inside the image
 #define BUDGET_MS 40000u
 #define SITES_MAX 4
@@ -38,18 +38,20 @@ static void hexdump(diag_log_fn log, const uint8_t *p, uint64_t addr, size_t len
     }
 }
 
-void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const *name, size_t count, diag_log_fn log)
+// Reads the image mapped from `base`: 16 KiB pages, a few unmapped holes tolerated, at most `cap` bytes.
+// Execute-only code, the usual state of a system process's text, is given read permission for the length
+// of one read and put back exactly as it was. Returns a calloc'd buffer of *len_out bytes (the pages that
+// could not be read stay zero), or NULL when nothing is mapped there. `what` names the module in the log.
+static uint8_t *read_image(sl_inject *ctx, intptr_t base, size_t cap, uint64_t t0, const char *what,
+                           diag_log_fn log, size_t *len_out)
 {
-    const uint64_t t0 = now();
     const pid_t pid = ctx->target_pid;
-    const intptr_t base = kernel_dynlib_mapbase_addr(pid, 0); // handle 0: the main executable
-    log("diag: SceRemotePlay pid %d, main module base 0x%llx", (int)pid, (unsigned long long)base);
-    if (base <= 0 || count == 0 || count > FUNCS_MAX) return;
+    *len_out = 0;
 
-    // How far the module's image reaches: mapped 16 KiB pages from its base, a few holes tolerated.
-    const size_t total = IMAGE_CAP / PAGE;
+    // How far the image reaches: mapped 16 KiB pages from its base, a few holes tolerated.
+    const size_t total = cap / PAGE;
     int *prot = malloc(total * sizeof *prot);
-    if (!prot) return;
+    if (!prot) return NULL;
     size_t pages = 0, holes = 0;
     for (size_t i = 0; i < total && holes <= HOLES_MAX; i++) {
         prot[i] = kernel_get_vmem_protection(pid, base + (intptr_t)(i * PAGE), PAGE);
@@ -57,10 +59,10 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
         holes = 0;
         pages = i + 1;
     }
-    if (!pages) { log("diag: nothing is mapped at the module base"); free(prot); return; }
+    if (!pages) { log("diag: nothing is mapped at the base of %s", what); free(prot); return NULL; }
     const size_t len = pages * PAGE;
     uint8_t *img = calloc(1, len);
-    if (!img) { free(prot); return; }
+    if (!img) { free(prot); return NULL; }
 
     // The protections of the image, as the console reports them.
     int kinds[8];
@@ -72,7 +74,7 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
         if (k == nkinds && nkinds < 8) kinds[nkinds++] = prot[i];
         if (k < nkinds) kind_pages[k]++;
     }
-    for (size_t k = 0; k < nkinds; k++) log("diag: %zu pages with protection 0x%x", kind_pages[k], (unsigned)kinds[k]);
+    for (size_t k = 0; k < nkinds; k++) log("diag: %s: %zu pages with protection 0x%x", what, kind_pages[k], (unsigned)kinds[k]);
 
     size_t read_ok = 0, mapped = 0, via_prot = 0, unreadable = 0;
     for (size_t i = 0; i < pages; i++) {
@@ -82,8 +84,8 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
         uint8_t *dst = img + i * PAGE;
         const intptr_t at = base + (intptr_t)(i * PAGE);
         if (sl_inject_read_at(ctx, at, dst, PAGE) == 0 || sl_inject_read_code_at(ctx, at, dst, PAGE) == 0) { read_ok++; continue; }
-        // Execute-only code, the usual state of a system process's text: give the page read permission for
-        // the length of one read, then put its protection back exactly as it was, and check that it is.
+        // Execute-only code: give the page read permission for the length of one read, then put its
+        // protection back exactly as it was, and check that it is.
         if (!(prot[i] & PROT_EXEC)) { unreadable++; continue; }
         if (kernel_set_vmem_protection(pid, at, PAGE, prot[i] | PROT_READ) != 0) { unreadable++; continue; }
         const int rd = sl_inject_read_at(ctx, at, dst, PAGE);
@@ -97,7 +99,24 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
         }
         if (rd == 0) { read_ok++; via_prot++; } else unreadable++;
     }
-    log("diag: image 0x%zx bytes, %zu mapped pages, %zu read (%zu of them with read permission given for the read), %zu not readable", len, mapped, read_ok, via_prot, unreadable);
+    log("diag: %s: image 0x%zx bytes, %zu mapped pages, %zu read (%zu of them with read permission given for the read), %zu not readable",
+        what, len, mapped, read_ok, via_prot, unreadable);
+    free(prot);
+    *len_out = len;
+    return img;
+}
+
+void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const *name, size_t count, diag_log_fn log)
+{
+    const uint64_t t0 = now();
+    const pid_t pid = ctx->target_pid;
+    const intptr_t base = kernel_dynlib_mapbase_addr(pid, 0); // handle 0: the main executable
+    log("diag: SceRemotePlay pid %d, main module base 0x%llx", (int)pid, (unsigned long long)base);
+    if (base <= 0 || count == 0 || count > FUNCS_MAX) return;
+
+    size_t len = 0;
+    uint8_t *img = read_image(ctx, base, IMAGE_CAP, t0, "SceRemotePlay", log, &len);
+    if (!img) return;
 
     // Where each function's address is stored (the import slots of this module).
     uint64_t want[FUNCS_MAX];
@@ -146,5 +165,44 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
     }
     log("diag: done in %llu ms", (unsigned long long)(now() - t0));
     free(img);
-    free(prot);
+}
+
+static int write_file(const char *path, const uint8_t *data, size_t len)
+{
+    FILE *f = fopen(path, "wb");
+    if (!f) return -1;
+    const size_t n = fwrite(data, 1, len, f);
+    return fclose(f) == 0 && n == len ? 0 : -1;
+}
+
+void diag_native_dump(sl_inject *ctx, const char *dir, diag_log_fn log)
+{
+    static const struct { const char *module, *file; } images[] = {
+        {NULL, "remoteplay-image.bin"},
+        {"libSceAvcap2.sprx", "avcap2-image.bin"},
+        {"libSceResourceArbitrator.sprx", "arbitrator-image.bin"},
+    };
+    const uint64_t t0 = now();
+    const pid_t pid = ctx->target_pid;
+    char path[256];
+    snprintf(path, sizeof path, "%s/dump-index.txt", dir);
+    FILE *index = fopen(path, "w"); // one line per image: file, module, load address, size
+    for (size_t i = 0; i < sizeof images / sizeof *images; i++) {
+        const char *what = images[i].module ? images[i].module : "SceRemotePlay";
+        const intptr_t base = images[i].module ? sl_module_base(pid, images[i].module) : kernel_dynlib_mapbase_addr(pid, 0);
+        if (base <= 0) { log("diag: %s is not loaded in pid %d", what, (int)pid); continue; }
+        size_t len = 0;
+        uint8_t *img = read_image(ctx, base, IMAGE_CAP, t0, what, log, &len);
+        if (!img) continue;
+        snprintf(path, sizeof path, "%s/%s", dir, images[i].file);
+        if (write_file(path, img, len)) {
+            log("diag: could not write %s", path);
+        } else {
+            log("diag: wrote %s: %zu bytes of %s, loaded at 0x%llx", path, len, what, (unsigned long long)base);
+            if (index) fprintf(index, "%s %s base=0x%llx size=0x%zx\n", images[i].file, what, (unsigned long long)base, len);
+        }
+        free(img);
+    }
+    if (index) fclose(index);
+    log("diag: images done in %llu ms", (unsigned long long)(now() - t0));
 }

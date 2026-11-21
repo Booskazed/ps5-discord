@@ -36,6 +36,7 @@
 #include "inject_broker.h"
 #include "h264_timing.h"
 #ifdef SL_PS5
+#include <sys/sysctl.h>
 #include "diag_native.h"
 #endif
 #ifdef SL_PS5
@@ -421,6 +422,53 @@ static int wait_stable_mode(struct capture *c, uint32_t *stable, unsigned budget
     return -1;
 }
 
+// Firmware 13.00 is the one this sequence was validated on. Anywhere else (13.60: upstream issue #11,
+// sceAvcap2OpenVideo answers 0x81950008) the extra attempts below run; the host tests stand for 13.00.
+static int firmware_is_13_00(void)
+{
+#ifdef SL_PS5
+    uint32_t sdk = 0;
+    size_t len = sizeof sdk;
+    return sysctlbyname("kern.sdk_version", &sdk, &len, NULL, 0) == 0 && len == sizeof sdk && (sdk >> 16) == 0x1300;
+#else
+    return 1;
+#endif
+}
+
+// SceRemotePlay's own code asks again when sceAvcap2OpenVideo answers 0x81950008 (it waits up to 4 s,
+// 16 ms apart, reading the output mode again each time). So does this, with a longer step to spare the log.
+#define OPEN_BUSY 0x81950008u
+#ifndef OPEN_RETRIES
+#define OPEN_RETRIES 16u
+#define OPEN_RETRY_US 250000u
+#endif
+
+// Writes the parameter block and opens the encoder, asking again while it answers OPEN_BUSY (the block is
+// rebuilt each time with the output mode as it is then). Returns 0 once the encoder is open, -1 otherwise;
+// *rc is the last answer (SL_CALL_ERROR when the transport failed).
+static int open_encoder(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req,
+                        unsigned retries, int64_t *rc)
+{
+    uint8_t video[0x2e8];
+    *rc = SL_CALL_ERROR;
+    for (unsigned attempt = 0;; attempt++) {
+        video_params(video, *mode, req);
+        if (sl_inject_write_at(&c->ctx, base, video, sizeof video)) return -1;
+        *rc = REMOTE(c, OPEN_VIDEO, base, base + 8, 0);
+        if (good(*rc)) return 0;
+        if (*rc == SL_CALL_ERROR || (uint32_t)*rc != OPEN_BUSY || attempt >= retries || quit || net_dead ||
+            stop_requested || c->ctx.quarantined)
+            return -1;
+        if (!attempt)
+            log_line("OpenVideo is busy (0x%x); asking again for up to %u ms", OPEN_BUSY, retries * OPEN_RETRY_US / 1000u);
+        usleep(OPEN_RETRY_US);
+        beat();
+        net_poll(NULL, &(int){1}, 0);
+        uint32_t fresh = 0;
+        if (read_mode(c, &fresh) == 0 && fresh) *mode = fresh;
+    }
+}
+
 static void cleanup(struct capture *c)
 {
     c->cleanup = 1;
@@ -504,20 +552,33 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
     c.callback = 1;
     static const char running[] = "RUNNING";
     if (sl_inject_write_at(&c.ctx, base + 0x600, running, sizeof running) ||
-        !good(REMOTE(&c, CHANGE_STATE, FEATURE, base + 0x600)) ||
-        !good(REMOTE(&c, ENABLE_SCAN))) goto done;
-    uint8_t video[0x2e8];
-    video_params(video, mode, req);
+        !good(REMOTE(&c, CHANGE_STATE, FEATURE, base + 0x600))) goto done;
     int64_t open_rc = SL_CALL_ERROR;
-    if (sl_inject_write_at(&c.ctx, base, video, sizeof video) ||
-        !good(open_rc = REMOTE(&c, OPEN_VIDEO, base, base + 8, 0))) {
+    int opened = 0;
+    // SceRemotePlay on 13.60 imports no EnableScanInEncode, so it never calls it. On a firmware this
+    // sequence was not validated on, try the encoder without it first; if it still refuses, call it
+    // as before and ask again for a few seconds, like SceRemotePlay does.
+    if (!firmware_is_13_00()) {
+        log_line("firmware not validated: opening the encoder without EnableScanInEncode first");
+        opened = open_encoder(&c, base, &mode, req, 2, &open_rc) == 0;
+        if (!opened && (open_rc == SL_CALL_ERROR || quit || net_dead || stop_requested)) goto done;
+    }
+    if (!opened) {
+        if (!good(REMOTE(&c, ENABLE_SCAN))) goto done;
+        opened = open_encoder(&c, base, &mode, req, OPEN_RETRIES, &open_rc) == 0;
+    }
+    if (!opened) {
 #ifdef SL_PS5
         // 0x81950008 on firmware 13.60 (upstream issue #11): log how SceRemotePlay's own code calls the same
-        // functions, read-only, so the sequence and the parameter block it builds can be compared with ours.
-        if (open_rc != SL_CALL_ERROR && (uint32_t)open_rc == 0x81950008u && !c.ctx.quarantined)
+        // functions, and write the images of the modules involved next to the log, read-only, so the
+        // sequence and the parameter block it builds can be compared with ours offline.
+        if (open_rc != SL_CALL_ERROR && (uint32_t)open_rc == OPEN_BUSY && !c.ctx.quarantined) {
             diag_native_sequence(&c.ctx, c.fn, symbols, REMOTE_GETPID, log_line);
+            beat();
+            diag_native_dump(&c.ctx, CAP_DIR, log_line);
+            beat();
+        }
 #endif
-        (void)open_rc;
         why("The console's encoder would not open.");
         goto done;
     }
