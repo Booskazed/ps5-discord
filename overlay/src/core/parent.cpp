@@ -49,6 +49,16 @@ static bool target(Request& r){
     }
     std::free(data);return matches==1&&r.pid>1&&r.epoch;
 }
+// The firmwares this overlay may run on, as kern.sdk_version >> 16 and as the kernel's firmware
+// version. 13.00 is where the hook offsets, colours, button bits and Mono signatures were measured.
+// 13.60 is allowed explicitly: worker.cpp still checks every method and signature and refuses
+// cleanly if SceShellUI differs, and every other refusal below is unchanged.
+static const std::uint32_t allowed_sdk[]={0x1300U,0x1360U};
+static const std::uint32_t allowed_fw[]={0x13000000U,0x13600000U};
+static bool allowed(const std::uint32_t* list,std::size_t n,std::uint32_t v){
+    for(std::size_t i=0;i<n;++i)if(list[i]==v)return true;
+    return false;
+}
 static int run(){
     // kabuki-style SDK probe: works without the kernel bridge (kern.sdk_version).
     std::uint32_t sdk=0;std::size_t sdk_len=sizeof sdk;
@@ -56,8 +66,8 @@ static int run(){
     auto fw=kernel_get_fw_version();
     note("START build=%016llx firmware=%08x sdk=%08x mode=%s",
         (unsigned long long)OVERLAY_BUILD,fw,have_sdk?sdk:0,mode_names[OVERLAY_MODE]);
-    if(have_sdk){if((sdk>>16)!=0x1300U){note("REFUSED: only FW13.00 selected for this diagnostic");return 1;}}
-    else if(fw&&fw!=0x13000000U){note("REFUSED: only FW13.00 selected for this diagnostic");return 1;}
+    if(have_sdk){if(!allowed(allowed_sdk,sizeof allowed_sdk/sizeof*allowed_sdk,sdk>>16)){note("REFUSED: only FW13.00 and FW13.60 are allowed (sdk=%08x)",sdk);return 1;}}
+    else if(fw&&!allowed(allowed_fw,sizeof allowed_fw/sizeof*allowed_fw,fw)){note("REFUSED: only FW13.00 and FW13.60 are allowed (firmware=%08x)",fw);return 1;}
     else note("NOTE fw unknown (kernel query and kern.sdk_version both unavailable); relying on method/signature checks");
     Request r;r.build=OVERLAY_BUILD;r.mode=static_cast<Mode>(OVERLAY_MODE);
     if(!target(r)){note("REFUSED: unique ShellUI PID/start identity missing");return 1;}
