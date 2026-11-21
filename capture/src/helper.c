@@ -1046,11 +1046,10 @@ done:
 #ifdef SL_PS5
 // Lab mode: the helper started by hand through elfldr, not by the core, with the file CAP_DIR "/lab" present
 // (the file is removed first, so the next start is a normal one). No core and no Discord: on a fixed profile
-// (720p60, 6 Mbit/s) it tries, one after the other, the combinations that could make 13.60's encoder accept
-// Start, logs every answer (the "lab:" lines) and, if one is accepted, reads the picture headers and a few
-// pictures to see what 13.60 returns for them. Only 13.60's block with the service's buffers is used (it is the
-// one that opens the encoder there); the combinations are the arbitrator id, EnableScanInEncode and the encoder
-// variant of the block.
+// (720p60, 6 Mbit/s) it opens, starts and reads the encoder under each combination that could change what it
+// encodes (the arbitrator id, EnableScanInEncode, the encoder variant of the block), logs every answer and the
+// size of the pictures it gets (the "lab:" lines), and compares this helper's block with SceRemotePlay's own.
+// Only 13.60's block with the service's buffers is used (it is the one that opens the encoder there).
 static int lab_try(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, const char *what)
 {
     int64_t rc = SL_CALL_ERROR;
@@ -1069,29 +1068,64 @@ static int lab_try(struct capture *c, intptr_t base, uint32_t *mode, const struc
     return 0;
 }
 
-static void lab_pictures(struct capture *c, intptr_t base)
+// Reads pictures from the started encoder and logs what they say about the picture: Annex-B units for a real
+// display are tens of kilobytes for a 720p key frame, a few hundred bytes when the encoder is given nothing to
+// encode (community.13's Go Live: a 218-byte key frame and 41-byte pictures for three minutes, a black screen).
+// Returns 0 when pictures were read, -1 when the session cannot go on.
+#define LAB_PICTURES 60u
+static int lab_pictures(struct capture *c, intptr_t base, const char *what)
 {
     uint8_t headers[0x200] = {0};
     if (sl_inject_write_at(&c->ctx, base + 0x2000, headers, sizeof headers) == 0) {
         const int64_t rc = REMOTE(c, HEADERS, c->video, base + 0x2000);
-        log_line("lab: picture headers -> 0x%llx", (unsigned long long)rc);
-        if (sl_inject_read_at(&c->ctx, base + 0x2000, headers, sizeof headers) == 0) hex_line("lab: headers", headers, 0x40);
+        log_line("lab: %s: picture headers -> 0x%llx", what, (unsigned long long)rc);
+        if (rc == SL_CALL_ERROR) return -1;
     }
-    const int64_t frame = REMOTE(c, REMOTE_MALLOC, FRAME_CAP);
-    if (frame == SL_CALL_ERROR || frame <= 0) return;
-    c->remote_frame = (uint64_t)frame;
-    log_line("lab: key frame request -> 0x%llx", (unsigned long long)REMOTE(c, KEYFRAME, c->video));
-    for (unsigned i = 0; i < 40 && !c->failed && !c->ctx.quarantined; i++) {
+    if (!c->remote_frame) {
+        const int64_t frame = REMOTE(c, REMOTE_MALLOC, FRAME_CAP);
+        if (frame == SL_CALL_ERROR) return -1;
+        if (frame <= 0) return 0;
+        c->remote_frame = (uint64_t)frame;
+    }
+    unsigned pictures = 0, keys = 0;
+    size_t first_key = 0, largest = 0, largest_p = 0;
+    unsigned long long total = 0;
+    for (unsigned i = 0; i < LAB_PICTURES && !c->failed && !c->ctx.quarantined; i++) {
+        if (i == 0 || i == LAB_PICTURES / 2) {
+            const int64_t rc = REMOTE(c, KEYFRAME, c->video);
+            if (rc == SL_CALL_ERROR) return -1;
+        }
         const int64_t n = REMOTE(c, READ_VIDEO, c->video, c->remote_frame, FRAME_CAP, base + 0x300, 0);
-        log_line("lab: ReadVideo -> 0x%llx", (unsigned long long)n);
+        if (n == SL_CALL_ERROR) return -1;
         if (n > 0 && n <= FRAME_CAP) {
-            uint8_t head[0x40];
+            uint8_t head[0x100]; // enough for the units that may come before the key frame's slice
             const size_t m = (size_t)n < sizeof head ? (size_t)n : sizeof head;
-            if (sl_inject_read_at(&c->ctx, (intptr_t)c->remote_frame, head, m) == 0) hex_line("lab: picture", head, m);
+            const int key = sl_inject_read_at(&c->ctx, (intptr_t)c->remote_frame, head, m) == 0 && has_nal(head, m, 5);
+            pictures++;
+            total += (unsigned long long)n;
+            if ((size_t)n > largest) largest = (size_t)n;
+            if (key) { if (!keys++) first_key = (size_t)n; }
+            else if ((size_t)n > largest_p) largest_p = (size_t)n;
+            if (pictures <= 4) log_line("lab: %s: picture %u: %lld bytes%s", what, pictures, (long long)n, key ? " (key frame)" : "");
         }
         usleep(50000);
         beat();
     }
+    log_line("lab: %s: %u pictures, %u key frames (the first %zu bytes), largest %zu, largest other %zu, %llu bytes in all", what,
+             pictures, keys, first_key, largest, largest_p, total);
+    return 0;
+}
+
+// Stops and closes the encoder the lab opened (the lab opens it several times). 0 on success.
+static int lab_stop(struct capture *c)
+{
+    if (!c->video_open) return 0;
+    if (c->video_start_attempted && !good(REMOTE(c, STOP, c->video))) return -1;
+    if (!good(REMOTE(c, CLOSE, c->video))) return -1;
+    c->video_open = 0; c->video_start_attempted = 0; c->video = 0;
+    usleep(300000);
+    beat();
+    return 0;
 }
 
 // SceRemotePlay's own functions that build the 13.60 block, as offsets in its main module (read from its image;
@@ -1113,10 +1147,10 @@ static int64_t lab_call(struct capture *c, intptr_t fn, uint64_t a0, uint64_t a1
     return rc;
 }
 
-// The lab's most telling test: have SceRemotePlay's own code build the block, on a new Glint object in its heap
-// (nothing it owns is touched). Logs every word where this helper's block differs from it, then opens the encoder
-// and starts it with SceRemotePlay's block. Returns 1 if Start was accepted, 0 if not, -1 when the session cannot go on.
-static int lab_native(struct capture *c, intptr_t base, uint32_t mode, const struct start_req *req, int open_it)
+// Has SceRemotePlay's own code build the block, on a new Glint object in its heap (nothing it owns is touched),
+// and logs every word where this helper's block differs from it (that is how word 0xdc was found). Returns 1 when
+// the two are identical, 0 when not (or when it cannot be done here), -1 when the session cannot go on.
+static int lab_native(struct capture *c, intptr_t base, uint32_t mode, const struct start_req *req)
 {
     const intptr_t rp = diag_native_main_base(&c->ctx);
     if (rp <= 0 || c->fn[REMOTE_MEMSET] <= 0) { log_line("lab: SceRemotePlay's own block: not possible here"); return 0; }
@@ -1158,89 +1192,86 @@ static int lab_native(struct capture *c, intptr_t base, uint32_t mode, const str
     }
     log_line("lab: SceRemotePlay's own block (selector %u, %u fps, %u bit/s): %u of %zu words differ from this helper's",
              req->selector, req->fps, req->bitrate, differing, sizeof ours / 4);
-    if (!open_it) { (void)REMOTE(c, REMOTE_FREE, obj); return 0; }
-    const int64_t opened = REMOTE(c, OPEN_VIDEO, obj + 0x38, obj + 0x40, 0);
-    log_line("lab: SceRemotePlay's own block: OpenVideo -> 0x%llx", (unsigned long long)opened);
-    if (!good(opened)) return opened == SL_CALL_ERROR ? -1 : 0;
-    c->video_unknown = 1;
-    if (sl_inject_read_at(&c->ctx, obj + 0x38, &c->video, 8) || !c->video) { c->cleanup_failed = 1; return -1; }
-    c->video_unknown = 0;
-    c->video_open = 1;
-    if (prepare_stream_buffer(c, base)) return -1;
-    c->video_start_attempted = 1;
-    const int64_t started = REMOTE(c, START, c->video);
-    log_line("lab: SceRemotePlay's own block: Start -> 0x%llx", (unsigned long long)started);
-    if (good(started)) return 1;
-    if (started == SL_CALL_ERROR) return -1;
-    if (!good(REMOTE(c, CLOSE, c->video))) return -1;
-    c->video_open = 0; c->video_start_attempted = 0; c->video = 0;
     (void)REMOTE(c, REMOTE_FREE, obj);
-    return 0;
+    return differing ? 0 : 1;
 }
+
+// What one picture test changes: the arbitrator id (and the id in the block), the encoder variant, and whether
+// EnableScanInEncode has been called (it cannot be undone from here, so the tests that need it come after the ones
+// that do not).
+struct lab_test { const char *what; uint32_t feature, variant; int scan; };
 
 static int lab_run(void)
 {
     struct start_req req = {.selector = 3, .fps_flag = 1, .bitrate = 6000000, .width = 1280, .height = 720, .fps = 60};
     struct capture c = {.startup_deadline = now_ms() + 600000u, .feature = FEATURE, .variant = 2};
-    int result = 1; // 1: nothing accepted, 0: Start accepted, -1: the session cannot go on
-    log_line("lab: 720p60 at %u bit/s, no core; trying what could make Start accepted", req.bitrate);
+    int result = 0; // -1: the session cannot go on
+    log_line("lab: 720p60 at %u bit/s, no core; which setting makes the encoder see the display?", req.bitrate);
     if (sl_inject_begin("SceRemotePlay", &c.ctx)) { log_line("lab: attach failed: stage=%s", c.ctx.stage); return 1; }
     const intptr_t base = c.ctx.scratch;
     uint32_t mode = 0;
-    if (c.ctx.scratch <= 0 || c.ctx.scratch_len < 0x4000 || bind_functions(&c)) { log_line("lab: setup failed"); goto end; }
-    if (!good(REMOTE(&c, INITIALIZE))) goto end;
+    if (c.ctx.scratch <= 0 || c.ctx.scratch_len < 0x4000 || bind_functions(&c)) { log_line("lab: setup failed"); result = -1; goto end; }
+    if (!good(REMOTE(&c, INITIALIZE))) { result = -1; goto end; }
     c.initialized = 1;
-    if (wait_stable_mode(&c, &mode, MODE_WAIT_MS)) { log_line("lab: no stable output mode"); goto end; }
+    if (wait_stable_mode(&c, &mode, MODE_WAIT_MS)) { log_line("lab: no stable output mode"); result = -1; goto end; }
     c.output_mode = mode;
-    if (arbitrate(&c, base, FEATURE, 0)) goto end;
+    if (arbitrate(&c, base, FEATURE, 0)) { result = -1; goto end; }
     probe_status(&c, base);
-    if (query_buffers(&c, base, mode, &req, &c.bufs)) { log_line("lab: no buffers from the service"); goto end; }
+    if (query_buffers(&c, base, mode, &req, &c.bufs)) { log_line("lab: no buffers from the service"); result = -1; goto end; }
     c.kind = OPEN_13_60_BUFFERS;
-    // First, how this helper's block compares with SceRemotePlay's for the profiles and bitrates Go Live offers
+    {
+        const intptr_t lib = sl_module_base(c.ctx.target_pid, "libSceAvcap2.sprx");
+        log_line("lab: %s is libSceAvcap2+0x%llx", symbols[ENABLE_SCAN], (unsigned long long)(c.fn[ENABLE_SCAN] - lib));
+    }
+    // Community.13 opened the encoder without EnableScanInEncode, which the 13.00 sequence calls before OpenVideo,
+    // and every picture of a three-minute Go Live was a few dozen bytes: the encoder was not given the display.
+    // Each test opens the encoder with this helper's block, starts it and reads pictures (keep something with
+    // detail on the screen: a key frame of a flat picture is 200 bytes, of a real one tens of kilobytes).
+    static const struct lab_test tests[] = {
+        {"id 12, scan off", FEATURE, 2, 0},
+        {"id 12, scan on", FEATURE, 2, 1},
+        {"id 12, scan on, variant 6", FEATURE, 6, 1},
+        {"id 0xb4, scan on", 0xb4u, 2, 1},
+        {"id 0xb9, scan on", 0xb9u, 2, 1},
+    };
+    int scan_on = 0;
+    for (unsigned t = 0; t < sizeof tests / sizeof *tests && result == 0; t++) {
+        const struct lab_test *test = &tests[t];
+        if (c.feature != test->feature && arbitrate(&c, base, test->feature, test->feature == FEATURE ? 0 : (uint64_t)c.ctx.target_pid)) {
+            log_line("lab: %s: the arbitrator refused the id", test->what);
+            if (c.failed || c.ctx.quarantined) result = -1;
+            continue;
+        }
+        c.variant = test->variant;
+        if (test->scan && !scan_on) {
+            const int64_t rc = REMOTE(&c, ENABLE_SCAN);
+            log_line("lab: EnableScanInEncode -> 0x%llx", (unsigned long long)rc);
+            if (!good(rc)) { result = -1; break; }
+            scan_on = 1;
+        }
+        if (t && query_buffers(&c, base, mode, &req, &c.bufs)) {
+            log_line("lab: %s: no buffers from the service", test->what);
+            if (c.failed || c.ctx.quarantined) result = -1;
+            continue;
+        }
+        const int started = lab_try(&c, base, &mode, &req, test->what);
+        if (started < 0) { result = -1; break; }
+        if (started == 1 && (lab_pictures(&c, base, test->what) || lab_stop(&c))) result = -1;
+    }
+    // Then how this helper's block compares with SceRemotePlay's for the profiles and bitrates Go Live offers
     // (the differing words are logged; nothing is opened).
     static const struct start_req profiles[] = {
         {3, 0, 4000000, 1280, 720, 30}, {3, 1, 6000000, 1280, 720, 60}, {4, 0, 6000000, 1920, 1080, 30},
         {4, 1, 8000000, 1920, 1080, 60}, {3, 1, 10000000, 1280, 720, 60}, {4, 1, 20000000, 1920, 1080, 60},
         {3, 0, 1000000, 1280, 720, 30}, {4, 0, 12500000, 1920, 1080, 30},
     };
-    for (unsigned p = 0; p < sizeof profiles / sizeof *profiles && c.ctx.attached && !c.failed && !c.ctx.quarantined; p++)
-        if (lab_native(&c, base, mode, &profiles[p], 0) < 0) { result = -1; break; }
-    if (result < 0) goto end;
-    result = lab_native(&c, base, mode, &req, 1);
-    if (result == 1) {
-        log_line("lab: START ACCEPTED (SceRemotePlay's own block)");
-        result = 0;
-        lab_pictures(&c, base);
-    } else if (result == 0) result = 1;
-    // Four steps that need two re-registrations and one EnableScanInEncode: id 12, id 0xb4 (SceRemotePlay's, with
-    // its process id), then EnableScanInEncode on, then id 12 again (with the process id). Two variants each.
-    static const uint32_t variants[] = {2, 6};
-    for (unsigned step = 0; step < 4 && result == 1; step++) {
-        const uint32_t feature = step == 0 || step == 3 ? FEATURE : 0xb4u;
-        if (step == 2) {
-            if (!good(REMOTE(&c, ENABLE_SCAN))) { result = -1; break; }
-            log_line("lab: EnableScanInEncode is now on");
-        } else if (c.feature != feature && arbitrate(&c, base, feature, (uint64_t)c.ctx.target_pid)) {
-            log_line("lab: the arbitrator refused id 0x%x", feature);
-            if (c.failed || c.ctx.quarantined) result = -1;
-            break;
-        }
-        for (unsigned v = 0; v < sizeof variants / sizeof *variants && result == 1; v++) {
-            char what[80];
-            c.variant = variants[v];
-            snprintf(what, sizeof what, "id 0x%x, scan %s, variant %u", feature, step >= 2 ? "on" : "off", c.variant);
-            const int r = lab_try(&c, base, &mode, &req, what);
-            if (r < 0) result = -1;
-            else if (r == 1) {
-                result = 0;
-                log_line("lab: START ACCEPTED (%s)", what);
-                lab_pictures(&c, base);
-            }
-        }
-    }
+    c.feature = FEATURE; c.variant = 2;
+    if (result == 0 && arbitrate(&c, base, FEATURE, 0)) result = -1;
+    for (unsigned p = 0; p < sizeof profiles / sizeof *profiles && result == 0 && c.ctx.attached && !c.failed && !c.ctx.quarantined; p++)
+        if (lab_native(&c, base, mode, &profiles[p]) < 0) result = -1;
 end:
     cleanup(&c);
-    log_line("lab: done (%s)", result == 0 ? "Start was accepted" : result == 1 ? "Start was refused every time" : "stopped early");
+    log_line("lab: done (%s)", result == 0 ? "all tests ran" : "stopped early");
     return result == 0 ? 0 : 1;
 }
 #endif
