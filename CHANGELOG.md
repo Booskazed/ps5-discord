@@ -74,6 +74,12 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   the app's Overlay page is no longer "Not in this build.".
 - `app/tools/fetch-opengl-sdk.sh` downloads the ps5-opengl SDK from `JVK3R/ps5-opengl`
   (`blackbearreloaded/ps5-opengl` answers 404); the pinned SHA-256 values are unchanged.
+- Side-by-side edition: the title (`src/app_paths.h`, `APP_TITLE_ID`) and the data folder
+  (`APP_DATA_DIR`) are build-time settings (`make EDITION_TITLE_ID=... EDITION_DATA_DIR=...`) instead
+  of constants spread over the core, the capture helper, the overlay and the controller audio worker.
+  The `build` workflow now also builds `PPSA99073` with data in `/data/ps5-discord-community`, which
+  installs next to the stock app without touching its files and has no updater; the stock build is
+  unchanged.
 - `make test` links the host tests with `-lm` when libdave is absent (the no-DAVE stub build the `test`
   workflow runs failed with "undefined reference to `sin'"; upstream `develop`'s `test` workflow was
   red since 45c8b78 for that reason).

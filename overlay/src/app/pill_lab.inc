@@ -16,7 +16,11 @@ namespace {
 namespace lab=pill_lab;
 constexpr std::uint32_t kLeft=1,kUp=2,kRight=4,kDown=8,kSquare=0x10,kTriangle=0x20,
     kCircle=0x40,kCross=0x80,kL1=0x400,kR1=0x800,kR2=0x2000;
+#ifdef OVERLAY_TITLE_ID
+constexpr const char* kArt="/user/data/homebrew/" OVERLAY_TITLE_ID "/assets/overlay/";
+#else
 constexpr const char* kArt="/user/data/homebrew/PPSA99072/assets/overlay/";
+#endif
 constexpr const char* kDir=PILL_LAB_DIR;
 constexpr Color kWhite{1,1,1,1},kDim{.70f,.74f,.80f,1},kCoral{1,.478f,.349f,1};
 void* background=nullptr,*live_icon=nullptr,*time_label=nullptr,*eye=nullptr,*count_label=nullptr,*mic=nullptr;

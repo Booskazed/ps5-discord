@@ -152,10 +152,20 @@ new options, that runs on firmware 13.60.
   to. `community` is the working branch (builds come from it); each topic lives on its own
   `fix/*` or `feat/*` branch and is merged into `community` once tested. Working fixes are offered
   back to upstream as pull requests against its `develop`.
-- **Builds.** Every push to `community` runs the `build` workflow (Actions tab) and uploads
-  `PPSA99072.zip` (the whole app: core with libdave, FFmpeg's AAC decoder, capture helper, overlay)
-  with a `SHA256SUMS`. A tag `v<VERSION>` also publishes a GitHub prerelease. Install as for any
-  release: replace `/data/homebrew/PPSA99072` with the zip's folder, app closed and core stopped.
+- **Builds.** Every push to `community` runs the `build` workflow (Actions tab) and uploads two
+  packages (the whole app each: core with libdave, FFmpeg's AAC decoder, capture helper, overlay),
+  each with a `SHA256SUMS`. A tag `v<VERSION>` also publishes a GitHub prerelease with both.
+  - **Stock** (`PPSA99072.zip`): the same title as upstream's app. Install as for any release:
+    replace `/data/homebrew/PPSA99072` with the zip's folder, app closed and core stopped.
+  - **Side by side** (`PPSA99073.zip`, home screen name "ps5-discord (community)"): its own title,
+    `PPSA99073`, and its own data folder, `/data/ps5-discord-community`, so it installs next to the
+    stock app and never reads or writes its files (sign in again once, with the QR code). Copy its
+    folder to `/data/homebrew/PPSA99073`. Only one of the two can run at a time, as both cores use
+    port 9041: quit one (Settings > Account > Quit) before starting the other. It has no updater (an
+    upstream release zip carries the stock title). To build one yourself:
+    `make EDITION_TITLE_ID=PPSA99073 EDITION_DATA_DIR=/data/ps5-discord-community RELEASE=1 all`, then
+    `cd app && make init TITLE_ID=PPSA99073 APP_NAME="ps5-discord (community)"` and
+    `EDITION_TITLE_ID=PPSA99073 EDITION_DATA_DIR=/data/ps5-discord-community RELEASE=1 make`.
 - **Versions.** `<upstream version>.community.<n>`, for example `0.6.0-alpha.2.community.1`.
   Never `-dev` (the app replaces a `-dev` core with the one it embeds).
 - **Updates.** The built-in updater is unchanged: it reads the upstream repository's releases and

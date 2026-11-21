@@ -55,7 +55,11 @@ namespace oui { namespace app {
 
 namespace {
 
+#ifdef OVERLAY_TITLE_ID // a side-by-side edition's title (overlay/Makefile)
+constexpr const char* kArt="/user/data/homebrew/" OVERLAY_TITLE_ID "/assets/overlay/";
+#else
 constexpr const char* kArt="/user/data/homebrew/PPSA99072/assets/overlay/";
+#endif
 constexpr const char* kAvatars="/user/data/discord-overlay-poc/av/";
 
 const Color kWhite{1,1,1,1};

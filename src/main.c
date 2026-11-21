@@ -38,10 +38,11 @@
 #include "stream.h"
 #include "tls.h"
 #include "update.h"
+#include "app_paths.h"
 
 #ifdef __PROSPERO__
-#define DATA_DIR "/data/ps5-discord"
-#define APP_DIR "/data/homebrew/PPSA99072" // the app's /app0: where it reads the core key
+#define DATA_DIR APP_DATA_DIR
+#define APP_DIR APP_HOMEBREW_DIR // the app's /app0: where it reads the core key
 int sceKernelSetProcessName(const char *name);
 #include <ps5/klog.h>
 #else
@@ -304,7 +305,7 @@ int main(void)
         LOG("control: cannot write %s/control.key (errno %d): the app cannot reach the core", APP_DIR, errno);
 #ifdef __PROSPERO__
     // Before the app is served: a swap a power cut ended is finished first.
-    update_init(APP_DIR, "/data/homebrew/.PPSA99072.update", DATA_DIR "/update-bad");
+    update_init(APP_DIR, "/data/homebrew/." APP_TITLE_ID ".update", DATA_DIR "/update-bad");
 #endif
     // Requests only once TLS, voice and Go Live are set up (the port is ours already).
     pthread_t t;

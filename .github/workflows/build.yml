@@ -1,16 +1,22 @@
-# Full community build of ps5-discord: the PPSA99072 app package with everything inside
-# (core with libdave, FFmpeg's AAC decoder, the capture helper, the overlay, the app).
+# Full community build of ps5-discord: the app package with everything inside (core with libdave,
+# FFmpeg's AAC decoder, the capture helper, the overlay, the app), in two editions built side by side:
+#
+#   stock         title PPSA99072, data in /data/ps5-discord. Replaces upstream's own install, as an
+#                 upstream release would (README "Fork notes").
+#   side-by-side  title PPSA99073, data in /data/ps5-discord-community, no updater. Installs next to
+#                 the stock one and never reads or writes its files, so the original stays as it is
+#                 (only one of the two can run at a time: both cores use port 9041).
 #
 #   - every push to `community`, and a manual run (Actions > build > Run workflow);
-#   - a tag `v<VERSION>` also publishes a GitHub prerelease with the files and the CHANGELOG notes.
+#   - a tag `v<VERSION>` also publishes a GitHub prerelease with both editions and the CHANGELOG notes.
 #
 # Jobs: `dave` and `ffmpeg` build the two slow libraries once and cache them (a cache hit skips
-# the build), then `build` compiles, tests and packages, and `release` (tags only) publishes.
-# GitHub scopes caches by ref: a tag build cannot read the ones made on `community`, so the
-# first build of a new tag rebuilds libdave (slow, once).
+# the build), then `build` (one job per edition) compiles, tests and packages, and `release` (tags
+# only) publishes. GitHub scopes caches by ref: a tag build cannot read the ones made on
+# `community`, so the first build of a new tag rebuilds libdave (a few minutes).
 #
-# The built-in updater is left alone: it reads the upstream repository's releases and trusts
-# only upstream's keys, so this workflow publishes no update.txt or update.sig.
+# The built-in updater is left alone in the stock edition: it reads the upstream repository's
+# releases and trusts only upstream's keys, so this workflow publishes no update.txt or update.sig.
 name: build
 
 on:
@@ -95,6 +101,24 @@ jobs:
     needs: [dave, ffmpeg]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: stock
+            package_id: PPSA99072
+            edition_title_id: ''
+            edition_data_dir: ''
+          - edition: side-by-side
+            package_id: PPSA99073
+            edition_title_id: PPSA99073
+            edition_data_dir: /data/ps5-discord-community
+    env:
+      EDITION: ${{ matrix.edition }}
+      PACKAGE_ID: ${{ matrix.package_id }}
+      # Read by the Makefiles (root, capture, overlay, tools/vpad-probe); empty for the stock edition.
+      EDITION_TITLE_ID: ${{ matrix.edition_title_id }}
+      EDITION_DATA_DIR: ${{ matrix.edition_data_dir }}
     steps:
       - uses: actions/checkout@v7
       - name: Build tools
@@ -128,7 +152,13 @@ jobs:
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
-          echo "Building $version"
+          echo "Building $version, edition $EDITION ($PACKAGE_ID)"
+      - name: Give the app its own identity (side-by-side edition)
+        if: matrix.edition == 'side-by-side'
+        run: |
+          # The kit's own tool: titleId, conceptId, contentId and the name shown on the home screen.
+          make -C app init TITLE_ID="$PACKAGE_ID" APP_NAME="ps5-discord (community)"
+          grep -F "\"titleId\": \"$PACKAGE_ID\"" app/sce_sys/param.json
       - name: make deps (SDK, mbedTLS, zlib, opus, cJSON, qrcodegen, SQLite, certificates, adapter firmware)
         run: make deps
       - name: Core, capture helper and overlay (make RELEASE=1 CORE_LAN=0 all)
@@ -154,7 +184,29 @@ jobs:
           for f in build/ps5-discord.elf capture/build/discord-capture.elf overlay/build/overlay-service.elf overlay/build/overlay-restart.elf overlay/build/overlay.build; do
             test -s "$f" || { echo "::error::$f was not built"; exit 1; }
           done
+      - name: The side-by-side edition leaves the stock install alone
+        if: matrix.edition == 'side-by-side'
+        run: |
+          # None of its programs may name the stock title's folders or the stock data folder.
+          for f in build/ps5-discord.elf capture/build/discord-capture.elf overlay/build/overlay-service.elf overlay/build/overlay-restart.elf; do
+            for stock in /data/homebrew/PPSA99072 /data/homebrew/.PPSA99072 /user/appmeta/PPSA99072 /user/app/PPSA99072 /user/data/homebrew/PPSA99072; do
+              if grep -a -q -F -- "$stock" "$f"; then
+                echo "::error::$f still names the stock install: $stock"
+                exit 1
+              fi
+            done
+            # The stock data folder, alone or followed by a path ("/data/ps5-discord-community" is fine).
+            if LC_ALL=C grep -a -q -P '/data/ps5-discord(/|\x00)' "$f"; then
+              echo "::error::$f still names the stock data folder /data/ps5-discord"
+              exit 1
+            fi
+          done
+          grep -a -q -F "/data/homebrew/$EDITION_TITLE_ID" build/ps5-discord.elf || { echo "::error::the core does not use /data/homebrew/$EDITION_TITLE_ID"; exit 1; }
+          grep -a -q -F "$EDITION_DATA_DIR" build/ps5-discord.elf || { echo "::error::the core does not use $EDITION_DATA_DIR"; exit 1; }
+          grep -a -q -F "$EDITION_DATA_DIR" capture/build/discord-capture.elf || { echo "::error::the capture helper does not use $EDITION_DATA_DIR"; exit 1; }
+          grep -a -q -F "/user/data/homebrew/$EDITION_TITLE_ID" overlay/build/overlay-service.elf || { echo "::error::the overlay does not read /user/data/homebrew/$EDITION_TITLE_ID"; exit 1; }
       - name: make test (host self-checks, with libdave)
+        if: matrix.edition == 'stock'
         run: |
           set -o pipefail
           make test 2>&1 | tee out/test.log
@@ -166,27 +218,43 @@ jobs:
           RELEASE=1 make 2>&1 | tee ../out/app-build.log
       - name: Check the package and collect the files
         run: |
-          d=app/dist/PPSA99072
+          d=app/dist/$PACKAGE_ID
           for f in eboot.bin version.txt assets/ps5-discord.elf assets/discord-capture.elf assets/overlay.elf assets/overlay-restart.elf assets/overlay.build assets/controller-audio.elf firmware/rtl8761bu_fw.bin; do
             test -s "$d/$f" || { echo "::error::$f is missing or empty in the app package"; exit 1; }
           done
           test "$(cat "$d/version.txt")" = "$VERSION" || { echo "::error::version.txt is not $VERSION"; exit 1; }
+          grep -F "\"titleId\": \"$PACKAGE_ID\"" "$d/sce_sys/param.json" || { echo "::error::param.json is not the title $PACKAGE_ID"; exit 1; }
           cmp build/ps5-discord.elf "$d/assets/ps5-discord.elf" || { echo "::error::the app embeds another core than the one just built"; exit 1; }
-          test -s app/dist/PPSA99072.zip || { echo "::error::app/dist/PPSA99072.zip is missing"; exit 1; }
+          if [[ $EDITION == side-by-side ]]; then
+            for f in assets/controller-audio.elf eboot.bin; do
+              for stock in /data/homebrew/PPSA99072 PPSA99072; do
+                if grep -a -q -F -- "$stock" "$d/$f"; then
+                  echo "::error::$f of the side-by-side edition still names the stock install: $stock"
+                  exit 1
+                fi
+              done
+              if LC_ALL=C grep -a -q -P '/data/ps5-discord(/|\x00)' "$d/$f"; then
+                echo "::error::$f of the side-by-side edition still names the stock data folder"
+                exit 1
+              fi
+            done
+            grep -a -q -F "$EDITION_DATA_DIR" "$d/assets/controller-audio.elf" || { echo "::error::controller-audio.elf does not use $EDITION_DATA_DIR"; exit 1; }
+          fi
+          test -s "app/dist/$PACKAGE_ID.zip" || { echo "::error::app/dist/$PACKAGE_ID.zip is missing"; exit 1; }
           mkdir -p out/release
-          cp app/dist/PPSA99072.zip build/ps5-discord.elf out/release/
-          (cd out/release && sha256sum PPSA99072.zip ps5-discord.elf > SHA256SUMS && cat SHA256SUMS)
+          cp "app/dist/$PACKAGE_ID.zip" build/ps5-discord.elf out/release/
+          (cd out/release && sha256sum "$PACKAGE_ID.zip" ps5-discord.elf > SHA256SUMS && cat SHA256SUMS)
       - name: Upload the package
         uses: actions/upload-artifact@v4
         with:
-          name: PPSA99072-${{ env.VERSION }}-run${{ github.run_number }}
+          name: ${{ matrix.package_id }}-${{ env.VERSION }}-run${{ github.run_number }}
           path: out/release/
           retention-days: 30
       - name: Upload the logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs-run${{ github.run_number }}
+          name: build-logs-${{ matrix.edition }}-run${{ github.run_number }}
           path: out/*.log
           if-no-files-found: ignore
           retention-days: 7
@@ -201,18 +269,21 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v4
         with:
-          pattern: PPSA99072-*
+          pattern: PPSA*
           path: dl
-          merge-multiple: true
       - name: Publish the prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           version=$(cat VERSION)
           [[ $GITHUB_REF_NAME == "v$version" ]] || { echo "::error::tag $GITHUB_REF_NAME is not v$version"; exit 1; }
+          stock=$(ls -d dl/PPSA99072-*/ | head -n 1)
+          side=$(ls -d dl/PPSA99073-*/ | head -n 1)
           mkdir -p assets
-          cp dl/PPSA99072.zip "assets/ps5-discord-app-v$version.zip"
-          cp dl/ps5-discord.elf "assets/ps5-discord-core-v$version.elf"
+          cp "${stock}PPSA99072.zip" "assets/ps5-discord-app-v$version.zip"
+          cp "${stock}ps5-discord.elf" "assets/ps5-discord-core-v$version.elf"
+          cp "${side}PPSA99073.zip" "assets/ps5-discord-app-v$version-side-by-side.zip"
+          cp "${side}ps5-discord.elf" "assets/ps5-discord-core-v$version-side-by-side.elf"
           (cd assets && sha256sum ps5-discord-* > SHA256SUMS && cat SHA256SUMS)
           # The CHANGELOG section of this version, else [Unreleased].
           section() { awk -v h="## [$1]" 'index($0, h) == 1 { p = 1; next } /^## \[/ { p = 0 } p' CHANGELOG.md; }
@@ -220,9 +291,12 @@ jobs:
           [[ -n ${notes//[[:space:]]/} ]] || notes=$(section Unreleased)
           {
             echo "Community build of ps5-discord, from the fork $GITHUB_REPOSITORY. Not published or signed by the upstream author."
-            echo "The app's built-in updater only offers upstream releases; installing one of those replaces this build."
             echo
-            echo "Install: replace /data/homebrew/PPSA99072 with the folder inside ps5-discord-app-v$version.zip (app closed, core stopped)."
+            echo "Two editions, same code:"
+            echo "- \`ps5-discord-app-v$version.zip\`: the stock title PPSA99072. It replaces an existing install; the built-in updater only offers upstream releases, and installing one replaces this build."
+            echo "- \`ps5-discord-app-v$version-side-by-side.zip\`: its own title PPSA99073 and data folder /data/ps5-discord-community, no updater. It installs next to the stock app and never touches its files; sign in again once. Quit one app (Settings > Account > Quit) before starting the other: both cores use port 9041."
+            echo
+            echo "Install: copy the folder inside the zip into /data/homebrew (app closed, core stopped)."
             echo
             echo "$notes"
           } > notes.md

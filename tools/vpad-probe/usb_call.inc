@@ -29,7 +29,11 @@ static int usb_call_connect(void)
     char key[64] = {0};
     int fd = -1, ok = 0;
     const char *stage = "read core key";
+#ifdef APP_TITLE_ID // a side-by-side edition's title (src/app_paths.h)
+    FILE *file = fopen("/data/homebrew/" APP_TITLE_ID "/control.key", "rb");
+#else
     FILE *file = fopen("/data/homebrew/PPSA99072/control.key", "rb");
+#endif
     if (!file)
         goto done;
     size_t n = fread(key, 1, sizeof key, file);
