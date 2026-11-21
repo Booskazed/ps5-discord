@@ -141,6 +141,38 @@ verification challenge.
   from a `release/vX.Y.Z` branch cut from `main`.
 - Versioning, release channels and milestones: [ROADMAP.md](ROADMAP.md). Changes: [CHANGELOG.md](CHANGELOG.md).
 
+## Fork notes
+
+This is a community fork of [ps5-discord by abhi245y](https://github.com/abhi245y/ps5-discord)
+(the project's author and the source of nearly all of this code). It is not published, signed or
+endorsed by upstream. It exists to ship a complete build of upstream's `develop` branch, with its
+new options, that runs on firmware 13.60.
+
+- **Branches.** `develop` mirrors `abhi245y/ps5-discord` `develop` exactly and is never committed
+  to. `community` is the working branch (builds come from it); each topic lives on its own
+  `fix/*` or `feat/*` branch and is merged into `community` once tested. Working fixes are offered
+  back to upstream as pull requests against its `develop`.
+- **Builds.** Every push to `community` runs the `build` workflow (Actions tab) and uploads
+  `PPSA99072.zip` (the whole app: core with libdave, FFmpeg's AAC decoder, capture helper, overlay)
+  with a `SHA256SUMS`. A tag `v<VERSION>` also publishes a GitHub prerelease. Install as for any
+  release: replace `/data/homebrew/PPSA99072` with the zip's folder, app closed and core stopped.
+- **Versions.** `<upstream version>.community.<n>`, for example `0.6.0-alpha.2.community.1`.
+  Never `-dev` (the app replaces a `-dev` core with the one it embeds).
+- **Updates.** The built-in updater is unchanged: it reads the upstream repository's releases and
+  trusts only upstream's keys. This fork publishes no `update.txt` or `update.sig`; if upstream
+  releases a newer version the app offers it, and installing it replaces the fork's build.
+- **Source.** Settings > About > Source shows `github.com/Booskazed/ps5-discord` (AGPL-3.0
+  section 13). Licenses, headers and third-party notices are kept as upstream has them.
+
+Status of upstream `develop`'s options on firmware 13.60, as tested so far on one console:
+
+| Option | State |
+|---|---|
+| Go Live through Remote Play (legacy) | works (tested at the four qualities) |
+| Go Live through the hardware encoder (wireless) | fails: `sceAvcap2OpenVideo` returns `0x81950008` (upstream issue #11) |
+| In-game overlay | refused: the overlay's firmware check accepts 13.00 only |
+| Controller audio (USB DualSense in calls) | WIP upstream, not tested |
+| Bluetooth headset through a USB adapter | needs an adapter, not tested |
 
 ## License
 
