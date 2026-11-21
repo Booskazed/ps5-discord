@@ -115,12 +115,11 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   and size of the encoder's stream buffer and fills the whole buffer with `0x80`; the helper does the same
   (`stream buffer` line in `capture.log`) before each Start. Start was still refused (`0x80c78000`).
 - Capture helper lab mode (console only): started by hand through elfldr with the file `lab` in the data
-  folder, the helper runs no session for a core; on a fixed profile it tries the combinations that could
-  make 13.60's encoder accept Start (arbitrator id, `sceAvcap2EnableScanInEncode`, the block's encoder
-  variant), logs each answer (`lab:` lines) and, if one is accepted, the picture headers and a few pictures.
-  It first has SceRemotePlay's own code (its Glint constructor and block builder, by their offsets in its image) build
-  the block on a new object in its heap, logs every word where this helper's block differs, and tries OpenVideo and
-  Start with SceRemotePlay's block.
+  folder, the helper runs no session for a core; on a fixed profile it opens, starts and reads the encoder
+  under each combination that could change what it encodes (arbitrator id, `sceAvcap2EnableScanInEncode`,
+  the block's encoder variant) and logs each answer and the size of the pictures it gets (`lab:` lines).
+  It also has SceRemotePlay's own code (its Glint constructor and block builder, by their offsets in its image) build
+  the block on a new object in its heap, and logs every word where this helper's block differs.
   Lab mode on the console showed 13.60's block built by SceRemotePlay's own code differs from this helper's in one word
   of 188 (offset `0xdc`: `0x23`, not the `0xffbf5f14` its read-only data suggested); with its block the encoder opens,
   **Start is accepted**, and the picture headers and H.264 pictures come out. The helper's block now has `0x23`.
