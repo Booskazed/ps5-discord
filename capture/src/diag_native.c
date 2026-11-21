@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <time.h>
 
 #include <ps5/kernel.h>
@@ -61,16 +62,42 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
     uint8_t *img = calloc(1, len);
     if (!img) { free(prot); return; }
 
-    size_t read_ok = 0, mapped = 0;
+    // The protections of the image, as the console reports them.
+    int kinds[8];
+    size_t kind_pages[8] = {0}, nkinds = 0;
+    for (size_t i = 0; i < pages; i++) {
+        if (prot[i] < 0) continue;
+        size_t k = 0;
+        while (k < nkinds && kinds[k] != prot[i]) k++;
+        if (k == nkinds && nkinds < 8) kinds[nkinds++] = prot[i];
+        if (k < nkinds) kind_pages[k]++;
+    }
+    for (size_t k = 0; k < nkinds; k++) log("diag: %zu pages with protection 0x%x", kind_pages[k], (unsigned)kinds[k]);
+
+    size_t read_ok = 0, mapped = 0, via_prot = 0, unreadable = 0;
     for (size_t i = 0; i < pages; i++) {
         if (prot[i] < 0) continue;
         mapped++;
         if (now() - t0 > BUDGET_MS) { log("diag: time budget spent after %zu of %zu pages", i, pages); break; }
         uint8_t *dst = img + i * PAGE;
         const intptr_t at = base + (intptr_t)(i * PAGE);
-        if (sl_inject_read_at(ctx, at, dst, PAGE) == 0 || sl_inject_read_code_at(ctx, at, dst, PAGE) == 0) read_ok++;
+        if (sl_inject_read_at(ctx, at, dst, PAGE) == 0 || sl_inject_read_code_at(ctx, at, dst, PAGE) == 0) { read_ok++; continue; }
+        // Execute-only code, the usual state of a system process's text: give the page read permission for
+        // the length of one read, then put its protection back exactly as it was, and check that it is.
+        if (!(prot[i] & PROT_EXEC)) { unreadable++; continue; }
+        if (kernel_set_vmem_protection(pid, at, PAGE, prot[i] | PROT_READ) != 0) { unreadable++; continue; }
+        const int rd = sl_inject_read_at(ctx, at, dst, PAGE);
+        int back = kernel_set_vmem_protection(pid, at, PAGE, prot[i]);
+        if (back != 0 || kernel_get_vmem_protection(pid, at, PAGE) != prot[i]) {
+            back = kernel_set_vmem_protection(pid, at, PAGE, prot[i]); // once more
+            if (back != 0 || kernel_get_vmem_protection(pid, at, PAGE) != prot[i]) {
+                log("diag: could not restore the protection of 0x%llx; stopping here", (unsigned long long)at);
+                break;
+            }
+        }
+        if (rd == 0) { read_ok++; via_prot++; } else unreadable++;
     }
-    log("diag: image 0x%zx bytes, %zu mapped pages, %zu read", len, mapped, read_ok);
+    log("diag: image 0x%zx bytes, %zu mapped pages, %zu read (%zu of them with read permission given for the read), %zu not readable", len, mapped, read_ok, via_prot, unreadable);
 
     // Where each function's address is stored (the import slots of this module).
     uint64_t want[FUNCS_MAX];
