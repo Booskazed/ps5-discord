@@ -83,14 +83,14 @@ int sceKernelSetProcessName(const char *name); // the SDK's kernel header does n
 enum function {
     INITIALIZE, TERMINATE, MODE, ENABLE_SCAN, OPEN_VIDEO, START, STOP, CLOSE, BITRATE_SET, HEADERS,
     KEYFRAME, READ_VIDEO, SET_CALLBACK, CHANGE_STATE, CLEAR_CALLBACK, REMOTE_GETPID, REMOTE_MALLOC,
-    REMOTE_FREE, FUNCTION_COUNT
+    REMOTE_FREE, REMOTE_MEMSET, FUNCTION_COUNT
 };
 static const char *const symbols[FUNCTION_COUNT] = {
     "sceAvcap2Initialize", "sceAvcap2Terminate", "sceAvcap2GetVideoOutMode",
     "sceAvcap2EnableScanInEncode", "sceAvcap2OpenVideo", "sceAvcap2Start", "sceAvcap2Stop",
     "sceAvcap2Close", "sceAvcap2SetVideoBitrate", "sceAvcap2GetNonVclNalUnitStream",
     "sceAvcap2RequestKeyFrame", "sceAvcap2ReadVideo", "sceResourceArbitratorSetCallback",
-    "sceResourceArbitratorChangeState", "sceResourceArbitratorClearCallback", "getpid", "malloc", "free"
+    "sceResourceArbitratorChangeState", "sceResourceArbitratorClearCallback", "getpid", "malloc", "free", "memset"
 };
 
 struct progress { _Atomic int function, target; _Atomic uint64_t heartbeat_ms; };
@@ -394,6 +394,10 @@ static int bind_functions(struct capture *c)
                              i == REMOTE_GETPID ? "libkernel_sys.sprx" :
                              i >= SET_CALLBACK ? "libSceResourceArbitrator.sprx" : "libSceAvcap2.sprx";
         c->fn[i] = sl_resolve_in(c->ctx.target_pid, module, symbols[i]);
+        if (c->fn[i] <= 0 && i == REMOTE_MEMSET) { // only the 13.60 stream buffer needs it; never a reason to refuse
+            log_line("no %s in %s: the 13.60 stream buffer will not be filled", symbols[i], module);
+            continue;
+        }
         if (c->fn[i] <= 0) { log_line("missing %s in %s", symbols[i], module); return -1; }
     }
     return 0;
@@ -671,6 +675,37 @@ static int take_handle(struct capture *c, intptr_t base)
     return 0;
 }
 
+#ifdef SL_PS5
+// Right after OpenVideo and before Start, SceRemotePlay asks libSceAvcap2 (13.60, +0x1dc0: a getter on the
+// handle that does not call the service) where the encoder's stream buffer is, and fills the whole buffer with
+// 0x80. This helper did neither, and Start answered 0x80c78000 on every try. Returns 0 (also when there is
+// nothing to fill), or -1 on a transport failure.
+#define AVCAP2_STREAM_BUFFER 0x1dc0
+#define STREAM_BUFFER_MAX (64u << 20)
+static int prepare_stream_buffer(struct capture *c, intptr_t base)
+{
+    const intptr_t lib = sl_module_base(c->ctx.target_pid, "libSceAvcap2.sprx");
+    if (lib <= 0) { log_line("stream buffer: libSceAvcap2 not found"); return 0; }
+    uint8_t out[16] = {0};
+    const intptr_t at = base + 0x1300;
+    if (sl_inject_write_at(&c->ctx, at, out, sizeof out)) return -1;
+    const uint64_t args[6] = {c->video, (uint64_t)at, (uint64_t)(at + 8)};
+    const int64_t rc = inj_call_fast(&c->ctx, lib + AVCAP2_STREAM_BUFFER, args, 1);
+    beat();
+    if (rc == SL_CALL_ERROR) { log_line("stream buffer: transport failure"); c->failed = 1; return -1; }
+    if (sl_inject_read_at(&c->ctx, at, out, sizeof out)) return -1;
+    uint64_t ptr, size;
+    memcpy(&ptr, out, 8);
+    memcpy(&size, out + 8, 8);
+    log_line("stream buffer: 0x%llx, at 0x%llx, %llu bytes", (unsigned long long)rc, (unsigned long long)ptr,
+             (unsigned long long)size);
+    if (!good(rc) || !ptr || !size || size > STREAM_BUFFER_MAX || c->fn[REMOTE_MEMSET] <= 0) return 0;
+    return REMOTE(c, REMOTE_MEMSET, ptr, 0x80, size) == SL_CALL_ERROR ? -1 : 0;
+}
+#else
+static int prepare_stream_buffer(struct capture *c, intptr_t base) { (void)c; (void)base; return 0; }
+#endif
+
 // How many times the encoder is started on 13.60, and the wait between two tries.
 #ifndef START_TRIES
 #define START_TRIES 6u
@@ -680,10 +715,12 @@ static int take_handle(struct capture *c, intptr_t base)
 // Firmware 13.60: SceRemotePlay never calls SetVideoBitrate (the bitrate is in the block) and, when Start is refused
 // (0x80c78000 was seen), closes the encoder, waits a frame and opens it again until its time budget is spent. So:
 // the first half of the tries start without a bitrate call, the second half with the call 13.00 needs; between two
-// tries the encoder is closed, and opened again with the block that worked. Returns 0 once started, -1 otherwise
-// (a refusal is logged with its code); *rc is the last answer of Start.
+// tries the encoder is closed, and opened again with the block that worked. Each time it is open, and before
+// Start, its stream buffer is prepared as SceRemotePlay does. Returns 0 once started, -1 otherwise (a refusal
+// is logged with its code); *rc is the last answer of Start.
 static int start_1360(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, int64_t *rc)
 {
+    if (prepare_stream_buffer(c, base)) return -1;
     for (unsigned attempt = 0; attempt < START_TRIES; attempt++) {
         const int with_rate = attempt >= START_TRIES / 2;
         if (with_rate) {
@@ -711,7 +748,7 @@ static int start_1360(struct capture *c, intptr_t base, uint32_t *mode, const st
             log_line("start retry: the encoder would not open again (0x%llx)", (unsigned long long)open_rc);
             return -1;
         }
-        if (take_handle(c, base)) return -1;
+        if (take_handle(c, base) || prepare_stream_buffer(c, base)) return -1;
     }
     return -1;
 }

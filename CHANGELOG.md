@@ -110,7 +110,10 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   never calls `sceAvcap2SetVideoBitrate` (the bitrate is in the block) and, when Start is refused, closes the
   encoder, waits and opens it again until its time budget is spent. The helper now does the same: the first
   tries start without the bitrate call, the later ones with it, closing and reopening (the same block)
-  between tries; every try is logged (`start try`).
+  between tries; every try is logged (`start try`). That alone did not change the answer: between OpenVideo
+  and Start, SceRemotePlay also asks `libSceAvcap2` (13.60, +0x1dc0, a getter on the handle) for the address
+  and size of the encoder's stream buffer and fills the whole buffer with `0x80`; the helper does the same
+  (`stream buffer` line in `capture.log`) before each Start.
 
 ## [0.6.0-alpha.2] - 2026-10-31
 
