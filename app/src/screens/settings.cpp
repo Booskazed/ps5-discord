@@ -364,7 +364,9 @@ std::vector<Row> rows_for(int section, const discord::Snapshot &s, const hui::Se
         }
         rows.insert(rows.end(), {
             {Kind::value, "License", "", "AGPL-3.0"},
-            {Kind::value, "Source", "", "github.com/abhi245y/ps5-discord"},
+            // The community fork's source (AGPL-3.0 section 13: the corresponding source of this build).
+            // Upstream is abhi245y/ps5-discord, credited in README.md; the updater still reads upstream.
+            {Kind::value, "Source", "", "github.com/Booskazed/ps5-discord"},
             {Kind::value, "Emoji", "", "Twemoji, CC-BY 4.0"},
         });
         return rows;
