@@ -121,6 +121,9 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   It first has SceRemotePlay's own code (its Glint constructor and block builder, by their offsets in its image) build
   the block on a new object in its heap, logs every word where this helper's block differs, and tries OpenVideo and
   Start with SceRemotePlay's block.
+  Lab mode on the console showed 13.60's block built by SceRemotePlay's own code differs from this helper's in one word
+  of 188 (offset `0xdc`: `0x23`, not the `0xffbf5f14` its read-only data suggested); with its block the encoder opens,
+  **Start is accepted**, and the picture headers and H.264 pictures come out. The helper's block now has `0x23`.
   The file is removed at start, so the next start is a normal one.
   (The helper looked for that file and for the module images with `access()`, which checks the real
   user's rights and fails in the root-only data folder; it uses `stat()` now.)
