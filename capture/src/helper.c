@@ -36,6 +36,9 @@
 #include "inject_broker.h"
 #include "h264_timing.h"
 #ifdef SL_PS5
+#include "diag_native.h"
+#endif
+#ifdef SL_PS5
 int sceKernelSetProcessName(const char *name); // the SDK's kernel header does not declare it
 #endif
 
@@ -505,8 +508,19 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
         !good(REMOTE(&c, ENABLE_SCAN))) goto done;
     uint8_t video[0x2e8];
     video_params(video, mode, req);
+    int64_t open_rc = SL_CALL_ERROR;
     if (sl_inject_write_at(&c.ctx, base, video, sizeof video) ||
-        !good(REMOTE(&c, OPEN_VIDEO, base, base + 8, 0))) { why("The console's encoder would not open."); goto done; }
+        !good(open_rc = REMOTE(&c, OPEN_VIDEO, base, base + 8, 0))) {
+#ifdef SL_PS5
+        // 0x81950008 on firmware 13.60 (upstream issue #11): log how SceRemotePlay's own code calls the same
+        // functions, read-only, so the sequence and the parameter block it builds can be compared with ours.
+        if (open_rc != SL_CALL_ERROR && (uint32_t)open_rc == 0x81950008u && !c.ctx.quarantined)
+            diag_native_sequence(&c.ctx, c.fn, symbols, REMOTE_GETPID, log_line);
+#endif
+        (void)open_rc;
+        why("The console's encoder would not open.");
+        goto done;
+    }
     // Read failures after a successful open still need cleanup; use the returned handle only
     // after a complete eight-byte transfer.
     c.video_unknown = 1;
