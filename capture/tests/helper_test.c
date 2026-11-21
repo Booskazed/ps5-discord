@@ -16,6 +16,8 @@
 #define WATCHDOG_HARD_MS 100u
 #define TERM_GRACE_MS 50u
 #define RECOVERY_POLL_US 10000u
+#define OPEN_RETRIES 3u
+#define OPEN_RETRY_US 5000u
 #include "../src/helper.c"
 #undef main
 #include <assert.h>
@@ -23,7 +25,7 @@
 enum scenario { OK, VIDEO_OPEN_FAIL, VIDEO_START_FAIL, BAD_HEADERS, VIDEO_OVERSIZE, TRANSPORT_FAIL, CALLBACK_FAIL,
                 NO_IDR, MODE_120HZ, CLOSE_FAIL, MODE_TRANSITION, MODE_CHANGED, CORE_CLOSES, BAD_PROFILE,
                 HANDLE_READ_FAIL, STOP_SETUP, EOF_SETUP, STOP_HEADERS, SLOW_SETUP, MODE_OTHER, MODE_ZERO, STOP_ATTACH, EOF_ATTACH, STOP_MODE, EOF_MODE, MODE_QUERY_ONCE, MODE_QUERY_FAIL, RESTORED_ABORT,
-                SCENARIO_COUNT,
+                SCENARIO_COUNT, OPEN_BUSY_ONCE, OPEN_BUSY_ALWAYS,
                 RECOVER_OK, RECOVER_ZERO_MODE, RECOVER_REOPEN_FAIL, RECOVER_SECOND_FAULT, RECOVER_BAD_CLEANUP,
                 RECOVER_TRANSPORT, RECOVER_120HZ, RECOVER_EARLY_MODE, RECOVER_LAST = RECOVER_EARLY_MODE };
 static enum scenario scenario;
@@ -122,6 +124,8 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
         assert(*(uint32_t *)(scratch + 0x2a8) == (scenario == MODE_120HZ ? 0x40u : recovery_scenario() && attachments > 1 ? 0x13cu : 0x30u));
         if (scenario == RECOVER_REOPEN_FAIL && attachments > 1) return -1;
         if (scenario == VIDEO_OPEN_FAIL) return -1;
+        // 13.60: the encoder answers 0x81950008 while it is not ready, as it does to SceRemotePlay
+        if (scenario == OPEN_BUSY_ALWAYS || (scenario == OPEN_BUSY_ONCE && calls[OPEN_VIDEO] == 1)) return (int64_t)0x81950008u;
         *(uint64_t *)(uintptr_t)a[0] = video_handle; break;
     case BITRATE_SET:
         assert(a[0] == video_handle && !saw_video_start);   // before Start, never after
@@ -484,6 +488,24 @@ int main(void)
             if (scenario == RECOVER_120HZ) assert(strstr(s.error, "120 Hz"));
         }
         cases++;
+    }
+
+    // Firmware 13.60 (upstream issue #11): sceAvcap2OpenVideo answers 0x81950008 while the encoder is not
+    // ready, and SceRemotePlay's own code asks again. The helper does too: once busy, then open, the
+    // session goes on as usual; busy for ever, it stops after the bounded number of tries and says so.
+    {
+        scenario = OPEN_BUSY_ONCE; profile = profiles[0]; reset_fake();
+        struct seen s; int rc;
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 2 && s.videos >= 8 && !s.states[CAP_ERROR]);
+        assert(vstop == 1 && vclose == 1 && freed == 1 && calls[TERMINATE] == 1 && attachments == 1 && detached == 1);
+        for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
+        scenario = OPEN_BUSY_ALWAYS; reset_fake();
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 1 && calls[OPEN_VIDEO] == OPEN_RETRIES + 1 && !s.videos && s.states[CAP_ERROR] == 1 && s.error[0]);
+        assert(vclose == 0 && calls[TERMINATE] == 1 && calls[START] == 0 && attachments == 1 && detached == 1);
+        for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
+        cases += 2;
     }
 
     // A missing connection file and a core that never sends a start are clean failures: nothing

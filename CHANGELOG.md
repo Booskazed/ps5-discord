@@ -93,6 +93,12 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   helper reads (only reads) SceRemotePlay's code, finds where it calls `sceAvcap2Initialize`,
   `sceAvcap2EnableScanInEncode`, `sceAvcap2OpenVideo` and the resource arbitrator, and writes the code
   leading to each call to `capture.log`, to compare the sequence and the parameter block with 13.00's.
+- Wireless Go Live: while `sceAvcap2OpenVideo` answers `0x81950008` the helper asks again for up to 4 s,
+  as SceRemotePlay's own code does. On a firmware other than 13.00 it first tries the encoder without
+  `sceAvcap2EnableScanInEncode`, which SceRemotePlay on 13.60 never calls. If the encoder still refuses,
+  the diagnostic also writes the images of SceRemotePlay, `libSceAvcap2` and `libSceResourceArbitrator`
+  to the data folder (read-only toward the target, never published) so the parameter block the encoder
+  checks can be read in full. 13.00 keeps its validated sequence.
 
 ## [0.6.0-alpha.2] - 2026-10-31
 
