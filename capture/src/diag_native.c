@@ -167,6 +167,11 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
     free(img);
 }
 
+intptr_t diag_native_main_base(sl_inject *ctx)
+{
+    return kernel_dynlib_mapbase_addr(ctx->target_pid, 0); // handle 0: the main executable
+}
+
 static int write_file(const char *path, const uint8_t *data, size_t len)
 {
     FILE *f = fopen(path, "wb");

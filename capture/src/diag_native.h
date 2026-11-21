@@ -19,3 +19,6 @@ void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const 
 // only the few hundred bytes the log shows. Read-only toward the target, like the sequence above;
 // the files stay on the console and are never published. Console only.
 void diag_native_dump(sl_inject *ctx, const char *dir, diag_log_fn log);
+
+// The load address of the target's main module (0 when unknown). Console only.
+intptr_t diag_native_main_base(sl_inject *ctx);

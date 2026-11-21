@@ -1092,6 +1092,84 @@ static void lab_pictures(struct capture *c, intptr_t base)
     }
 }
 
+// SceRemotePlay's own functions that build the 13.60 block, as offsets in its main module (read from its image;
+// the lab runs on 13.60 only): the Glint object's constructor, the setter of its variant and arbitrator id, the
+// block builder (which also asks the service for the buffer descriptors) and the function that fills in the rates.
+#define RP_GLINT_CTOR 0x6f1c0
+#define RP_GLINT_CONFIGURE 0x71960
+#define RP_GLINT_BUILD 0x6f840
+#define RP_GLINT_RATES 0x70190
+
+static int64_t lab_call(struct capture *c, intptr_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                        uint64_t a5)
+{
+    const uint64_t args[6] = {a0, a1, a2, a3, a4, a5};
+    const int64_t rc = inj_call_fast(&c->ctx, fn, args, 1);
+    beat();
+    if (rc == SL_CALL_ERROR) { log_line("lab: transport failure in the call to 0x%llx", (unsigned long long)fn); c->failed = 1; }
+    return rc;
+}
+
+// The lab's most telling test: have SceRemotePlay's own code build the block, on a new Glint object in its heap
+// (nothing it owns is touched). Logs every word where this helper's block differs from it, then opens the encoder
+// and starts it with SceRemotePlay's block. Returns 1 if Start was accepted, 0 if not, -1 when the session cannot go on.
+static int lab_native(struct capture *c, intptr_t base, uint32_t mode, const struct start_req *req)
+{
+    const intptr_t rp = diag_native_main_base(&c->ctx);
+    if (rp <= 0 || c->fn[REMOTE_MEMSET] <= 0) { log_line("lab: SceRemotePlay's own block: not possible here"); return 0; }
+    const int64_t obj = REMOTE(c, REMOTE_MALLOC, 0x200400);
+    if (obj == SL_CALL_ERROR) return -1;
+    if (obj <= 0) { log_line("lab: SceRemotePlay's own block: malloc failed"); return 0; }
+    log_line("lab: SceRemotePlay's own block: a new Glint object at 0x%llx", (unsigned long long)obj);
+    if (lab_call(c, rp + RP_GLINT_CTOR, (uint64_t)obj, 0, 0, 0, 0, 0) == SL_CALL_ERROR) return -1;
+    if (lab_call(c, rp + RP_GLINT_CONFIGURE, (uint64_t)obj, c->variant, c->feature, 0, 0, 0) == SL_CALL_ERROR) return -1;
+    uint8_t config[0x28] = {0}; // type 2 (H.264), size, flag 0, rate, then the settings this helper had to choose
+    put32(config, 0x00, 2); put32(config, 0x04, req->width); put32(config, 0x08, req->height);
+    put32(config, 0x10, req->fps); put32(config, 0x18, NATIVE_CAP_BUDGET); put32(config, 0x1c, NATIVE_CAP_BUFFER / 8);
+    const intptr_t at_config = base + 0x1400;
+    if (sl_inject_write_at(&c->ctx, at_config, config, sizeof config)) return -1;
+    const int64_t built = lab_call(c, rp + RP_GLINT_BUILD, (uint64_t)obj, 0, 0, (uint64_t)at_config, 0, 0);
+    if (built == SL_CALL_ERROR) return -1;
+    log_line("lab: SceRemotePlay's own block: builder -> 0x%llx", (unsigned long long)built);
+    if (lab_call(c, rp + RP_GLINT_RATES, (uint64_t)obj, 0, 0, req->bitrate / 1000u, req->fps, req->selector) == SL_CALL_ERROR)
+        return -1;
+    // What SceRemotePlay's open function writes just before OpenVideo: the output mode (read straight into the
+    // block), and the flag derived from the status answer (1 here; the enum next to the mode is already 2).
+    if (REMOTE(c, MODE, obj + 0x2e8) == SL_CALL_ERROR || REMOTE(c, REMOTE_MEMSET, obj + 0x2fc, 1, 1) == SL_CALL_ERROR) return -1;
+    uint8_t theirs[0x2f0], ours[0x2f0];
+    if (sl_inject_read_at(&c->ctx, obj + 0x38, theirs, sizeof theirs)) return -1;
+    struct buffers got;
+    memcpy(got.out1, theirs + 0x1b8, sizeof got.out1);
+    memcpy(got.out2, theirs + 0x1d8, sizeof got.out2);
+    video_params_1360(ours, mode, req, c->feature, c->variant, &got);
+    unsigned differing = 0;
+    for (size_t i = 0; i < sizeof ours; i += 4) {
+        uint32_t x, y;
+        memcpy(&x, ours + i, 4);
+        memcpy(&y, theirs + i, 4);
+        if (x == y) continue;
+        if (differing++ < 70) log_line("lab: block word 0x%zx: ours 0x%x, SceRemotePlay's 0x%x", i, x, y);
+    }
+    log_line("lab: SceRemotePlay's own block: %u of %zu words differ from this helper's", differing, sizeof ours / 4);
+    const int64_t opened = REMOTE(c, OPEN_VIDEO, obj + 0x38, obj + 0x40, 0);
+    log_line("lab: SceRemotePlay's own block: OpenVideo -> 0x%llx", (unsigned long long)opened);
+    if (!good(opened)) return opened == SL_CALL_ERROR ? -1 : 0;
+    c->video_unknown = 1;
+    if (sl_inject_read_at(&c->ctx, obj + 0x38, &c->video, 8) || !c->video) { c->cleanup_failed = 1; return -1; }
+    c->video_unknown = 0;
+    c->video_open = 1;
+    if (prepare_stream_buffer(c, base)) return -1;
+    c->video_start_attempted = 1;
+    const int64_t started = REMOTE(c, START, c->video);
+    log_line("lab: SceRemotePlay's own block: Start -> 0x%llx", (unsigned long long)started);
+    if (good(started)) return 1;
+    if (started == SL_CALL_ERROR) return -1;
+    if (!good(REMOTE(c, CLOSE, c->video))) return -1;
+    c->video_open = 0; c->video_start_attempted = 0; c->video = 0;
+    (void)REMOTE(c, REMOTE_FREE, obj);
+    return 0;
+}
+
 static int lab_run(void)
 {
     struct start_req req = {.selector = 3, .fps_flag = 1, .bitrate = 6000000, .width = 1280, .height = 720, .fps = 60};
@@ -1110,6 +1188,12 @@ static int lab_run(void)
     probe_status(&c, base);
     if (query_buffers(&c, base, mode, &req, &c.bufs)) { log_line("lab: no buffers from the service"); goto end; }
     c.kind = OPEN_13_60_BUFFERS;
+    result = lab_native(&c, base, mode, &req);
+    if (result == 1) {
+        log_line("lab: START ACCEPTED (SceRemotePlay's own block)");
+        result = 0;
+        lab_pictures(&c, base);
+    } else if (result == 0) result = 1;
     // Four steps that need two re-registrations and one EnableScanInEncode: id 12, id 0xb4 (SceRemotePlay's, with
     // its process id), then EnableScanInEncode on, then id 12 again (with the process id). Two variants each.
     static const uint32_t variants[] = {2, 6};
