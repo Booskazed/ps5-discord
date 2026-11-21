@@ -787,6 +787,16 @@ static void cleanup(struct capture *c)
 
 static void why(const char *text) { if (!segment.why[0]) snprintf(segment.why, sizeof segment.why, "%s", text); }
 
+#ifdef SL_PS5
+// Whether a path exists. Not access(): it checks the real user's rights, and the data folder is root's (0700), so
+// it fails for this process where open() and stat() (the effective user's) succeed.
+static int file_exists(const char *path)
+{
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+#endif
+
 enum session_end { SESS_STOPPED, SESS_RECOVERABLE, SESS_FAILED };
 
 // One capture session: attach, open the encoder, stream until the core stops it or something
@@ -852,7 +862,7 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
         // functions, and write the images of the modules involved next to the log, read-only, so the
         // sequence and the parameter block it builds can be compared with ours offline (once: the files stay).
         if (open_rc != SL_CALL_ERROR && (uint32_t)open_rc == OPEN_BUSY && !c.ctx.quarantined) {
-            if (access(CAP_DIR "/remoteplay-image.bin", F_OK) == 0) {
+            if (file_exists(CAP_DIR "/remoteplay-image.bin")) {
                 log_line("diag: the module images are already on the console; not read again");
             } else {
                 diag_native_sequence(&c.ctx, c.fn, symbols, REMOTE_GETPID, log_line);
@@ -1137,7 +1147,7 @@ end:
 static int helper_run(void)
 {
 #ifdef SL_PS5
-    if (access(CAP_DIR "/lab", F_OK) == 0) {
+    if (file_exists(CAP_DIR "/lab")) {
         (void)unlink(CAP_DIR "/lab");
         return lab_run();
     }
