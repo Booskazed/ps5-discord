@@ -1,0 +1,231 @@
+# Full community build of ps5-discord: the PPSA99072 app package with everything inside
+# (core with libdave, FFmpeg's AAC decoder, the capture helper, the overlay, the app).
+#
+#   - every push to `community`, and a manual run (Actions > build > Run workflow);
+#   - a tag `v<VERSION>` also publishes a GitHub prerelease with the files and the CHANGELOG notes.
+#
+# Jobs: `dave` and `ffmpeg` build the two slow libraries once and cache them (a cache hit skips
+# the build), then `build` compiles, tests and packages, and `release` (tags only) publishes.
+# GitHub scopes caches by ref: a tag build cannot read the ones made on `community`, so the
+# first build of a new tag rebuilds libdave (slow, once).
+#
+# The built-in updater is left alone: it reads the upstream repository's releases and trusts
+# only upstream's keys, so this workflow publishes no update.txt or update.sig.
+name: build
+
+on:
+  push:
+    branches: [community]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push waits for the running build instead of cancelling libdave half-way.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  dave:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache libdave (OpenSSL, mlspp, libdave for the PS5 and the host)
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: .deps/dave
+          key: dave-${{ hashFiles('tools/dave/**') }}
+      - name: Build tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm cmake ninja-build perl unzip curl wget python3 git xz-utils ca-certificates
+          for t in ar ranlib; do
+            command -v llvm-$t >/dev/null || sudo ln -s "$(ls /usr/bin/llvm-$t-* | sort -V | tail -1)" /usr/local/bin/llvm-$t
+          done
+          clang --version | head -1
+          cmake --version | head -1
+          ninja --version
+      - name: make deps (the SDK libdave builds with)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: make deps
+      - name: make dave (slow)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: make dave
+      - name: Check the libraries
+        run: |
+          for t in ps5 host; do
+            test -s ".deps/dave/install/$t/lib/libdave.a" || { echo "::error::libdave for $t is missing"; exit 1; }
+          done
+
+  ffmpeg:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Cache FFmpeg's AAC decoder (the AirPods microphone)
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: .deps/ffmpeg
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/**') }}
+      - name: Build tools
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm cmake ninja-build perl unzip curl wget python3 git xz-utils ca-certificates
+          for t in ar ranlib; do
+            command -v llvm-$t >/dev/null || sudo ln -s "$(ls /usr/bin/llvm-$t-* | sort -V | tail -1)" /usr/local/bin/llvm-$t
+          done
+      - name: make deps (the SDK FFmpeg builds with)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: make deps
+      - name: make ffmpeg
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: make ffmpeg
+      - name: Check the libraries
+        run: |
+          test -s .deps/ffmpeg/install/ps5/lib/libavcodec.a || { echo "::error::FFmpeg for the PS5 is missing"; exit 1; }
+
+  build:
+    needs: [dave, ffmpeg]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm cmake ninja-build perl unzip curl wget python3 git xz-utils ca-certificates
+          for t in ar ranlib; do
+            command -v llvm-$t >/dev/null || sudo ln -s "$(ls /usr/bin/llvm-$t-* | sort -V | tail -1)" /usr/local/bin/llvm-$t
+          done
+      - name: Restore libdave
+        uses: actions/cache/restore@v6
+        with:
+          path: .deps/dave
+          key: dave-${{ hashFiles('tools/dave/**') }}
+          fail-on-cache-miss: true
+      - name: Restore FFmpeg
+        uses: actions/cache/restore@v6
+        with:
+          path: .deps/ffmpeg
+          key: ffmpeg-${{ hashFiles('tools/ffmpeg/**') }}
+          fail-on-cache-miss: true
+      - name: Check the version
+        run: |
+          version=$(cat VERSION)
+          # Never -dev: the app replaces a -dev+g<commit> core with the one it embeds.
+          case "$version" in
+            *-dev*) echo "::error::VERSION $version contains -dev"; exit 1 ;;
+          esac
+          if [[ $GITHUB_REF_TYPE == tag && $GITHUB_REF_NAME != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match VERSION $version (expected v$version)"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "Building $version"
+      - name: make deps (SDK, mbedTLS, zlib, opus, cJSON, qrcodegen, SQLite, certificates, adapter firmware)
+        run: make deps
+      - name: Core, capture helper and overlay (make RELEASE=1 CORE_LAN=0 all)
+        run: |
+          set -o pipefail
+          mkdir -p out
+          make RELEASE=1 CORE_LAN=0 all 2>&1 | tee out/build.log
+      - name: Fail if libdave or FFmpeg was left out
+        run: |
+          if grep -q 'no-DAVE stub' out/build.log; then
+            echo "::error::the core was built with the no-DAVE stub: every voice call would fail (code 4017)"
+            exit 1
+          fi
+          if grep -q 'FFmpeg for the PS5 is missing' out/build.log; then
+            echo "::error::the core was built without FFmpeg: the AirPods microphone would not decode"
+            exit 1
+          fi
+          if grep -a -q -F "$VERSION-dev" build/ps5-discord.elf; then
+            echo "::error::the core announces a -dev version; the app would replace it with its own"
+            exit 1
+          fi
+          grep -a -q -F "$VERSION" build/ps5-discord.elf || { echo "::error::the core does not announce $VERSION"; exit 1; }
+          for f in build/ps5-discord.elf capture/build/discord-capture.elf overlay/build/overlay-service.elf overlay/build/overlay-restart.elf overlay/build/overlay.build; do
+            test -s "$f" || { echo "::error::$f was not built"; exit 1; }
+          done
+      - name: make test (host self-checks, with libdave)
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee out/test.log
+      - name: App package (cd app && make deps && RELEASE=1 make)
+        run: |
+          set -o pipefail
+          cd app
+          make deps 2>&1 | tee ../out/app-deps.log
+          RELEASE=1 make 2>&1 | tee ../out/app-build.log
+      - name: Check the package and collect the files
+        run: |
+          d=app/dist/PPSA99072
+          for f in eboot.bin version.txt assets/ps5-discord.elf assets/discord-capture.elf assets/overlay.elf assets/overlay-restart.elf assets/overlay.build assets/controller-audio.elf firmware/rtl8761bu_fw.bin; do
+            test -s "$d/$f" || { echo "::error::$f is missing or empty in the app package"; exit 1; }
+          done
+          test "$(cat "$d/version.txt")" = "$VERSION" || { echo "::error::version.txt is not $VERSION"; exit 1; }
+          cmp build/ps5-discord.elf "$d/assets/ps5-discord.elf" || { echo "::error::the app embeds another core than the one just built"; exit 1; }
+          test -s app/dist/PPSA99072.zip || { echo "::error::app/dist/PPSA99072.zip is missing"; exit 1; }
+          mkdir -p out/release
+          cp app/dist/PPSA99072.zip build/ps5-discord.elf out/release/
+          (cd out/release && sha256sum PPSA99072.zip ps5-discord.elf > SHA256SUMS && cat SHA256SUMS)
+      - name: Upload the package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PPSA99072-${{ env.VERSION }}-run${{ github.run_number }}
+          path: out/release/
+          retention-days: 30
+      - name: Upload the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-run${{ github.run_number }}
+          path: out/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: PPSA99072-*
+          path: dl
+          merge-multiple: true
+      - name: Publish the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cat VERSION)
+          [[ $GITHUB_REF_NAME == "v$version" ]] || { echo "::error::tag $GITHUB_REF_NAME is not v$version"; exit 1; }
+          mkdir -p assets
+          cp dl/PPSA99072.zip "assets/ps5-discord-app-v$version.zip"
+          cp dl/ps5-discord.elf "assets/ps5-discord-core-v$version.elf"
+          (cd assets && sha256sum ps5-discord-* > SHA256SUMS && cat SHA256SUMS)
+          # The CHANGELOG section of this version, else [Unreleased].
+          section() { awk -v h="## [$1]" 'index($0, h) == 1 { p = 1; next } /^## \[/ { p = 0 } p' CHANGELOG.md; }
+          notes=$(section "$version")
+          [[ -n ${notes//[[:space:]]/} ]] || notes=$(section Unreleased)
+          {
+            echo "Community build of ps5-discord, from the fork $GITHUB_REPOSITORY. Not published or signed by the upstream author."
+            echo "The app's built-in updater only offers upstream releases; installing one of those replaces this build."
+            echo
+            echo "Install: replace /data/homebrew/PPSA99072 with the folder inside ps5-discord-app-v$version.zip (app closed, core stopped)."
+            echo
+            echo "$notes"
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" assets/* \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            --title "$GITHUB_REF_NAME (community build)" --notes-file notes.md
