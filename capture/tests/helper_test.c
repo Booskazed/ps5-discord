@@ -26,7 +26,7 @@
 enum scenario { OK, VIDEO_OPEN_FAIL, VIDEO_START_FAIL, BAD_HEADERS, VIDEO_OVERSIZE, TRANSPORT_FAIL, CALLBACK_FAIL,
                 NO_IDR, MODE_120HZ, CLOSE_FAIL, MODE_TRANSITION, MODE_CHANGED, CORE_CLOSES, BAD_PROFILE,
                 HANDLE_READ_FAIL, STOP_SETUP, EOF_SETUP, STOP_HEADERS, SLOW_SETUP, MODE_OTHER, MODE_ZERO, STOP_ATTACH, EOF_ATTACH, STOP_MODE, EOF_MODE, MODE_QUERY_ONCE, MODE_QUERY_FAIL, RESTORED_ABORT,
-                SCENARIO_COUNT, OPEN_BUSY_ONCE, OPEN_BUSY_ALWAYS, PROBE_OPENS_LATE, PROBE_ALL_REFUSED,
+                SCENARIO_COUNT, OPEN_BUSY_ONCE, OPEN_BUSY_ALWAYS, FW1360_NATIVE_ONLY, FW1360_OLD_AFTER_SCAN, FW1360_REFUSED,
                 RECOVER_OK, RECOVER_ZERO_MODE, RECOVER_REOPEN_FAIL, RECOVER_SECOND_FAULT, RECOVER_BAD_CLEANUP,
                 RECOVER_TRANSPORT, RECOVER_120HZ, RECOVER_EARLY_MODE, RECOVER_LAST = RECOVER_EARLY_MODE };
 static enum scenario scenario;
@@ -35,12 +35,9 @@ static const uint64_t video_handle = 0x1234567800000012ull;
 static unsigned calls[FUNCTION_COUNT], vstop, vclose, detached, freed, attachments, mode_samples, reads_in_session;
 static int saw_video_start, saw_bitrate, error_fired;
 static uint32_t cur_feature;   // the arbitrator id last registered (and not yet cleared)
-static uint64_t cur_pid_arg;   // ChangeState's fourth argument the last time
-static int known_feature(uint64_t id)
-{
-    for (size_t i = 0; i < PROBE_FEATURE_COUNT; i++) if (PROBE_FEATURES[i] == id) return 1;
-    return 0;
-}
+static unsigned native_blocks; // how many 13.60 parameter blocks OpenVideo was given
+static uint32_t rd32(const uint8_t *p) { uint32_t v; memcpy(&v, p, 4); return v; }
+static uint64_t rd64(const uint8_t *p) { uint64_t v; memcpy(&v, p, 8); return v; }
 static const uint8_t real_sps[] = {
     0x67,0x4d,0x40,0x28,0x91,0x8a,0x01,0x40,0x16,0xec,0x05,0xa8,0x08,0x08,
     0x0a,0x00,0x00,0x1f,0x48,0x00,0x07,0x53,0x01,0x13,0x43,0xc7,0xc5,0x40
@@ -117,34 +114,50 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
             scenario == MODE_CHANGED ? 0x40 : scenario == MODE_OTHER ? 0x31 : scenario == MODE_ZERO ? 0 : 0x30 : 0x30;
         break;
     case SET_CALLBACK:
-        assert((a[0] == FEATURE || (!fw_override && known_feature(a[0]))) && a[1] == REMOTE_GETPID + 1);
+        assert(a[0] == FEATURE && a[1] == REMOTE_GETPID + 1);
         if (scenario == CALLBACK_FAIL) return -1;
         cur_feature = (uint32_t)a[0];
         break;
     case CHANGE_STATE:
-        assert(!strcmp((const char *)(uintptr_t)a[1], "RUNNING") && a[0] == cur_feature);
-        cur_pid_arg = a[3];
+        assert(!strcmp((const char *)(uintptr_t)a[1], "RUNNING") && a[0] == cur_feature && a[3] == 0);
         break;
     case CLEAR_CALLBACK: assert(a[0] == cur_feature); break;
-    case OPEN_VIDEO:
+    case OPEN_VIDEO: {
         assert(a[0] == (uint64_t)(uintptr_t)scratch && a[1] == a[0] + 8 && a[2] == 0);
-        assert(*(uint32_t *)(scratch + 8) == 0x2e0 || (!fw_override && *(uint32_t *)(scratch + 8) == 0x2e8));
-        assert(*(uint32_t *)(scratch + 0x30) == cur_feature);
-        assert(*(uint32_t *)(scratch + 0x20) == profile.selector);
-        assert(*(uint32_t *)(scratch + 0x24) == profile.fps_flag);
-        assert(*(uint32_t *)(scratch + 0x2c) == 0);
-        assert(*(uint32_t *)(scratch + 0xd0) == profile.bitrate && *(uint32_t *)(scratch + 0xd4) == profile.bitrate);
-        assert(*(uint32_t *)(scratch + 0x210) == profile.width && *(uint32_t *)(scratch + 0x214) == profile.height);
-        assert(*(uint32_t *)(scratch + 0x2a8) == (scenario == MODE_120HZ ? 0x40u : recovery_scenario() && attachments > 1 ? 0x13cu : 0x30u));
+        const int native = rd64(scratch + 8) == 0x2e8; // 13.60's block says 0x2e8, 13.00's says 0x2e0
+        assert(native ? fw_override == 0x1360 : rd32(scratch + 8) == 0x2e0);
+        assert(rd32(scratch + 0x30) == cur_feature && rd32(scratch + 0x20) == profile.selector);
+        assert(rd32(scratch + 0x24) == profile.fps_flag && rd32(scratch + 0x2c) == 0);
+        if (native) {
+            // the values SceRemotePlay's own code gives the block (module+0x6f840, +0x70190, +0x704c0)
+            const uint32_t bps = profile.bitrate / 1000 * 1000;
+            assert(rd64(scratch + 0x10) == 0x28 && rd32(scratch + 0x1c) == 2);
+            assert(rd32(scratch + 0xd4) == bps && rd32(scratch + 0xd8) == (uint32_t)((uint64_t)bps * 1001 / (profile.fps * 1000)));
+            assert(rd32(scratch + 0xdc) == 0xffbf5f14u && rd32(scratch + 0xe0) == 0x33);
+            assert(rd32(scratch + 0x138) == profile.fps && rd32(scratch + 0x2d4) == (profile.fps == 30 ? 0x37u : 0x6eu));
+            assert(rd32(scratch + 0x4c) == (profile.fps == 30 ? 136u : 68u) && rd32(scratch + 0xfc) == rd32(scratch + 0x4c));
+            assert(rd64(scratch + 0xc0) == 0xe8 && rd64(scratch + 0x1f8) == 0xf8 && rd64(scratch + 0x228) == 0x88);
+            assert(rd32(scratch + 0x214) == 384 && rd32(scratch + 0x218) == 352 && rd32(scratch + 0x21c) == 512 &&
+                   rd64(scratch + 0x220) == 278528);
+            assert(rd32(scratch + 0x2b0) == (scenario == MODE_120HZ ? 0x40u : 0x30u));
+            assert(rd32(scratch + 0x2b4) == 2 && scratch[0x2c4] == 1 && rd64(scratch + 0x1a8) == 0); // no descriptors on the host
+            assert(rd32(scratch + 0x238) == 0x3f800000u && scratch[0x230] == 0 && scratch[0x2af] == 0); // not the 0xff fill
+            native_blocks++;
+        } else {
+            assert(rd32(scratch + 0xd0) == profile.bitrate && rd32(scratch + 0xd4) == profile.bitrate);
+            assert(rd32(scratch + 0x210) == profile.width && rd32(scratch + 0x214) == profile.height);
+            assert(rd32(scratch + 0x2a8) == (scenario == MODE_120HZ ? 0x40u : recovery_scenario() && attachments > 1 ? 0x13cu : 0x30u));
+        }
         if (scenario == RECOVER_REOPEN_FAIL && attachments > 1) return -1;
         if (scenario == VIDEO_OPEN_FAIL) return -1;
         // 13.60: the encoder answers 0x81950008 while it is not ready, as it does to SceRemotePlay
         if (scenario == OPEN_BUSY_ALWAYS || (scenario == OPEN_BUSY_ONCE && calls[OPEN_VIDEO] == 1)) return (int64_t)0x81950008u;
-        // other firmware: only the id, process id and size SceRemotePlay uses are accepted (or none)
-        if (scenario == PROBE_ALL_REFUSED || (scenario == PROBE_OPENS_LATE && !(cur_feature == 0xb4 && cur_pid_arg == 123 &&
-                                                                               *(uint32_t *)(scratch + 8) == 0x2e8)))
+        // 13.60 with the host's fake encoder: it takes only one kind of block (after EnableScanInEncode for 13.00's), or none
+        if (scenario == FW1360_REFUSED || (scenario == FW1360_NATIVE_ONLY && !native) ||
+            (scenario == FW1360_OLD_AFTER_SCAN && (native || !calls[ENABLE_SCAN])))
             return (int64_t)0x81950008u;
         *(uint64_t *)(uintptr_t)a[0] = video_handle; break;
+    }
     case BITRATE_SET:
         assert(a[0] == video_handle && !saw_video_start);   // before Start, never after
         assert(*(uint32_t *)(scratch + 0x780 + 8) == profile.bitrate);
@@ -340,7 +353,7 @@ static void reset_fake(void)
     memset(calls, 0, sizeof calls);
     vstop = vclose = detached = freed = attachments = mode_samples = reads_in_session = 0;
     saw_video_start = saw_bitrate = error_fired = 0;
-    cur_feature = 0; cur_pid_arg = 0;
+    cur_feature = 0; native_blocks = 0;
 }
 
 static const struct start_req profiles[] = {
@@ -527,26 +540,30 @@ int main(void)
         cases += 2;
     }
 
-    // A firmware the sequence was not validated on: the helper tries the arbitrator ids, process ids and
-    // block sizes SceRemotePlay uses, once each, and goes on with the combination the encoder accepts;
-    // when none is accepted it says so, after exactly those attempts.
+    // Firmware 13.60 (upstream issue #11): the 13.00 block is refused there. The helper registers as ever, then
+    // tries 13.60's block (the one SceRemotePlay's own code builds), then 13.00's, without and then with
+    // EnableScanInEncode, and goes on with the first the encoder accepts; when none is accepted it says so,
+    // after exactly those attempts. (The service's status and buffer queries exist on the console only, so on
+    // the host 13.60's block is tried without the buffer descriptors.)
     {
-        fw_override = 0;
-        scenario = PROBE_OPENS_LATE; profile = profiles[0]; reset_fake();
+        fw_override = 0x1360;
+        scenario = FW1360_NATIVE_ONLY; profile = profiles[1]; reset_fake(); // 720p60
         struct seen s; int rc;
         run_helper(&profile, &s, &rc, 1, 1);
-        // id 12 with its four variants, then id 0xb4 with the process id and the 0x2e8 size: the eighth try
-        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 8 && calls[ENABLE_SCAN] == 0 && s.videos >= 8 && !s.states[CAP_ERROR]);
-        assert(calls[SET_CALLBACK] == 8 && calls[CHANGE_STATE] == 8 && calls[CLEAR_CALLBACK] == 8);
-        assert(vstop == 1 && vclose == 1 && calls[TERMINATE] == 1 && attachments == 1 && detached == 1);
-        scenario = PROBE_ALL_REFUSED; reset_fake();
+        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 1 && calls[ENABLE_SCAN] == 0 && native_blocks == 1);
+        assert(s.videos >= 8 && !s.states[CAP_ERROR] && vstop == 1 && vclose == 1 && calls[TERMINATE] == 1);
+        assert(calls[SET_CALLBACK] == 1 && calls[CHANGE_STATE] == 1 && calls[CLEAR_CALLBACK] == 1);
+        scenario = FW1360_OLD_AFTER_SCAN; profile = profiles[2]; reset_fake(); // 1080p30
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 4 && calls[ENABLE_SCAN] == 1 && native_blocks == 2);
+        assert(s.videos >= 8 && !s.states[CAP_ERROR] && vstop == 1 && vclose == 1);
+        scenario = FW1360_REFUSED; reset_fake();
         run_helper(&profile, &s, &rc, 1, 1);
         assert(s.hello && rc == 1 && !s.videos && s.states[CAP_ERROR] == 1 && s.error[0]);
-        assert(calls[OPEN_VIDEO] == 2 * PROBE_FEATURE_COUNT * 4 && calls[ENABLE_SCAN] == 1 && vclose == 0);
-        assert(calls[SET_CALLBACK] == calls[OPEN_VIDEO] && calls[CLEAR_CALLBACK] == calls[OPEN_VIDEO] && calls[TERMINATE] == 1);
-        fw_override = 1;
+        assert(calls[OPEN_VIDEO] == 4 && calls[ENABLE_SCAN] == 1 && native_blocks == 2 && vclose == 0 && calls[TERMINATE] == 1);
+        fw_override = 0x1300;
         for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
-        cases += 2;
+        cases += 3;
     }
 
     // A missing connection file and a core that never sends a start are clean failures: nothing
