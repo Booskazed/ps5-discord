@@ -84,6 +84,11 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   workflow runs failed with "undefined reference to `sin'"; upstream `develop`'s `test` workflow was
   red since 45c8b78 for that reason).
 - Settings > About > Source shows `github.com/Booskazed/ps5-discord`.
+- In-game overlay: `overlay/src/core/parent.cpp` allows firmware 13.60 next to 13.00 (an explicit list;
+  every other refusal and the Mono signature checks are unchanged). Colours, button bits, fonts and
+  labels are still unchecked on 13.60.
+- Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00, where the
+  wireless hardware encoder was seen to work; on 13.60 it fails with `0x81950008`. A saved choice wins.
 
 ## [0.6.0-alpha.2] - 2026-10-31
 
