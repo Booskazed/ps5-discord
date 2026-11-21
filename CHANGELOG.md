@@ -119,6 +119,8 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   make 13.60's encoder accept Start (arbitrator id, `sceAvcap2EnableScanInEncode`, the block's encoder
   variant), logs each answer (`lab:` lines) and, if one is accepted, the picture headers and a few pictures.
   The file is removed at start, so the next start is a normal one.
+  (The helper looked for that file and for the module images with `access()`, which checks the real
+  user's rights and fails in the root-only data folder; it uses `stat()` now.)
 
 ## [0.6.0-alpha.2] - 2026-10-31
 
