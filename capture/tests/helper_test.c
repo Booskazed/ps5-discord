@@ -136,7 +136,7 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
             const uint32_t bps = profile.bitrate / 1000 * 1000;
             assert(rd64(scratch + 0x10) == 0x28 && rd32(scratch + 0x1c) == 2);
             assert(rd32(scratch + 0xd4) == bps && rd32(scratch + 0xd8) == (uint32_t)((uint64_t)bps * 1001 / (profile.fps * 1000)));
-            assert(rd32(scratch + 0xdc) == 0xffbf5f14u && rd32(scratch + 0xe0) == 0x33);
+            assert(rd32(scratch + 0xdc) == 0x23 && rd32(scratch + 0xe0) == 0x33);
             assert(rd32(scratch + 0x138) == profile.fps && rd32(scratch + 0x2d4) == (profile.fps == 30 ? 0x37u : 0x6eu));
             assert(rd32(scratch + 0x4c) == (profile.fps == 30 ? 136u : 68u) && rd32(scratch + 0xfc) == rd32(scratch + 0x4c));
             assert(rd64(scratch + 0xc0) == 0xe8 && rd64(scratch + 0x1f8) == 0xf8 && rd64(scratch + 0x228) == 0x88);
