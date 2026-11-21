@@ -89,6 +89,10 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   labels are still unchecked on 13.60.
 - Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00, where the
   wireless hardware encoder was seen to work; on 13.60 it fails with `0x81950008`. A saved choice wins.
+- Wireless Go Live diagnostic (`capture/src/diag_native.c`): when the encoder answers `0x81950008`, the
+  helper reads (only reads) SceRemotePlay's code, finds where it calls `sceAvcap2Initialize`,
+  `sceAvcap2EnableScanInEncode`, `sceAvcap2OpenVideo` and the resource arbitrator, and writes the code
+  leading to each call to `capture.log`, to compare the sequence and the parameter block with 13.00's.
 
 ## [0.6.0-alpha.2] - 2026-10-31
 

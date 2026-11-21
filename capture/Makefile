@@ -14,9 +14,9 @@ endif
 .PHONY: all test clean
 all: build/discord-capture.elf
 
-build/discord-capture.elf: src/helper.c src/inject.c src/inject_broker.c src/inject_broker.h src/h264_timing.c src/h264_timing.h src/inject.h src/inject_broker.h ../src/capture_proto.h
+build/discord-capture.elf: src/helper.c src/inject.c src/inject_broker.c src/inject_broker.h src/h264_timing.c src/h264_timing.h src/inject.h src/inject_broker.h src/diag_native.c src/diag_native.h src/diag_scan.c src/diag_scan.h ../src/capture_proto.h
 	@mkdir -p build
-	$(CC_PS5) $(CFLAGS) -O2 -g -DSL_PS5 -o $@ src/helper.c src/inject.c src/inject_broker.c src/h264_timing.c
+	$(CC_PS5) $(CFLAGS) -O2 -g -DSL_PS5 -o $@ src/helper.c src/inject.c src/inject_broker.c src/h264_timing.c src/diag_native.c src/diag_scan.c
 
 build/helper-test: tests/helper_test.c src/helper.c src/inject_broker.c src/h264_timing.c src/h264_timing.h src/inject.h src/inject_broker.h ../src/capture_proto.h
 	@mkdir -p build
@@ -30,10 +30,15 @@ build/inject-test: tests/inject_test.c src/inject.c src/inject.h src/inject_brok
 	@mkdir -p build
 	$(CC) $(CFLAGS) -Itests/fake -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tests/inject_test.c
 
-test: build/helper-test build/h264-test build/inject-test
+build/diag-test: tests/diag_scan_test.c src/diag_scan.c src/diag_scan.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer -o $@ tests/diag_scan_test.c src/diag_scan.c
+
+test: build/helper-test build/h264-test build/inject-test build/diag-test
 	./build/helper-test
 	./build/h264-test
 	./build/inject-test
+	./build/diag-test
 
 clean:
 	rm -rf build

@@ -1,0 +1,123 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// See diag_native.h. Read-only: the target stays stopped and untouched; only its memory is read.
+#include "diag_native.h"
+
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include <ps5/kernel.h>
+
+#include "diag_scan.h"
+
+#define PAGE 0x4000u
+#define IMAGE_CAP (96u << 20) // how much of the main module's image is looked at
+#define HOLES_MAX 32u         // unmapped pages tolerated inside the image
+#define BUDGET_MS 40000u
+#define SITES_MAX 4
+#define SLOTS_MAX 4
+#define FUNCS_MAX 16
+
+static uint64_t now(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (uint64_t)t.tv_sec * 1000u + (uint64_t)t.tv_nsec / 1000000u;
+}
+
+static void hexdump(diag_log_fn log, const uint8_t *p, uint64_t addr, size_t len)
+{
+    for (size_t i = 0; i < len; i += 32) {
+        char line[32 * 3 + 1];
+        const size_t n = len - i < 32 ? len - i : 32;
+        for (size_t j = 0; j < n; j++) snprintf(line + j * 3, 4, "%02x ", p[i + j]);
+        log("  %llx: %s", (unsigned long long)(addr + i), line);
+    }
+}
+
+void diag_native_sequence(sl_inject *ctx, const intptr_t *fn, const char *const *name, size_t count, diag_log_fn log)
+{
+    const uint64_t t0 = now();
+    const pid_t pid = ctx->target_pid;
+    const intptr_t base = kernel_dynlib_mapbase_addr(pid, 0); // handle 0: the main executable
+    log("diag: SceRemotePlay pid %d, main module base 0x%llx", (int)pid, (unsigned long long)base);
+    if (base <= 0 || count == 0 || count > FUNCS_MAX) return;
+
+    // How far the module's image reaches: mapped 16 KiB pages from its base, a few holes tolerated.
+    const size_t total = IMAGE_CAP / PAGE;
+    int *prot = malloc(total * sizeof *prot);
+    if (!prot) return;
+    size_t pages = 0, holes = 0;
+    for (size_t i = 0; i < total && holes <= HOLES_MAX; i++) {
+        prot[i] = kernel_get_vmem_protection(pid, base + (intptr_t)(i * PAGE), PAGE);
+        if (prot[i] < 0) { holes++; continue; }
+        holes = 0;
+        pages = i + 1;
+    }
+    if (!pages) { log("diag: nothing is mapped at the module base"); free(prot); return; }
+    const size_t len = pages * PAGE;
+    uint8_t *img = calloc(1, len);
+    if (!img) { free(prot); return; }
+
+    size_t read_ok = 0, mapped = 0;
+    for (size_t i = 0; i < pages; i++) {
+        if (prot[i] < 0) continue;
+        mapped++;
+        if (now() - t0 > BUDGET_MS) { log("diag: time budget spent after %zu of %zu pages", i, pages); break; }
+        uint8_t *dst = img + i * PAGE;
+        const intptr_t at = base + (intptr_t)(i * PAGE);
+        if (sl_inject_read_at(ctx, at, dst, PAGE) == 0 || sl_inject_read_code_at(ctx, at, dst, PAGE) == 0) read_ok++;
+    }
+    log("diag: image 0x%zx bytes, %zu mapped pages, %zu read", len, mapped, read_ok);
+
+    // Where each function's address is stored (the import slots of this module).
+    uint64_t want[FUNCS_MAX];
+    for (size_t i = 0; i < count; i++) want[i] = (uint64_t)fn[i];
+    struct diag_hit hits[64];
+    size_t nh = diag_find_qwords(img, len, (uint64_t)base, want, count, hits, 64);
+    if (nh > 64) nh = 64;
+    uint64_t slots[FUNCS_MAX][SLOTS_MAX];
+    size_t nslots[FUNCS_MAX] = {0};
+    for (size_t h = 0; h < nh; h++) {
+        const size_t f = hits[h].index;
+        log("diag: %s (0x%llx) is held at 0x%llx", name[f], (unsigned long long)fn[f], (unsigned long long)hits[h].addr);
+        if (nslots[f] < SLOTS_MAX) slots[f][nslots[f]++] = hits[h].addr;
+    }
+
+    // The calls that reach each function, and the code leading to them.
+    for (size_t f = 0; f < count; f++) {
+        if (!nslots[f]) { log("diag: no import slot of this module holds %s", name[f]); continue; }
+        struct diag_slot_ref refs[16];
+        size_t nr = diag_refs_to_slots(img, len, (uint64_t)base, slots[f], nslots[f], refs, 16);
+        if (nr > 16) nr = 16;
+        uint64_t sites[SITES_MAX];
+        size_t ns = 0;
+        for (size_t r = 0; r < nr; r++) {
+            if (refs[r].call) {
+                if (ns < SITES_MAX) sites[ns++] = refs[r].site;
+                continue;
+            }
+            uint64_t callers[SITES_MAX];
+            size_t nc = diag_call_sites(img, len, (uint64_t)base, refs[r].site, callers, SITES_MAX);
+            if (nc > SITES_MAX) nc = SITES_MAX;
+            log("diag: %s: thunk at 0x%llx (module+0x%llx), %zu callers", name[f], (unsigned long long)refs[r].site,
+                (unsigned long long)(refs[r].site - (uint64_t)base), nc);
+            for (size_t c = 0; c < nc && ns < SITES_MAX; c++) sites[ns++] = callers[c];
+        }
+        const size_t before = strcmp(name[f], "sceAvcap2OpenVideo") == 0 ? 0x600 : 0x180, after = 0x20;
+        for (size_t s = 0; s < ns; s++) {
+            const uint64_t off = sites[s] - (uint64_t)base;
+            const size_t start = off > before ? (size_t)(off - before) : 0;
+            const size_t end = off + after < len ? (size_t)(off + after) : len;
+            log("diag: %s is called at 0x%llx (module+0x%llx); code from module+0x%zx:", name[f],
+                (unsigned long long)sites[s], (unsigned long long)off, start);
+            hexdump(log, img + start, (uint64_t)base + start, end - start);
+        }
+        if (!ns) log("diag: %s: no call found", name[f]);
+    }
+    log("diag: done in %llu ms", (unsigned long long)(now() - t0));
+    free(img);
+    free(prot);
+}
