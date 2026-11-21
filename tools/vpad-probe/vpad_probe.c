@@ -56,7 +56,11 @@
 #include "usb_forward_report.h"
 #endif
 
+#ifdef APP_DATA_DIR // a side-by-side edition's data folder (src/app_paths.h)
+#define PROBE_DIR APP_DATA_DIR
+#else
 #define PROBE_DIR "/data/ps5-discord"
+#endif
 #if PROBE_USB_FORWARD
 #if PROBE_USB_CALL
 #if PROBE_USB_SERVICE

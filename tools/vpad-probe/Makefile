@@ -5,6 +5,8 @@ SDK := $(abspath $(PS5_PAYLOAD_SDK))
 export LLVM_CONFIG ?= $(or $(shell command -v llvm-config),$(abspath ../llvm-config))
 PS5_CC := $(SDK)/bin/prospero-clang
 HOST_CC ?= cc
+# A side-by-side edition's title and data folder (the root Makefile exports them; empty for the stock build).
+EDITION_FLAGS := $(if $(EDITION_TITLE_ID),-DAPP_TITLE_ID='"$(EDITION_TITLE_ID)"') $(if $(EDITION_DATA_DIR),-DAPP_DATA_DIR='"$(EDITION_DATA_DIR)"')
 
 .PHONY: all game orphan delete-handle usb audio call restore call-restore service test clean
 all: vpad-probe.elf
@@ -46,7 +48,7 @@ vpad-usb-call-probe.elf vpad-usb-call-restore-probe.elf controller-audio.elf: CA
 
 $(USB_TARGETS): $(USB_SOURCES) $(USB_HEADERS) ../ds5-usb-bridge/pcm_stream.c Makefile
 	@echo "  CC    $@"
-	@PS5_PAYLOAD_SDK=$(SDK) $(PS5_CC) -std=gnu11 -Wall -Wextra -Werror -O2 $(PROBE_FLAGS) \
+	@PS5_PAYLOAD_SDK=$(SDK) $(PS5_CC) -std=gnu11 -Wall -Wextra -Werror -O2 $(PROBE_FLAGS) $(EDITION_FLAGS) \
 		-I../ds5-usb-bridge -o $@ $(USB_SOURCES) $(CALL_SOURCE) -lkernel_sys -lSceUserService -lpthread
 
 test: test_usb_forward.c ../../tests/usb_owner.c ../ds5-usb-bridge/ds5_usb_owner.c ../ds5-usb-bridge/ds5_usb_owner.h usb_forward_report.h usb_test_tone.h ../ds5-usb-bridge/ds5_usb.h ../ds5-usb-bridge/ds5_usb_pcm.h ../ds5-usb-bridge/ds5_usb_format.h

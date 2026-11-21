@@ -120,6 +120,23 @@ CORE_LAN ?= 0
 PS5_CFLAGS += -Ibuild
 HOST_CFLAGS += -Ibuild
 
+# A side-by-side edition (README.md "Fork notes"): its own title (the app folder is
+# /data/homebrew/<title>) and its own data folder, so it never reads or writes the stock install's
+# files. Both stay empty for the stock build, whose defaults are in src/app_paths.h:
+#   make EDITION_TITLE_ID=PPSA99073 EDITION_DATA_DIR=/data/ps5-discord-community RELEASE=1 all
+# (then `cd app && make init TITLE_ID=PPSA99073 APP_NAME=... && RELEASE=1 make`, same variables).
+# An edition whose title is not the stock one has no updater: an upstream release zip carries the
+# stock title's param.json and folder name. The flags are not tracked as dependencies: make clean
+# when switching editions. The sub-makes (capture, overlay, tools/vpad-probe) read the same variables.
+EDITION_TITLE_ID ?=
+EDITION_DATA_DIR ?=
+export EDITION_TITLE_ID EDITION_DATA_DIR
+EDITION_FLAGS := $(if $(EDITION_TITLE_ID),-DAPP_TITLE_ID='"$(EDITION_TITLE_ID)"' \
+	$(if $(filter-out PPSA99072,$(EDITION_TITLE_ID)),-DAPP_NO_UPDATES=1)) \
+	$(if $(EDITION_DATA_DIR),-DAPP_DATA_DIR='"$(EDITION_DATA_DIR)"')
+PS5_CFLAGS += $(EDITION_FLAGS)
+PS5_CXXFLAGS += $(EDITION_FLAGS)
+
 PS5_OBJ = $(patsubst %.c,build/ps5/%.o,$(APP_SRC) $(PS5_ONLY_SRC) $(PS5_DAVE_SRC) src/platform/entropy_ps5.c build/ca_bundle.c $(DEP_SRC)) \
 	$(patsubst %.cpp,build/ps5/%.o,$(BLUEV_CXX))
 HOST_OBJ = $(patsubst %.c,build/host/%.o,$(APP_SRC) src/headset_stub.c $(HOST_DAVE_SRC) build/ca_bundle.c $(DEP_SRC))

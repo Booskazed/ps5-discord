@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #pragma once
 
+#ifdef APP_DATA_DIR // a side-by-side edition's data folder (src/app_paths.h)
+#define DS5_USB_OWNER_DIR APP_DATA_DIR
+#else
 #define DS5_USB_OWNER_DIR "/data/ps5-discord"
+#endif
 #define DS5_USB_LOCK "ds5-usb.lock"
 #define DS5_USB_TAKEN "ds5-usb.taken"
 #define DS5_USB_HANDBACK "ds5-usb.handback"

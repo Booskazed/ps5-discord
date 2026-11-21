@@ -9,11 +9,12 @@
 
 #include <cJSON.h>
 
+#include "app_paths.h"
 #include "http.h"
 #include "log.h"
 
 #define APPMETA "/system_data/priv/appmeta" // the console's copy of each title's param file
-#define OWN_TITLE "PPSA99072"
+#define OWN_TITLE APP_TITLE_ID
 
 static char *slurp(const char *path, size_t *len)
 {

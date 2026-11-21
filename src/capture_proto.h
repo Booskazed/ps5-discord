@@ -19,8 +19,12 @@
 #include <stdint.h>
 #include <string.h>
 
-#define CAP_CONN_FILE "/data/ps5-discord/capture.conn"
-#define CAP_LOCK_FILE "/data/ps5-discord/capture.lock"
+// The data folder: APP_DATA_DIR in a side-by-side edition (src/app_paths.h), else the stock one.
+#ifndef APP_DATA_DIR
+#define APP_DATA_DIR "/data/ps5-discord"
+#endif
+#define CAP_CONN_FILE APP_DATA_DIR "/capture.conn"
+#define CAP_LOCK_FILE APP_DATA_DIR "/capture.lock"
 #define CAP_PROCESS_NAME "discord-capture-supervisor.elf" // the parent; its worker: CAP_WORKER_NAME
 #define CAP_WORKER_NAME "discord-capture-worker.elf"
 

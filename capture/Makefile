@@ -6,6 +6,10 @@ SDK := $(abspath $(PS5_PAYLOAD_SDK))
 CC_PS5 := $(SDK)/bin/prospero-clang
 export LLVM_CONFIG
 CFLAGS := -std=gnu11 -Wall -Wextra -Werror -I../src -Isrc
+# A side-by-side edition's data folder (the root Makefile exports it; empty for the stock build).
+ifneq ($(EDITION_DATA_DIR),)
+CFLAGS += -DAPP_DATA_DIR='"$(EDITION_DATA_DIR)"'
+endif
 
 .PHONY: all test clean
 all: build/discord-capture.elf

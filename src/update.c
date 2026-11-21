@@ -23,6 +23,7 @@
 
 #include <mbedtls/sha256.h>
 
+#include "app_paths.h"
 #include "broadcast.h"
 #include "http.h"
 #include "log.h"
@@ -35,7 +36,7 @@
 #define MAX_UNPACKED (1ull << 30)
 
 static char app_dir[256], work[256], bad_file[256], sandbox_dir[64] = "/mnt/sandbox";
-static const char *registered[] = {"/user/appmeta/PPSA99072", "/user/app/PPSA99072/sce_sys"};
+static const char *registered[] = {"/user/appmeta/" APP_TITLE_ID, "/user/app/" APP_TITLE_ID "/sce_sys"};
 // The keys a release must be signed by: the tests put their own in.
 static const unsigned char (*keys)[65] = update_keys;
 static int key_count = (int)(sizeof update_keys / sizeof *update_keys);
@@ -369,7 +370,7 @@ static int app_running(void)
     DIR *d = opendir(sandbox_dir);
     int running = 0;
     for (struct dirent *e; d && !running && (e = readdir(d));) {
-        if (strncmp(e->d_name, "PPSA99072_", 10) != 0)
+        if (strncmp(e->d_name, APP_TITLE_ID "_", sizeof APP_TITLE_ID) != 0)
             continue;
         char path[340];
         snprintf(path, sizeof path, "%s/%s/app0", sandbox_dir, e->d_name);
@@ -517,6 +518,17 @@ static int try_release(cJSON *rel, const char *installed, int force, char *why, 
 // cannot be reached, and why goes to check_error.
 static void check(int force)
 {
+#ifdef APP_NO_UPDATES
+    // A side-by-side edition has its own title and folder name, and an upstream release zip carries the
+    // stock ones: installing it here would break this app. Updates are off; the Settings row says so.
+    (void)force;
+    pthread_mutex_lock(&lock);
+    u.state = "none";
+    u.checked = time(NULL);
+    snprintf(u.check_error, sizeof u.check_error, "Off in this side-by-side edition");
+    pthread_mutex_unlock(&lock);
+    return;
+#endif
     char installed[64], why[96] = "", staged[64] = "";
     installed_version(installed, sizeof installed);
     pthread_mutex_lock(&lock);

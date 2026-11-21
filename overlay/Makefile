@@ -7,8 +7,11 @@ HASH_SOURCES := src/core/worker.cpp src/core/protocol.hpp src/core/hook.hpp src/
              src/app/overlay_ui.hpp src/app/overlay_app.cpp src/app/discord_app.inc src/app/live_pill.hpp vendor/shellui-loader/prologue.hpp
 LAB_SOURCES := $(filter-out src/app/discord_app.inc,$(HASH_SOURCES)) src/app/pill_lab.inc src/app/pill_lab_model.hpp
 LAB_BUILD_ID := $(shell cat $(LAB_SOURCES) | sha256sum | cut -c1-16)
-BUILD_ID := $(shell cat $(HASH_SOURCES) | sha256sum | cut -c1-16)
-FLAGS := -O2 -g -march=znver2 -fPIC -std=c++20 -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wall -Wextra -Werror -fno-omit-frame-pointer -DOVERLAY_BUILD=0x$(BUILD_ID)ULL -Isrc -Isrc/core -Isrc/app -Ivendor/shellui-loader
+# A side-by-side edition (EDITION_TITLE_ID, exported by the root Makefile; empty for the stock build)
+# reads its art from its own app folder, and its build id differs from the stock one's. For the
+# stock build the id is the hash of the sources alone, as before.
+BUILD_ID := $(shell { cat $(HASH_SOURCES); printf '%s' '$(EDITION_TITLE_ID)'; } | sha256sum | cut -c1-16)
+FLAGS := -O2 -g -march=znver2 -fPIC -std=c++20 -fno-exceptions -fno-rtti -fno-threadsafe-statics -Wall -Wextra -Werror -fno-omit-frame-pointer -DOVERLAY_BUILD=0x$(BUILD_ID)ULL -Isrc -Isrc/core -Isrc/app -Ivendor/shellui-loader $(if $(EDITION_TITLE_ID),-DOVERLAY_TITLE_ID='"$(EDITION_TITLE_ID)"')
 LAB_FLAGS := $(filter-out -DOVERLAY_BUILD=%,$(FLAGS)) -DOVERLAY_BUILD=0x$(LAB_BUILD_ID)ULL -DOVERLAY_APP_LAB
 VENDOR := vendor/shellui-loader
 OBJECTS := build/pt.o build/loader.o build/injector.o build/remote-call.o build/blob.o

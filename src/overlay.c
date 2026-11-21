@@ -16,6 +16,7 @@
 #include <sys/socket.h>
 #endif
 
+#include "app_paths.h"
 #include "broadcast.h"
 #include "chat.h"
 #include "headset.h"
@@ -29,7 +30,7 @@
 
 // The overlay engine's data folder (overlay/src/core/protocol.hpp parent_dir).
 #define OVERLAY_DIR "/data/discord-overlay-poc"
-#define APP_ASSETS "/data/homebrew/PPSA99072/assets" // the app's /app0/assets
+#define APP_ASSETS APP_HOMEBREW_DIR "/assets" // the app's /app0/assets
 #define IDLE_LINE "3|x|o|0||0||||||" // state x: the core quit (the overlay goes inert)
 // overlay/src/core/protocol.hpp Command, written by the overlay (Builder::send).
 typedef struct {

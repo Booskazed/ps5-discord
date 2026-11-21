@@ -40,7 +40,7 @@ int sceKernelSetProcessName(const char *name); // the SDK's kernel header does n
 #endif
 
 #ifndef CAP_DIR
-#define CAP_DIR "/data/ps5-discord"
+#define CAP_DIR APP_DATA_DIR // capture_proto.h: the stock folder, or the side-by-side edition's
 #endif
 #ifndef CONN_FILE
 #define CONN_FILE CAP_CONN_FILE

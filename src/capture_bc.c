@@ -20,6 +20,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "app_paths.h"
 #include "capture_proto.h"
 #include "capture_io.h"
 #include "game_audio.h"
@@ -27,7 +28,7 @@
 #include "log.h"
 #include "tls.h"
 
-#define APP_ASSETS "/data/homebrew/PPSA99072/assets"
+#define APP_ASSETS APP_HOMEBREW_DIR "/assets"
 #define HELLO_SLOTS 8
 #define HELLO_MS 500
 #define COMMAND_MS 1000

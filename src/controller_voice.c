@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Core manages call lifetime and saved preference; supervised worker owns USB.
 #include "controller_voice.h"
+#include "app_paths.h"
 #include "prefs.h"
 #include "voice.h"
 #include "voice_audio.h"
@@ -74,8 +75,8 @@ void cv_init(void)
 #include <time.h>
 #include <unistd.h>
 
-#define WORKER "/data/homebrew/PPSA99072/assets/controller-audio.elf"
-#define WORKER_LOCK "/data/ps5-discord/vpad-probe.lock"
+#define WORKER APP_HOMEBREW_DIR "/assets/controller-audio.elf"
+#define WORKER_LOCK APP_DATA_DIR "/vpad-probe.lock"
 
 static uint64_t milliseconds(void)
 {
