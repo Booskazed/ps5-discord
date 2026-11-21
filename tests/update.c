@@ -45,6 +45,23 @@ static void versions(void)
     assert(update_version_ok("1.2.3") && !update_version_ok("1.2") && !update_version_ok("v1.2.3") &&
            !update_version_ok("1.2.3-") && !update_version_ok("1.2.3-a/b"));
     assert(update_prerelease("0.5.0-alpha.1") && update_prerelease("0.5.0-dev") && !update_prerelease("0.5.0"));
+
+    // Community builds (fork releases): <upstream version>.community.<n>, never -dev. Each is newer
+    // than the upstream release it is built on and than its own earlier builds, and older than any
+    // later upstream release (the next alpha, the stable one, the next minor), so the updater
+    // never offers an older upstream release over a community build, and always offers a newer one.
+    assert(update_version_ok("0.6.0-alpha.2.community.1") && update_prerelease("0.6.0-alpha.2.community.1"));
+    assert(update_version_cmp("0.6.0-alpha.2.community.1", "0.6.0-alpha.2") > 0);
+    assert(update_version_cmp("0.6.0-alpha.2", "0.6.0-alpha.2.community.1") < 0);
+    assert(update_version_cmp("0.6.0-alpha.2.community.2", "0.6.0-alpha.2.community.1") > 0);
+    assert(update_version_cmp("0.6.0-alpha.2.community.10", "0.6.0-alpha.2.community.9") > 0); // numbers, not text
+    assert(update_version_cmp("0.6.0-alpha.2.community.1", "0.6.0-alpha.2.community.1") == 0);
+    assert(update_version_cmp("0.6.0-alpha.3", "0.6.0-alpha.2.community.9") > 0);
+    assert(update_version_cmp("0.6.0-beta.1", "0.6.0-alpha.2.community.1") > 0);
+    assert(update_version_cmp("0.6.0", "0.6.0-alpha.2.community.1") > 0);
+    assert(update_version_cmp("0.7.0-alpha.1", "0.6.0-alpha.2.community.1") > 0);
+    assert(update_version_cmp("0.6.0-alpha.2.community.1", "0.6.0-alpha.1") > 0);
+    assert(update_version_cmp("0.6.0-alpha.2.community.1", "0.6.0-alpha.2.community.1-dev+gabc") > 0);
 }
 
 static const char manifest[] = "ps5-discord-update 1\nversion 0.5.0-alpha.1\nasset ps5-discord-app-v0.5.0-alpha.1.zip\n"
