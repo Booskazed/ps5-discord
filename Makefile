@@ -6,6 +6,7 @@
 #   make stop PS5_HOST=<ip>       stop the running copy
 #   control API: 127.0.0.1:9041 for the app (CORE_LAN=1: the LAN too, for make stop)
 #   make host                     build/host/ps5-discord (runs on Linux, token in ./token)
+#   make overlay                  the in-game overlay (overlay/): build/overlay-*.elf, packaged by app/tools/build.sh
 #   make test                     host self-checks
 #   make dave                     build libdave (DAVE E2EE) into .deps/dave with tools/dave/build.sh (run on arlp-pc)
 #   make ffmpeg                   build FFmpeg's AAC decoder (AirPods mic) into .deps/ffmpeg with tools/ffmpeg/build.sh
@@ -121,7 +122,7 @@ PS5_OBJ = $(patsubst %.c,build/ps5/%.o,$(APP_SRC) $(PS5_ONLY_SRC) $(PS5_DAVE_SRC
 	$(patsubst %.cpp,build/ps5/%.o,$(BLUEV_CXX))
 HOST_OBJ = $(patsubst %.c,build/host/%.o,$(APP_SRC) src/headset_stub.c $(HOST_DAVE_SRC) build/ca_bundle.c $(DEP_SRC))
 
-.PHONY: all deps dave ffmpeg host test deploy stop clean release capture capture-test controller-audio-test FORCE
+.PHONY: all deps dave ffmpeg host test deploy stop clean release capture overlay capture-test controller-audio-test FORCE
 .DEFAULT_GOAL := all
 
 build/build_config.h: FORCE
@@ -139,16 +140,23 @@ release:
 	@test -f .deps/firmware/rtl8761bu_fw.bin || { echo "release: the adapter firmware is missing: run make deps first"; exit 1; }
 	$(MAKE) clean
 	$(MAKE) RELEASE=1 CORE_LAN=0 all
+	@test -s overlay/build/overlay-service.elf || { echo "release: the overlay did not build (the app's Overlay page would say \"Not in this build.\")"; exit 1; }
 	$(MAKE) test
 	cd app && RELEASE=1 $(MAKE)
 	rm -rf dist && mkdir -p dist
 	cp build/ps5-discord.elf dist/ps5-discord-core-v$(VERSION).elf
 	cp app/dist/PPSA99072.zip dist/ps5-discord-app-v$(VERSION).zip
 	cd dist && sha256sum ps5-discord-* > SHA256SUMS && cat SHA256SUMS
-all: build/ps5-discord.elf capture
+all: build/ps5-discord.elf capture overlay
 
 capture:
 	$(MAKE) -C capture PS5_PAYLOAD_SDK=$(abspath $(SDK))
+
+# The in-game overlay. app/tools/build.sh copies overlay/build/overlay-service.elf,
+# overlay-restart.elf and overlay.build into the app package only when they exist; without them
+# the app's Overlay page says "Not in this build.". LLVM_CONFIG is exported above, as for capture.
+overlay:
+	$(MAKE) -C overlay PS5_PAYLOAD_SDK=$(abspath $(SDK)) all
 
 capture-test:
 	$(MAKE) -C capture test CC=$(HOST_CC)
@@ -348,6 +356,7 @@ stop:
 clean:
 	rm -rf build
 	$(MAKE) -C capture clean
+	$(MAKE) -C overlay clean
 
 # Header dependencies written by -MMD.
 -include $(PS5_OBJ:.o=.d) $(HOST_OBJ:.o=.d)
