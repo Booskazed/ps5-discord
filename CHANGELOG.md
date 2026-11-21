@@ -113,7 +113,12 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   between tries; every try is logged (`start try`). That alone did not change the answer: between OpenVideo
   and Start, SceRemotePlay also asks `libSceAvcap2` (13.60, +0x1dc0, a getter on the handle) for the address
   and size of the encoder's stream buffer and fills the whole buffer with `0x80`; the helper does the same
-  (`stream buffer` line in `capture.log`) before each Start.
+  (`stream buffer` line in `capture.log`) before each Start. Start was still refused (`0x80c78000`).
+- Capture helper lab mode (console only): started by hand through elfldr with the file `lab` in the data
+  folder, the helper runs no session for a core; on a fixed profile it tries the combinations that could
+  make 13.60's encoder accept Start (arbitrator id, `sceAvcap2EnableScanInEncode`, the block's encoder
+  variant), logs each answer (`lab:` lines) and, if one is accepted, the picture headers and a few pictures.
+  The file is removed at start, so the next start is a normal one.
 
 ## [0.6.0-alpha.2] - 2026-10-31
 

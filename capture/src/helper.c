@@ -322,6 +322,7 @@ struct capture {
     int initialized, callback, video_open, video_start_attempted, cleanup, failed, cleanup_failed;
     uint32_t output_mode, final_mode;
     uint32_t feature;                // the id registered with the resource arbitrator (and written in the block)
+    uint32_t variant;                // the encoder variant written in 13.60's block
 };
 
 // One result per session; the supervisor never conflates capture and cleanup.
@@ -477,7 +478,7 @@ static double bits_double(uint64_t b) { double d; memcpy(&d, &b, sizeof d); retu
 #define NATIVE_CAP_BUDGET 0xffffu
 #define NATIVE_CAP_BUFFER 8192u
 static void video_params_1360(uint8_t p[0x2f0], uint32_t mode, const struct start_req *r, uint32_t feature,
-                              const struct buffers *bufs)
+                              uint32_t variant, const struct buffers *bufs)
 {
     const uint32_t kbps = r->bitrate / 1000u, bps = kbps * 1000u;
     const uint32_t per_frame = (uint32_t)((uint64_t)bps * 1001u / (r->fps * 1000u)); // floor(kbps * 1001 / fps)
@@ -490,7 +491,7 @@ static void video_params_1360(uint8_t p[0x2f0], uint32_t mode, const struct star
     if (second > NATIVE_CAP_BUFFER) second = NATIVE_CAP_BUFFER;
     memset(p, 0, 0x2f0);
     put64(p, 0x08, 0x2e8); put64(p, 0x10, 0x28);
-    put32(p, 0x1c, 2);
+    put32(p, 0x1c, variant); // the encoder variant SceRemotePlay's session configures (2 here; 6 is the other it tests for)
     put32(p, 0x20, r->selector); put32(p, 0x24, r->fps_flag);
     put32(p, 0x30, feature);
     put64(p, 0x38, 0x58); put64(p, 0x40, 0x18);
@@ -516,7 +517,7 @@ static void video_params_1360(uint8_t p[0x2f0], uint32_t mode, const struct star
     put32(p, 0x214, 384); put32(p, 0x218, 352); put32(p, 0x21c, 512); put64(p, 0x220, 278528);
     put64(p, 0x228, 0x88);
     put32(p, 0x238, 0x3f800000u); put32(p, 0x23c, 0x3f800000u);
-    put32(p, 0x2b0, mode); put32(p, 0x2b4, 2);
+    put32(p, 0x2b0, mode); put32(p, 0x2b4, variant == 6 ? 1 : 2); // the code that fills it differs for variant 6
     put64(p, 0x2b8, 0x10); put32(p, 0x2c0, 1); p[0x2c4] = 1;
     put64(p, 0x2c8, 0x10); p[0x2d0] = 1; put32(p, 0x2d4, r->fps == 30 ? 0x37u : 0x6eu);
 }
@@ -533,7 +534,7 @@ static int open_encoder(struct capture *c, intptr_t base, uint32_t *mode, const 
     *rc = SL_CALL_ERROR;
     for (unsigned attempt = 0;; attempt++) {
         if (kind == OPEN_13_00) video_params(block, *mode, req, c->feature, 0x2e0);
-        else video_params_1360(block, *mode, req, c->feature, kind == OPEN_13_60_BUFFERS ? bufs : NULL);
+        else video_params_1360(block, *mode, req, c->feature, c->variant, kind == OPEN_13_60_BUFFERS ? bufs : NULL);
         if (sl_inject_write_at(&c->ctx, base, block, len)) return -1;
         *rc = REMOTE(c, OPEN_VIDEO, base, base + 8, 0);
         if (good(*rc)) return 0;
@@ -607,7 +608,7 @@ static int query_buffers(struct capture *c, intptr_t base, uint32_t mode, const 
     const intptr_t lib = sl_module_base(c->ctx.target_pid, "libSceAvcap2.sprx");
     if (lib <= 0) return -1;
     uint8_t block[0x2f0], in[0x90] = {0}, zero[0x20] = {0};
-    video_params_1360(block, mode, req, c->feature, NULL);
+    video_params_1360(block, mode, req, c->feature, c->variant, NULL);
     put64(in, 0, 0x90);
     memcpy(in + 8, block + 0x10, 0x80);
     const intptr_t at_in = base + 0x1100, at_out1 = base + 0x1200, at_out2 = base + 0x1220;
@@ -794,7 +795,7 @@ enum session_end { SESS_STOPPED, SESS_RECOVERABLE, SESS_FAILED };
 static enum session_end capture_session(const struct start_req *req, int may_recover)
 {
     memset(&segment, 0, sizeof segment);
-    struct capture c = {.startup_deadline = now_ms() + START_WAIT_MS, .feature = FEATURE};
+    struct capture c = {.startup_deadline = now_ms() + START_WAIT_MS, .feature = FEATURE, .variant = 2};
     uint8_t *frame = NULL;
     int first_idr = 0;
     int64_t window_gap = 0, last_read_us = 0;
@@ -1030,9 +1031,117 @@ done:
     return SESS_FAILED;
 }
 
+#ifdef SL_PS5
+// Lab mode: the helper started by hand through elfldr, not by the core, with the file CAP_DIR "/lab" present
+// (the file is removed first, so the next start is a normal one). No core and no Discord: on a fixed profile
+// (720p60, 6 Mbit/s) it tries, one after the other, the combinations that could make 13.60's encoder accept
+// Start, logs every answer (the "lab:" lines) and, if one is accepted, reads the picture headers and a few
+// pictures to see what 13.60 returns for them. Only 13.60's block with the service's buffers is used (it is the
+// one that opens the encoder there); the combinations are the arbitrator id, EnableScanInEncode and the encoder
+// variant of the block.
+static int lab_try(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, const char *what)
+{
+    int64_t rc = SL_CALL_ERROR;
+    if (open_encoder(c, base, mode, req, OPEN_13_60_BUFFERS, &c->bufs, 0, &rc)) {
+        log_line("lab: %s: OpenVideo refused (0x%llx)", what, (unsigned long long)rc);
+        return rc == SL_CALL_ERROR || c->ctx.quarantined ? -1 : 0;
+    }
+    if (take_handle(c, base) || prepare_stream_buffer(c, base)) return -1;
+    c->video_start_attempted = 1;
+    rc = REMOTE(c, START, c->video);
+    log_line("lab: %s: Start -> 0x%llx", what, (unsigned long long)rc);
+    if (good(rc)) return 1;
+    if (rc == SL_CALL_ERROR) return -1;
+    if (!good(REMOTE(c, CLOSE, c->video))) return -1;
+    c->video_open = 0; c->video_start_attempted = 0; c->video = 0;
+    return 0;
+}
+
+static void lab_pictures(struct capture *c, intptr_t base)
+{
+    uint8_t headers[0x200] = {0};
+    if (sl_inject_write_at(&c->ctx, base + 0x2000, headers, sizeof headers) == 0) {
+        const int64_t rc = REMOTE(c, HEADERS, c->video, base + 0x2000);
+        log_line("lab: picture headers -> 0x%llx", (unsigned long long)rc);
+        if (sl_inject_read_at(&c->ctx, base + 0x2000, headers, sizeof headers) == 0) hex_line("lab: headers", headers, 0x40);
+    }
+    const int64_t frame = REMOTE(c, REMOTE_MALLOC, FRAME_CAP);
+    if (frame == SL_CALL_ERROR || frame <= 0) return;
+    c->remote_frame = (uint64_t)frame;
+    log_line("lab: key frame request -> 0x%llx", (unsigned long long)REMOTE(c, KEYFRAME, c->video));
+    for (unsigned i = 0; i < 40 && !c->failed && !c->ctx.quarantined; i++) {
+        const int64_t n = REMOTE(c, READ_VIDEO, c->video, c->remote_frame, FRAME_CAP, base + 0x300, 0);
+        log_line("lab: ReadVideo -> 0x%llx", (unsigned long long)n);
+        if (n > 0 && n <= FRAME_CAP) {
+            uint8_t head[0x40];
+            const size_t m = (size_t)n < sizeof head ? (size_t)n : sizeof head;
+            if (sl_inject_read_at(&c->ctx, (intptr_t)c->remote_frame, head, m) == 0) hex_line("lab: picture", head, m);
+        }
+        usleep(50000);
+        beat();
+    }
+}
+
+static int lab_run(void)
+{
+    struct start_req req = {.selector = 3, .fps_flag = 1, .bitrate = 6000000, .width = 1280, .height = 720, .fps = 60};
+    struct capture c = {.startup_deadline = now_ms() + 600000u, .feature = FEATURE, .variant = 2};
+    int result = 1; // 1: nothing accepted, 0: Start accepted, -1: the session cannot go on
+    log_line("lab: 720p60 at %u bit/s, no core; trying what could make Start accepted", req.bitrate);
+    if (sl_inject_begin("SceRemotePlay", &c.ctx)) { log_line("lab: attach failed: stage=%s", c.ctx.stage); return 1; }
+    const intptr_t base = c.ctx.scratch;
+    uint32_t mode = 0;
+    if (c.ctx.scratch <= 0 || c.ctx.scratch_len < 0x4000 || bind_functions(&c)) { log_line("lab: setup failed"); goto end; }
+    if (!good(REMOTE(&c, INITIALIZE))) goto end;
+    c.initialized = 1;
+    if (wait_stable_mode(&c, &mode, MODE_WAIT_MS)) { log_line("lab: no stable output mode"); goto end; }
+    c.output_mode = mode;
+    if (arbitrate(&c, base, FEATURE, 0)) goto end;
+    probe_status(&c, base);
+    if (query_buffers(&c, base, mode, &req, &c.bufs)) { log_line("lab: no buffers from the service"); goto end; }
+    c.kind = OPEN_13_60_BUFFERS;
+    // Four steps that need two re-registrations and one EnableScanInEncode: id 12, id 0xb4 (SceRemotePlay's, with
+    // its process id), then EnableScanInEncode on, then id 12 again (with the process id). Two variants each.
+    static const uint32_t variants[] = {2, 6};
+    for (unsigned step = 0; step < 4 && result == 1; step++) {
+        const uint32_t feature = step == 0 || step == 3 ? FEATURE : 0xb4u;
+        if (step == 2) {
+            if (!good(REMOTE(&c, ENABLE_SCAN))) { result = -1; break; }
+            log_line("lab: EnableScanInEncode is now on");
+        } else if (c.feature != feature && arbitrate(&c, base, feature, (uint64_t)c.ctx.target_pid)) {
+            log_line("lab: the arbitrator refused id 0x%x", feature);
+            if (c.failed || c.ctx.quarantined) result = -1;
+            break;
+        }
+        for (unsigned v = 0; v < sizeof variants / sizeof *variants && result == 1; v++) {
+            char what[80];
+            c.variant = variants[v];
+            snprintf(what, sizeof what, "id 0x%x, scan %s, variant %u", feature, step >= 2 ? "on" : "off", c.variant);
+            const int r = lab_try(&c, base, &mode, &req, what);
+            if (r < 0) result = -1;
+            else if (r == 1) {
+                result = 0;
+                log_line("lab: START ACCEPTED (%s)", what);
+                lab_pictures(&c, base);
+            }
+        }
+    }
+end:
+    cleanup(&c);
+    log_line("lab: done (%s)", result == 0 ? "Start was accepted" : result == 1 ? "Start was refused every time" : "stopped early");
+    return result == 0 ? 0 : 1;
+}
+#endif
+
 // The worker: connect, wait for the core's start, run the session, recover at most once.
 static int helper_run(void)
 {
+#ifdef SL_PS5
+    if (access(CAP_DIR "/lab", F_OK) == 0) {
+        (void)unlink(CAP_DIR "/lab");
+        return lab_run();
+    }
+#endif
     if (net_connect()) return 1;
     struct start_req req = {0};
     int got = 0;
