@@ -82,7 +82,9 @@ HOST_DAVE_TEST := build/host/dave-test
 else
 $(warning libdave for the host is missing in $(DAVE_HOST): building the no-DAVE stub (run `make dave`))
 HOST_DAVE_INC := -Isrc/dave_fallback
-HOST_DAVE_LINK :=
+# The stub needs no library, but the host objects use libm (resample.c, the self-checks): with
+# libdave this is in HOST_DAVE_LINK above, so the stub build needs it too.
+HOST_DAVE_LINK := -lm
 HOST_DAVE_SRC := src/dave_stub.c
 HOST_DAVE_TEST :=
 endif
