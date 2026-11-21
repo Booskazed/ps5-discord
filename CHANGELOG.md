@@ -94,11 +94,16 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   `sceAvcap2EnableScanInEncode`, `sceAvcap2OpenVideo` and the resource arbitrator, and writes the code
   leading to each call to `capture.log`, to compare the sequence and the parameter block with 13.00's.
 - Wireless Go Live: while `sceAvcap2OpenVideo` answers `0x81950008` the helper asks again for up to 4 s,
-  as SceRemotePlay's own code does. On a firmware other than 13.00 it first tries the encoder without
-  `sceAvcap2EnableScanInEncode`, which SceRemotePlay on 13.60 never calls. If the encoder still refuses,
-  the diagnostic also writes the images of SceRemotePlay, `libSceAvcap2` and `libSceResourceArbitrator`
-  to the data folder (read-only toward the target, never published) so the parameter block the encoder
-  checks can be read in full. 13.00 keeps its validated sequence.
+  as SceRemotePlay's own code does (13.00's validated sequence is otherwise untouched). On a firmware
+  other than 13.00 it first tries, once each, the combinations SceRemotePlay itself uses: the resource
+  arbitrator ids it registers (`0xb4`, `0xb9`, `0xb1`, `0xaf`, `0xb6`, besides this helper's `12`), its own
+  process id or nothing as ChangeState's fourth argument, the block's size field as 13.00 wrote it
+  (`0x2e0`) or as 13.60's `libSceAvcap2` sends the block (`0x2e8`), without and then with
+  `sceAvcap2EnableScanInEncode` (SceRemotePlay on 13.60 never calls it). The first combination the encoder
+  accepts is used and logged (`probe:` lines in `capture.log`, with the encoder service's raw status
+  answer). If none works, the diagnostic writes the images of SceRemotePlay, `libSceAvcap2` and
+  `libSceResourceArbitrator` to the data folder once (read-only toward the target, never published) so
+  the parameter block the encoder checks can be read in full.
 
 ## [0.6.0-alpha.2] - 2026-10-31
 

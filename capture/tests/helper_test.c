@@ -18,6 +18,7 @@
 #define RECOVERY_POLL_US 10000u
 #define OPEN_RETRIES 3u
 #define OPEN_RETRY_US 5000u
+#define CAPTURE_FW_OVERRIDE 1
 #include "../src/helper.c"
 #undef main
 #include <assert.h>
@@ -25,7 +26,7 @@
 enum scenario { OK, VIDEO_OPEN_FAIL, VIDEO_START_FAIL, BAD_HEADERS, VIDEO_OVERSIZE, TRANSPORT_FAIL, CALLBACK_FAIL,
                 NO_IDR, MODE_120HZ, CLOSE_FAIL, MODE_TRANSITION, MODE_CHANGED, CORE_CLOSES, BAD_PROFILE,
                 HANDLE_READ_FAIL, STOP_SETUP, EOF_SETUP, STOP_HEADERS, SLOW_SETUP, MODE_OTHER, MODE_ZERO, STOP_ATTACH, EOF_ATTACH, STOP_MODE, EOF_MODE, MODE_QUERY_ONCE, MODE_QUERY_FAIL, RESTORED_ABORT,
-                SCENARIO_COUNT, OPEN_BUSY_ONCE, OPEN_BUSY_ALWAYS,
+                SCENARIO_COUNT, OPEN_BUSY_ONCE, OPEN_BUSY_ALWAYS, PROBE_OPENS_LATE, PROBE_ALL_REFUSED,
                 RECOVER_OK, RECOVER_ZERO_MODE, RECOVER_REOPEN_FAIL, RECOVER_SECOND_FAULT, RECOVER_BAD_CLEANUP,
                 RECOVER_TRANSPORT, RECOVER_120HZ, RECOVER_EARLY_MODE, RECOVER_LAST = RECOVER_EARLY_MODE };
 static enum scenario scenario;
@@ -33,6 +34,13 @@ static uint8_t scratch[0x4000], video_mem[FRAME_CAP];
 static const uint64_t video_handle = 0x1234567800000012ull;
 static unsigned calls[FUNCTION_COUNT], vstop, vclose, detached, freed, attachments, mode_samples, reads_in_session;
 static int saw_video_start, saw_bitrate, error_fired;
+static uint32_t cur_feature;   // the arbitrator id last registered (and not yet cleared)
+static uint64_t cur_pid_arg;   // ChangeState's fourth argument the last time
+static int known_feature(uint64_t id)
+{
+    for (size_t i = 0; i < PROBE_FEATURE_COUNT; i++) if (PROBE_FEATURES[i] == id) return 1;
+    return 0;
+}
 static const uint8_t real_sps[] = {
     0x67,0x4d,0x40,0x28,0x91,0x8a,0x01,0x40,0x16,0xec,0x05,0xa8,0x08,0x08,
     0x0a,0x00,0x00,0x1f,0x48,0x00,0x07,0x53,0x01,0x13,0x43,0xc7,0xc5,0x40
@@ -109,13 +117,19 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
             scenario == MODE_CHANGED ? 0x40 : scenario == MODE_OTHER ? 0x31 : scenario == MODE_ZERO ? 0 : 0x30 : 0x30;
         break;
     case SET_CALLBACK:
-        assert(a[0] == FEATURE && a[1] == REMOTE_GETPID + 1);
+        assert((a[0] == FEATURE || (!fw_override && known_feature(a[0]))) && a[1] == REMOTE_GETPID + 1);
         if (scenario == CALLBACK_FAIL) return -1;
+        cur_feature = (uint32_t)a[0];
         break;
-    case CHANGE_STATE: assert(!strcmp((const char *)(uintptr_t)a[1], "RUNNING")); break;
+    case CHANGE_STATE:
+        assert(!strcmp((const char *)(uintptr_t)a[1], "RUNNING") && a[0] == cur_feature);
+        cur_pid_arg = a[3];
+        break;
+    case CLEAR_CALLBACK: assert(a[0] == cur_feature); break;
     case OPEN_VIDEO:
         assert(a[0] == (uint64_t)(uintptr_t)scratch && a[1] == a[0] + 8 && a[2] == 0);
-        assert(*(uint32_t *)(scratch + 8) == 0x2e0);
+        assert(*(uint32_t *)(scratch + 8) == 0x2e0 || (!fw_override && *(uint32_t *)(scratch + 8) == 0x2e8));
+        assert(*(uint32_t *)(scratch + 0x30) == cur_feature);
         assert(*(uint32_t *)(scratch + 0x20) == profile.selector);
         assert(*(uint32_t *)(scratch + 0x24) == profile.fps_flag);
         assert(*(uint32_t *)(scratch + 0x2c) == 0);
@@ -126,6 +140,10 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
         if (scenario == VIDEO_OPEN_FAIL) return -1;
         // 13.60: the encoder answers 0x81950008 while it is not ready, as it does to SceRemotePlay
         if (scenario == OPEN_BUSY_ALWAYS || (scenario == OPEN_BUSY_ONCE && calls[OPEN_VIDEO] == 1)) return (int64_t)0x81950008u;
+        // other firmware: only the id, process id and size SceRemotePlay uses are accepted (or none)
+        if (scenario == PROBE_ALL_REFUSED || (scenario == PROBE_OPENS_LATE && !(cur_feature == 0xb4 && cur_pid_arg == 123 &&
+                                                                               *(uint32_t *)(scratch + 8) == 0x2e8)))
+            return (int64_t)0x81950008u;
         *(uint64_t *)(uintptr_t)a[0] = video_handle; break;
     case BITRATE_SET:
         assert(a[0] == video_handle && !saw_video_start);   // before Start, never after
@@ -322,6 +340,7 @@ static void reset_fake(void)
     memset(calls, 0, sizeof calls);
     vstop = vclose = detached = freed = attachments = mode_samples = reads_in_session = 0;
     saw_video_start = saw_bitrate = error_fired = 0;
+    cur_feature = 0; cur_pid_arg = 0;
 }
 
 static const struct start_req profiles[] = {
@@ -504,6 +523,28 @@ int main(void)
         run_helper(&profile, &s, &rc, 1, 1);
         assert(s.hello && rc == 1 && calls[OPEN_VIDEO] == OPEN_RETRIES + 1 && !s.videos && s.states[CAP_ERROR] == 1 && s.error[0]);
         assert(vclose == 0 && calls[TERMINATE] == 1 && calls[START] == 0 && attachments == 1 && detached == 1);
+        for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
+        cases += 2;
+    }
+
+    // A firmware the sequence was not validated on: the helper tries the arbitrator ids, process ids and
+    // block sizes SceRemotePlay uses, once each, and goes on with the combination the encoder accepts;
+    // when none is accepted it says so, after exactly those attempts.
+    {
+        fw_override = 0;
+        scenario = PROBE_OPENS_LATE; profile = profiles[0]; reset_fake();
+        struct seen s; int rc;
+        run_helper(&profile, &s, &rc, 1, 1);
+        // id 12 with its four variants, then id 0xb4 with the process id and the 0x2e8 size: the eighth try
+        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 8 && calls[ENABLE_SCAN] == 0 && s.videos >= 8 && !s.states[CAP_ERROR]);
+        assert(calls[SET_CALLBACK] == 8 && calls[CHANGE_STATE] == 8 && calls[CLEAR_CALLBACK] == 8);
+        assert(vstop == 1 && vclose == 1 && calls[TERMINATE] == 1 && attachments == 1 && detached == 1);
+        scenario = PROBE_ALL_REFUSED; reset_fake();
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 1 && !s.videos && s.states[CAP_ERROR] == 1 && s.error[0]);
+        assert(calls[OPEN_VIDEO] == 2 * PROBE_FEATURE_COUNT * 4 && calls[ENABLE_SCAN] == 1 && vclose == 0);
+        assert(calls[SET_CALLBACK] == calls[OPEN_VIDEO] && calls[CLEAR_CALLBACK] == calls[OPEN_VIDEO] && calls[TERMINATE] == 1);
+        fw_override = 1;
         for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
         cases += 2;
     }
