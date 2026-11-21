@@ -313,7 +313,6 @@ struct capture {
     uint64_t video, remote_frame, startup_deadline;
     int startup_done, video_unknown;
     int initialized, callback, video_open, video_start_attempted, cleanup, failed, cleanup_failed;
-    int quiet;                       // probing: the per-call log lines are left out
     uint32_t output_mode, final_mode;
     uint32_t feature;                // the id registered with the resource arbitrator (and written in the block)
 };
@@ -337,13 +336,13 @@ static int64_t remote(struct capture *c, enum function id, const uint64_t args[6
     }
     if (c->ctx.quarantined && !(c->cleanup && c->ctx.aborted_restored)) { c->failed = 1; return SL_CALL_ERROR; }
     if (progress) progress->function = id + 1;
-    if (!c->quiet && id != READ_VIDEO && (id != MODE || !c->startup_done)) log_line("calling %s", symbols[id]);
+    if (id != READ_VIDEO && (id != MODE || !c->startup_done)) log_line("calling %s", symbols[id]);
     // Preserve the pinned borrowed LWP's general and extended CPU state across media calls.
     int64_t rc = c->cleanup ? sl_inject_cleanup_call(&c->ctx, c->fn[id], args) :
                             inj_call_fast(&c->ctx, c->fn[id], args, 1);
     if (progress) progress->function = 0;
     beat();
-    if (!c->quiet && id != READ_VIDEO && (id != MODE || !c->startup_done)) log_line("%s returned 0x%llx", symbols[id], (unsigned long long)rc);
+    if (id != READ_VIDEO && (id != MODE || !c->startup_done)) log_line("%s returned 0x%llx", symbols[id], (unsigned long long)rc);
     if (rc == SL_CALL_ERROR) {
         log_line("transport failure in %s; stage=%s quarantined=%d", symbols[id],
                  c->ctx.stage ? c->ctx.stage : "unknown", c->ctx.quarantined);
@@ -425,21 +424,23 @@ static int wait_stable_mode(struct capture *c, uint32_t *stable, unsigned budget
     return -1;
 }
 
-// Firmware 13.00 is the one this sequence was validated on. Anywhere else (13.60: upstream issue #11,
-// sceAvcap2OpenVideo answers 0x81950008) the extra attempts below run; the host tests stand for 13.00.
+// Which firmware this runs on: kern.sdk_version >> 16 (0x1300 is 13.00, 0x1360 is 13.60). The sequence in this
+// file was validated on 13.00. On 13.60 (upstream issue #11) sceAvcap2OpenVideo answers 0x81950008 to the 13.00
+// block, whatever the arbitrator id, process id, size field or EnableScanInEncode; open_1360() below follows what
+// SceRemotePlay's own code does there. The host tests stand for 13.00 unless they say otherwise.
 #ifdef CAPTURE_FW_OVERRIDE
-static int fw_override = 1; // host tests: 1 stands for 13.00, 0 for any other firmware
+static unsigned fw_override = 0x1300;
 #endif
-static int firmware_is_13_00(void)
+static int firmware_is_13_60(void)
 {
 #ifdef CAPTURE_FW_OVERRIDE
-    return fw_override;
+    return fw_override == 0x1360;
 #elif defined(SL_PS5)
     uint32_t sdk = 0;
     size_t len = sizeof sdk;
-    return sysctlbyname("kern.sdk_version", &sdk, &len, NULL, 0) == 0 && len == sizeof sdk && (sdk >> 16) == 0x1300;
+    return sysctlbyname("kern.sdk_version", &sdk, &len, NULL, 0) == 0 && len == sizeof sdk && (sdk >> 16) == 0x1360;
 #else
-    return 1;
+    return 0;
 #endif
 }
 
@@ -451,18 +452,83 @@ static int firmware_is_13_00(void)
 #define OPEN_RETRY_US 250000u
 #endif
 
-// Writes the parameter block (its size field `size`, the arbitrator id c->feature) and opens the encoder,
-// asking again up to `retries` times while it answers OPEN_BUSY (the block is rebuilt each time with the
-// output mode as it is then). Returns 0 once the encoder is open, -1 otherwise; *rc is the last answer
+// The two buffer descriptors (0x20 bytes each) the encoder service answers to the buffer query on 13.60.
+struct buffers { uint8_t out1[0x20], out2[0x20]; };
+// Which parameter block open_encoder() writes: 13.00's, or 13.60's without or with the two buffer descriptors.
+enum open_kind { OPEN_13_00, OPEN_13_60, OPEN_13_60_BUFFERS };
+
+static float bits_float(uint32_t b) { float f; memcpy(&f, &b, sizeof f); return f; }
+static double bits_double(uint64_t b) { double d; memcpy(&d, &b, sizeof d); return d; }
+
+// The 13.60 parameter block as SceRemotePlay builds it for H.264, read from its code and read-only data (the block
+// builder, SetParams and OpenVideo's caller at module+0x6f840, +0x70190 and +0x704c0 of its image). libSceAvcap2
+// 13.60 sends the block as a 0x2e8-byte buffer behind the 8-byte output slot, so this is 0x2f0 bytes, with the
+// same convention as video_params(): offsets include the output slot. What SceRemotePlay takes from its session's
+// settings is not known and is chosen: NATIVE_CAP_BUDGET (a cap on the picture budget) and NATIVE_CAP_BUFFER (a
+// cap on two sizes derived from the bitrate). The surface it describes (384 wide, 352 high, pitch 512, 278528
+// bytes) comes out the same for selectors 3 and 4: it is computed from constants, not from the picture size.
+// `bufs`, when given, are the descriptors the service answered; they go at offsets 0x1b8 and 0x1d8.
+#define NATIVE_CAP_BUDGET 0xffffu
+#define NATIVE_CAP_BUFFER 8192u
+static void video_params_1360(uint8_t p[0x2f0], uint32_t mode, const struct start_req *r, uint32_t feature,
+                              const struct buffers *bufs)
+{
+    const uint32_t kbps = r->bitrate / 1000u, bps = kbps * 1000u;
+    const uint32_t per_frame = (uint32_t)((uint64_t)bps * 1001u / (r->fps * 1000u)); // floor(kbps * 1001 / fps)
+    uint32_t budget = (uint32_t)(((uint64_t)(0x3c000u / r->fps) * 0x4444445u) >> 32); // 136 at 30 fps, 68 at 60
+    if (budget > NATIVE_CAP_BUDGET) budget = NATIVE_CAP_BUDGET;
+    const float divided = (float)bps / bits_float(0x3f8f5c29u); // the rate over 1.12, as a single
+    uint32_t first = (uint32_t)(int64_t)(kbps * bits_double(0x3fd0c49ba5e353f8ull) + bits_double(0x4091a7999999999aull));
+    uint32_t second = (uint32_t)(int64_t)(kbps * bits_double(0x3fcaeb1c432ca57aull) + bits_double(0x408157d70a3d70a4ull));
+    if (first > NATIVE_CAP_BUFFER) first = NATIVE_CAP_BUFFER;
+    if (second > NATIVE_CAP_BUFFER) second = NATIVE_CAP_BUFFER;
+    memset(p, 0, 0x2f0);
+    put64(p, 0x08, 0x2e8); put64(p, 0x10, 0x28);
+    put32(p, 0x1c, 2);
+    put32(p, 0x20, r->selector); put32(p, 0x24, r->fps_flag);
+    put32(p, 0x30, feature);
+    put64(p, 0x38, 0x58); put64(p, 0x40, 0x18);
+    p[0x48] = 1; put32(p, 0x4c, budget); put32(p, 0x50, 1); put32(p, 0x54, NATIVE_CAP_BUFFER);
+    put64(p, 0x58, 0x10); p[0x60] = 1; put32(p, 0x64, 9);
+    put64(p, 0x68, 0x18); p[0x70] = 1;
+    put64(p, 0x90, 0x30);
+    put64(p, 0xc0, 0xe8); put64(p, 0xc8, 0x20);
+    put32(p, 0xd0, (uint32_t)(int64_t)divided); put32(p, 0xd4, bps); put32(p, 0xd8, per_frame);
+    put32(p, 0xdc, 0xffbf5f14u); put32(p, 0xe0, 0x33); put64(p, 0xe8, 0x20);
+    p[0xf0] = 1;
+    put32(p, 0xf4, first); put32(p, 0xf8, second); put32(p, 0xfc, budget); put32(p, 0x100, 1);
+    put32(p, 0x104, NATIVE_CAP_BUFFER);
+    put64(p, 0x108, 0x20); p[0x110] = 1; put32(p, 0x114, per_frame >> 3);
+    put64(p, 0x128, 0x18); p[0x130] = 1; put32(p, 0x134, 0x19); put32(p, 0x138, r->fps);
+    put64(p, 0x190, 0x10);
+    if (bufs) {
+        put64(p, 0x1a8, 0x50); put32(p, 0x1b0, 1);
+        memcpy(p + 0x1b8, bufs->out1, sizeof bufs->out1);
+        memcpy(p + 0x1d8, bufs->out2, sizeof bufs->out2);
+    }
+    put64(p, 0x1f8, 0xf8); put64(p, 0x200, 0x28);
+    put32(p, 0x214, 384); put32(p, 0x218, 352); put32(p, 0x21c, 512); put64(p, 0x220, 278528);
+    put64(p, 0x228, 0x88);
+    put32(p, 0x238, 0x3f800000u); put32(p, 0x23c, 0x3f800000u);
+    put32(p, 0x2b0, mode); put32(p, 0x2b4, 2);
+    put64(p, 0x2b8, 0x10); put32(p, 0x2c0, 1); p[0x2c4] = 1;
+    put64(p, 0x2c8, 0x10); p[0x2d0] = 1; put32(p, 0x2d4, r->fps == 30 ? 0x37u : 0x6eu);
+}
+
+// Writes the parameter block `kind` (arbitrator id c->feature; `bufs` for OPEN_13_60_BUFFERS) and opens the
+// encoder, asking again up to `retries` times while it answers OPEN_BUSY (the block is rebuilt each time with
+// the output mode as it is then). Returns 0 once the encoder is open, -1 otherwise; *rc is the last answer
 // (SL_CALL_ERROR when the transport failed).
 static int open_encoder(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req,
-                        uint32_t size, unsigned retries, int64_t *rc)
+                        enum open_kind kind, const struct buffers *bufs, unsigned retries, int64_t *rc)
 {
-    uint8_t video[0x2e8];
+    uint8_t block[0x2f0];
+    const size_t len = kind == OPEN_13_00 ? 0x2e8 : sizeof block;
     *rc = SL_CALL_ERROR;
     for (unsigned attempt = 0;; attempt++) {
-        video_params(video, *mode, req, c->feature, size);
-        if (sl_inject_write_at(&c->ctx, base, video, sizeof video)) return -1;
+        if (kind == OPEN_13_00) video_params(block, *mode, req, c->feature, 0x2e0);
+        else video_params_1360(block, *mode, req, c->feature, kind == OPEN_13_60_BUFFERS ? bufs : NULL);
+        if (sl_inject_write_at(&c->ctx, base, block, len)) return -1;
         *rc = REMOTE(c, OPEN_VIDEO, base, base + 8, 0);
         if (good(*rc)) return 0;
         if (*rc == SL_CALL_ERROR || (uint32_t)*rc != OPEN_BUSY || attempt >= retries || quit || net_dead ||
@@ -479,8 +545,9 @@ static int open_encoder(struct capture *c, intptr_t base, uint32_t *mode, const 
 }
 
 // Registers `feature` with the resource arbitrator, replacing the id registered before, and says it is
-// running. `pid` is ChangeState's fourth argument: SceRemotePlay passes its own process id there, the 13.00
-// sequence passed nothing. Returns 0 on success.
+// running; `pid` is ChangeState's fourth argument (SceRemotePlay passes its own process id there, the 13.00
+// sequence passes nothing, and on 13.60 neither that nor the id made the encoder answer differently).
+// Returns 0 on success.
 static int arbitrate(struct capture *c, intptr_t base, uint32_t feature, uint64_t pid)
 {
     if (c->callback) {
@@ -496,78 +563,93 @@ static int arbitrate(struct capture *c, intptr_t base, uint32_t feature, uint64_
     return 0;
 }
 
-// A firmware this sequence was not validated on (13.60, upstream issue #11): the encoder answers 0x81950008
-// whatever the block holds. SceRemotePlay there registers with the arbitrator under one of five ids (the
-// five types of its arbitrator wrapper; its sessions create the wrapper as type 0, id 0xb4, and type 2, id
-// 0xb9) and gives ChangeState its process id; this sequence used 12 and nothing. So the combinations below are tried once
-// each before giving up: the id (in the arbitrator calls and in the block), the process id or zero, the
-// block's size field as 13.00 wrote it (0x2e0) or as 13.60's library sends the block (0x2e8), without and
-// then with EnableScanInEncode (which SceRemotePlay never calls).
-static const uint32_t PROBE_FEATURES[] = {FEATURE, 0xb4, 0xb9, 0xb1, 0xaf, 0xb6};
-#define PROBE_FEATURE_COUNT (sizeof PROBE_FEATURES / sizeof *PROBE_FEATURES)
+#ifdef SL_PS5
+// Two libSceAvcap2 13.60 entry points SceRemotePlay's own code calls around OpenVideo (offsets read from the
+// library's image; only called when the firmware is 13.60, where they are): +0x1750 asks the encoder service
+// for its status (0x20 bytes; SceRemotePlay waits while a flag in it is set), +0x1b90 asks it for the two buffer
+// descriptors the block carries, given the first 0x88 bytes of the block. Both only read the service.
+#define AVCAP2_STATUS 0x1750
+#define AVCAP2_QUERY 0x1b90
 
-// Returns 1 once the encoder is open (c->feature is the id that worked), 0 when every combination was
-// refused, -1 when the session has to end (transport failure, stop, quarantine).
-static int probe_open(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, int64_t *rc)
+static void hex_line(const char *what, const uint8_t *p, size_t n)
 {
-    int result = 0;
-    c->quiet = 1;
-    for (unsigned scan = 0; scan < 2 && result == 0; scan++) {
-        if (scan) {
-            c->quiet = 0;
-            if (!good(REMOTE(c, ENABLE_SCAN))) { result = -1; break; }
-            c->quiet = 1;
-        }
-        for (size_t f = 0; f < PROBE_FEATURE_COUNT && result == 0; f++) {
-            for (unsigned v = 0; v < 4 && result == 0; v++) {
-                const uint64_t pid = v & 1 ? (uint64_t)c->ctx.target_pid : 0;
-                const uint32_t size = v & 2 ? 0x2e8u : 0x2e0u;
-                if (arbitrate(c, base, PROBE_FEATURES[f], pid)) {
-                    // The arbitrator refusing one id is an answer, not the end: go on with the next id.
-                    if (c->failed || c->ctx.quarantined || quit || net_dead || stop_requested) result = -1;
-                    else log_line("probe: the arbitrator refused id 0x%x", PROBE_FEATURES[f]);
-                    break;
-                }
-                const int ok = open_encoder(c, base, mode, req, size, 0, rc) == 0;
-                log_line("probe: EnableScanInEncode %s, id 0x%x, pid %llu, size 0x%x -> 0x%llx", scan ? "on" : "off",
-                         PROBE_FEATURES[f], (unsigned long long)pid, size, (unsigned long long)*rc);
-                if (ok) result = 1;
-                else if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined) result = -1;
-            }
-        }
-    }
-    c->quiet = 0;
-    return result;
+    char hex[0x41 * 2];
+    if (n > 0x40) n = 0x40;
+    for (size_t i = 0; i < n; i++) snprintf(hex + i * 2, 3, "%02x", p[i]);
+    log_line("%s: %s", what, hex);
 }
 
-#ifdef SL_PS5
-// SceRemotePlay asks the encoder service for its status before every OpenVideo and waits while a flag in
-// the answer is set (libSceAvcap2 13.60, +0x1750). Log the raw answer; only where the function is the one
-// that was read (its first bytes match), so no other firmware calls a different function by accident.
 static void probe_status(struct capture *c, intptr_t base)
 {
     const intptr_t lib = sl_module_base(c->ctx.target_pid, "libSceAvcap2.sprx");
-    static const uint8_t prologue[] = {0x55, 0x48, 0x89, 0xe5, 0x41, 0x57, 0x41, 0x56, 0x53, 0x48, 0x83, 0xec, 0x18};
-    uint8_t seen[sizeof prologue];
-    if (lib <= 0 || (sl_inject_read_at(&c->ctx, lib + 0x1750, seen, sizeof seen) &&
-                     sl_inject_read_code_at(&c->ctx, lib + 0x1750, seen, sizeof seen)) ||
-        memcmp(seen, prologue, sizeof seen)) {
-        log_line("status query: libSceAvcap2+0x1750 is not the function that was read; skipped");
-        return;
-    }
+    if (lib <= 0) { log_line("status query: libSceAvcap2 not found"); return; }
     uint8_t out[0x40] = {0};
     const intptr_t at = base + 0x1000;
     if (sl_inject_write_at(&c->ctx, at, out, sizeof out)) return;
     const uint64_t args[6] = {(uint64_t)at};
-    const int64_t rc = inj_call_fast(&c->ctx, lib + 0x1750, args, 1);
+    log_line("status query: calling libSceAvcap2+0x%x", AVCAP2_STATUS);
+    const int64_t rc = inj_call_fast(&c->ctx, lib + AVCAP2_STATUS, args, 1);
     beat();
     if (rc == SL_CALL_ERROR) { log_line("status query: transport failure"); c->failed = 1; return; }
-    if (sl_inject_read_at(&c->ctx, at, out, sizeof out)) return;
-    char hex[sizeof out * 2 + 1];
-    for (size_t i = 0; i < sizeof out; i++) snprintf(hex + i * 2, 3, "%02x", out[i]);
-    log_line("status query returned 0x%llx: %s", (unsigned long long)rc, hex);
+    log_line("status query returned 0x%llx", (unsigned long long)rc);
+    if (sl_inject_read_at(&c->ctx, at, out, sizeof out) == 0) hex_line("status", out, sizeof out);
+}
+
+// Returns 0 with the descriptors in *bufs, -1 when the service refused or the call could not be made.
+static int query_buffers(struct capture *c, intptr_t base, uint32_t mode, const struct start_req *req, struct buffers *bufs)
+{
+    const intptr_t lib = sl_module_base(c->ctx.target_pid, "libSceAvcap2.sprx");
+    if (lib <= 0) return -1;
+    uint8_t block[0x2f0], in[0x90] = {0}, zero[0x20] = {0};
+    video_params_1360(block, mode, req, c->feature, NULL);
+    put64(in, 0, 0x90);
+    memcpy(in + 8, block + 0x10, 0x80);
+    const intptr_t at_in = base + 0x1100, at_out1 = base + 0x1200, at_out2 = base + 0x1220;
+    if (sl_inject_write_at(&c->ctx, at_in, in, sizeof in) || sl_inject_write_at(&c->ctx, at_out1, zero, sizeof zero) ||
+        sl_inject_write_at(&c->ctx, at_out2, zero, sizeof zero)) return -1;
+    const uint64_t args[6] = {(uint64_t)at_in, (uint64_t)at_out1, (uint64_t)at_out2};
+    log_line("buffer query: calling libSceAvcap2+0x%x", AVCAP2_QUERY);
+    const int64_t rc = inj_call_fast(&c->ctx, lib + AVCAP2_QUERY, args, 1);
+    beat();
+    if (rc == SL_CALL_ERROR) { log_line("buffer query: transport failure"); c->failed = 1; return -1; }
+    if (!good(rc)) { log_line("buffer query: refused with 0x%llx", (unsigned long long)rc); return -1; }
+    if (sl_inject_read_at(&c->ctx, at_out1, bufs->out1, sizeof bufs->out1) ||
+        sl_inject_read_at(&c->ctx, at_out2, bufs->out2, sizeof bufs->out2)) return -1;
+    hex_line("buffer 1", bufs->out1, sizeof bufs->out1);
+    hex_line("buffer 2", bufs->out2, sizeof bufs->out2);
+    return 0;
 }
 #endif
+
+// Firmware 13.60: registers as the 13.00 sequence does (id 12), reads the encoder service's status and buffer
+// descriptors as SceRemotePlay does (logged), then tries each parameter block once, without and then with
+// EnableScanInEncode (SceRemotePlay never calls it): 13.60's block with the descriptors, 13.60's block alone,
+// 13.00's block. Returns 1 once the encoder is open, 0 when all were refused, -1 when the session must end.
+static int open_1360(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, int64_t *rc)
+{
+    struct buffers bufs = {{0}, {0}};
+    int have = 0;
+    *rc = SL_CALL_ERROR;
+    if (arbitrate(c, base, FEATURE, 0)) return -1;
+#ifdef SL_PS5
+    probe_status(c, base);
+    have = query_buffers(c, base, *mode, req, &bufs) == 0;
+    if (c->failed || c->ctx.quarantined) return -1;
+#endif
+    static const enum open_kind plan[] = {OPEN_13_60_BUFFERS, OPEN_13_60, OPEN_13_00};
+    static const char *const names[] = {"13.60 block with the service's buffers", "13.60 block", "13.00 block"};
+    for (unsigned scan = 0; scan < 2; scan++) {
+        if (scan && !good(REMOTE(c, ENABLE_SCAN))) return -1;
+        for (unsigned k = 0; k < sizeof plan / sizeof *plan; k++) {
+            if (plan[k] == OPEN_13_60_BUFFERS && !have) continue;
+            const int ok = open_encoder(c, base, mode, req, plan[k], &bufs, 0, rc) == 0;
+            log_line("probe: %s, EnableScanInEncode %s -> 0x%llx", names[k], scan ? "on" : "off", (unsigned long long)*rc);
+            if (ok) return 1;
+            if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined) return -1;
+        }
+    }
+    return 0;
+}
 
 static void cleanup(struct capture *c)
 {
@@ -650,19 +732,16 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
     }
     int64_t open_rc = SL_CALL_ERROR;
     int opened = 0;
-    if (firmware_is_13_00()) {
-        // The validated sequence, untouched: id 12, no process id, EnableScanInEncode, then the block.
-        if (arbitrate(&c, base, FEATURE, 0) || !good(REMOTE(&c, ENABLE_SCAN))) goto done;
-        opened = open_encoder(&c, base, &mode, req, 0x2e0, OPEN_RETRIES, &open_rc) == 0;
+    if (firmware_is_13_60()) {
+        log_line("firmware 13.60: opening the encoder the way SceRemotePlay does");
+        const int tried = open_1360(&c, base, &mode, req, &open_rc);
+        if (tried < 0) goto done;
+        opened = tried == 1;
+        if (opened) log_line("probe: the encoder opened");
     } else {
-        log_line("firmware not validated: trying the arbitrator ids and block sizes SceRemotePlay uses");
-#ifdef SL_PS5
-        probe_status(&c, base);
-#endif
-        const int probed = probe_open(&c, base, &mode, req, &open_rc);
-        if (probed < 0) goto done;
-        opened = probed == 1;
-        if (opened) log_line("probe: the encoder opened with id 0x%x", c.feature);
+        // The validated sequence, untouched: id 12, no process id, EnableScanInEncode, then 13.00's block.
+        if (arbitrate(&c, base, FEATURE, 0) || !good(REMOTE(&c, ENABLE_SCAN))) goto done;
+        opened = open_encoder(&c, base, &mode, req, OPEN_13_00, NULL, OPEN_RETRIES, &open_rc) == 0;
     }
     if (!opened) {
 #ifdef SL_PS5
