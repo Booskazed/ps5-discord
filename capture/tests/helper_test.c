@@ -18,6 +18,8 @@
 #define RECOVERY_POLL_US 10000u
 #define OPEN_RETRIES 3u
 #define OPEN_RETRY_US 5000u
+#define START_TRIES 6u
+#define START_RETRY_US 5000u
 #define CAPTURE_FW_OVERRIDE 1
 #include "../src/helper.c"
 #undef main
@@ -27,6 +29,7 @@ enum scenario { OK, VIDEO_OPEN_FAIL, VIDEO_START_FAIL, BAD_HEADERS, VIDEO_OVERSI
                 NO_IDR, MODE_120HZ, CLOSE_FAIL, MODE_TRANSITION, MODE_CHANGED, CORE_CLOSES, BAD_PROFILE,
                 HANDLE_READ_FAIL, STOP_SETUP, EOF_SETUP, STOP_HEADERS, SLOW_SETUP, MODE_OTHER, MODE_ZERO, STOP_ATTACH, EOF_ATTACH, STOP_MODE, EOF_MODE, MODE_QUERY_ONCE, MODE_QUERY_FAIL, RESTORED_ABORT,
                 SCENARIO_COUNT, OPEN_BUSY_ONCE, OPEN_BUSY_ALWAYS, FW1360_NATIVE_ONLY, FW1360_OLD_AFTER_SCAN, FW1360_REFUSED,
+                FW1360_START_RETRY, FW1360_START_NEEDS_RATE, FW1360_START_REFUSED,
                 RECOVER_OK, RECOVER_ZERO_MODE, RECOVER_REOPEN_FAIL, RECOVER_SECOND_FAULT, RECOVER_BAD_CLEANUP,
                 RECOVER_TRANSPORT, RECOVER_120HZ, RECOVER_EARLY_MODE, RECOVER_LAST = RECOVER_EARLY_MODE };
 static enum scenario scenario;
@@ -156,6 +159,7 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
         if (scenario == FW1360_REFUSED || (scenario == FW1360_NATIVE_ONLY && !native) ||
             (scenario == FW1360_OLD_AFTER_SCAN && (native || !calls[ENABLE_SCAN])))
             return (int64_t)0x81950008u;
+        saw_video_start = saw_bitrate = 0; // a new encoder: nothing set, nothing started
         *(uint64_t *)(uintptr_t)a[0] = video_handle; break;
     }
     case BITRATE_SET:
@@ -166,9 +170,13 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
         if (scenario == STOP_SETUP) send_simple(fake_core_fd, CAP_STOP);
         if (scenario == EOF_SETUP) shutdown(fake_core_fd, SHUT_WR);
         if (scenario == SLOW_SETUP) usleep(START_WAIT_MS * 1000 + 10000);
-        assert(a[0] == video_handle && saw_bitrate);
+        assert(a[0] == video_handle && (saw_bitrate || fw_override == 0x1360)); // 13.60 may start without the call
         saw_video_start = 1;
         if (scenario == VIDEO_START_FAIL) return -1;
+        // 13.60 (0x80c78000 on the console): the encoder refuses to start, as it can for SceRemotePlay
+        if (scenario == FW1360_START_REFUSED || (scenario == FW1360_START_RETRY && calls[START] <= 2) ||
+            (scenario == FW1360_START_NEEDS_RATE && !saw_bitrate))
+            return (int64_t)(int32_t)0x80c78000u;
         break;
     case STOP: assert(a[0] == video_handle); vstop++; break;
     case CLOSE:
@@ -561,9 +569,25 @@ int main(void)
         run_helper(&profile, &s, &rc, 1, 1);
         assert(s.hello && rc == 1 && !s.videos && s.states[CAP_ERROR] == 1 && s.error[0]);
         assert(calls[OPEN_VIDEO] == 4 && calls[ENABLE_SCAN] == 1 && native_blocks == 2 && vclose == 0 && calls[TERMINATE] == 1);
+        // Once open, the encoder is started without the bitrate call SceRemotePlay never makes; refused, it is
+        // closed and opened again (the same block) and started again; the second half of the tries make the
+        // bitrate call 13.00 needs; refused every time, the session ends in an error after exactly those tries.
+        scenario = FW1360_START_RETRY; profile = profiles[0]; reset_fake();
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 0 && calls[START] == 3 && calls[OPEN_VIDEO] == 3 && native_blocks == 3);
+        assert(calls[BITRATE_SET] == 0 && vclose == 3 && vstop == 1 && calls[TERMINATE] == 1 && s.videos >= 8 && !s.states[CAP_ERROR]);
+        scenario = FW1360_START_NEEDS_RATE; reset_fake();
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 0 && calls[START] == 4 && calls[OPEN_VIDEO] == 4 && calls[BITRATE_SET] == 1);
+        assert(vclose == 4 && vstop == 1 && s.videos >= 8 && !s.states[CAP_ERROR]);
+        scenario = FW1360_START_REFUSED; reset_fake();
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 1 && !s.videos && s.states[CAP_ERROR] == 1 && s.error[0]);
+        assert(calls[START] == START_TRIES && calls[OPEN_VIDEO] == START_TRIES && calls[BITRATE_SET] == START_TRIES / 2);
+        assert(vclose == START_TRIES && vstop == 1 && calls[TERMINATE] == 1);
         fw_override = 0x1300;
         for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
-        cases += 3;
+        cases += 6;
     }
 
     // A missing connection file and a core that never sends a start are clean failures: nothing

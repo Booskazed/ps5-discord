@@ -307,8 +307,15 @@ static int headers_annexb(const uint8_t *h, size_t n, uint8_t *out, size_t cap, 
 
 // ---- the capture session in SceRemotePlay --------------------------------------------------
 
+// The two buffer descriptors (0x20 bytes each) the encoder service answers to the buffer query on 13.60.
+struct buffers { uint8_t out1[0x20], out2[0x20]; };
+// Which parameter block open_encoder() writes: 13.00's, or 13.60's without or with the two buffer descriptors.
+enum open_kind { OPEN_13_00, OPEN_13_60, OPEN_13_60_BUFFERS };
+
 struct capture {
     sl_inject ctx;
+    enum open_kind kind;             // the block that opened the encoder (to open it again) and its descriptors
+    struct buffers bufs;
     intptr_t fn[FUNCTION_COUNT];
     uint64_t video, remote_frame, startup_deadline;
     int startup_done, video_unknown;
@@ -451,11 +458,6 @@ static int firmware_is_13_60(void)
 #define OPEN_RETRIES 16u
 #define OPEN_RETRY_US 250000u
 #endif
-
-// The two buffer descriptors (0x20 bytes each) the encoder service answers to the buffer query on 13.60.
-struct buffers { uint8_t out1[0x20], out2[0x20]; };
-// Which parameter block open_encoder() writes: 13.00's, or 13.60's without or with the two buffer descriptors.
-enum open_kind { OPEN_13_00, OPEN_13_60, OPEN_13_60_BUFFERS };
 
 static float bits_float(uint32_t b) { float f; memcpy(&f, &b, sizeof f); return f; }
 static double bits_double(uint64_t b) { double d; memcpy(&d, &b, sizeof d); return d; }
@@ -644,11 +646,74 @@ static int open_1360(struct capture *c, intptr_t base, uint32_t *mode, const str
             if (plan[k] == OPEN_13_60_BUFFERS && !have) continue;
             const int ok = open_encoder(c, base, mode, req, plan[k], &bufs, 0, rc) == 0;
             log_line("probe: %s, EnableScanInEncode %s -> 0x%llx", names[k], scan ? "on" : "off", (unsigned long long)*rc);
-            if (ok) return 1;
+            if (ok) { c->kind = plan[k]; c->bufs = bufs; return 1; }
             if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined) return -1;
         }
     }
     return 0;
+}
+
+// Reads the handle OpenVideo left in the output slot. Read failures after a successful open still need cleanup;
+// the handle is used only after a complete eight-byte transfer, retried once while the target is stopped, and never
+// as a partial or zero value. Returns 0 on success.
+static int take_handle(struct capture *c, intptr_t base)
+{
+    c->video_unknown = 1;
+    if (sl_inject_read_at(&c->ctx, base, &c->video, 8) || !c->video) {
+        c->video = 0;
+        if (sl_inject_read_at(&c->ctx, base, &c->video, 8) || !c->video) {
+            c->cleanup_failed = 1;
+            return -1;
+        }
+    }
+    c->video_unknown = 0;
+    c->video_open = 1;
+    return 0;
+}
+
+// How many times the encoder is started on 13.60, and the wait between two tries.
+#ifndef START_TRIES
+#define START_TRIES 6u
+#define START_RETRY_US 250000u
+#endif
+
+// Firmware 13.60: SceRemotePlay never calls SetVideoBitrate (the bitrate is in the block) and, when Start is refused
+// (0x80c78000 was seen), closes the encoder, waits a frame and opens it again until its time budget is spent. So:
+// the first half of the tries start without a bitrate call, the second half with the call 13.00 needs; between two
+// tries the encoder is closed, and opened again with the block that worked. Returns 0 once started, -1 otherwise
+// (a refusal is logged with its code); *rc is the last answer of Start.
+static int start_1360(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, int64_t *rc)
+{
+    for (unsigned attempt = 0; attempt < START_TRIES; attempt++) {
+        const int with_rate = attempt >= START_TRIES / 2;
+        if (with_rate) {
+            // The bitrate is set once per encoder, before Start: a change mid-session wedges it until restart.
+            uint8_t rate[16] = {0};
+            put64(rate, 0, 16); put32(rate, 8, req->bitrate); put32(rate, 12, req->bitrate);
+            if (sl_inject_write_at(&c->ctx, base + 0x780, rate, sizeof rate) ||
+                !good(REMOTE(c, BITRATE_SET, c->video, base + 0x780))) return -1;
+        }
+        c->video_start_attempted = 1;
+        *rc = REMOTE(c, START, c->video);
+        log_line("start try %u (%s) -> 0x%llx", attempt + 1, with_rate ? "with the bitrate call" : "like SceRemotePlay",
+                 (unsigned long long)*rc);
+        if (good(*rc)) return 0;
+        if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined || attempt + 1 >= START_TRIES)
+            return -1;
+        // Refused: close the encoder, wait, open it again with the same block.
+        if (!good(REMOTE(c, CLOSE, c->video))) return -1;
+        c->video_open = 0; c->video_start_attempted = 0; c->video = 0;
+        usleep(START_RETRY_US);
+        beat();
+        net_poll(NULL, &(int){1}, 0);
+        int64_t open_rc;
+        if (open_encoder(c, base, mode, req, c->kind, &c->bufs, 0, &open_rc)) {
+            log_line("start retry: the encoder would not open again (0x%llx)", (unsigned long long)open_rc);
+            return -1;
+        }
+        if (take_handle(c, base)) return -1;
+    }
+    return -1;
 }
 
 static void cleanup(struct capture *c)
@@ -762,28 +827,23 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
         why("The console's encoder would not open.");
         goto done;
     }
-    // Read failures after a successful open still need cleanup; use the returned handle only
-    // after a complete eight-byte transfer.
-    c.video_unknown = 1;
-    if (sl_inject_read_at(&c.ctx, base, &c.video, 8) || !c.video) {
-        // Retry once while the target is stopped; never use a partial or zero handle.
-        c.video = 0;
-        if (sl_inject_read_at(&c.ctx, base, &c.video, 8) || !c.video) {
-            c.cleanup_failed = 1;
-            why("The encoder opened but its handle could not be read.");
-            goto done;
-        }
+    if (take_handle(&c, base)) {
+        why("The encoder opened but its handle could not be read.");
+        goto done;
     }
-    c.video_unknown = 0;
-    c.video_open = 1;
-    // The bitrate is set once, before Start: a change mid-session wedges the encoder until
-    // the console restarts.
-    uint8_t rate[16] = {0};
-    put64(rate, 0, 16); put32(rate, 8, req->bitrate); put32(rate, 12, req->bitrate);
-    if (sl_inject_write_at(&c.ctx, base + 0x780, rate, sizeof rate) ||
-        !good(REMOTE(&c, BITRATE_SET, c.video, base + 0x780))) goto done;
-    c.video_start_attempted = 1;
-    if (!good(REMOTE(&c, START, c.video))) { why("The console's encoder would not start."); goto done; }
+    if (firmware_is_13_60()) {
+        int64_t start_rc = SL_CALL_ERROR;
+        if (start_1360(&c, base, &mode, req, &start_rc)) { why("The console's encoder would not start."); goto done; }
+    } else {
+        // The bitrate is set once, before Start: a change mid-session wedges the encoder until
+        // the console restarts.
+        uint8_t rate[16] = {0};
+        put64(rate, 0, 16); put32(rate, 8, req->bitrate); put32(rate, 12, req->bitrate);
+        if (sl_inject_write_at(&c.ctx, base + 0x780, rate, sizeof rate) ||
+            !good(REMOTE(&c, BITRATE_SET, c.video, base + 0x780))) goto done;
+        c.video_start_attempted = 1;
+        if (!good(REMOTE(&c, START, c.video))) { why("The console's encoder would not start."); goto done; }
+    }
 
     int headers_ready = 0;
     for (unsigned i = 0; i < 20 && !quit && !net_dead && !stop_requested && now_ms() < c.startup_deadline; i++) {
