@@ -118,6 +118,9 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   folder, the helper runs no session for a core; on a fixed profile it tries the combinations that could
   make 13.60's encoder accept Start (arbitrator id, `sceAvcap2EnableScanInEncode`, the block's encoder
   variant), logs each answer (`lab:` lines) and, if one is accepted, the picture headers and a few pictures.
+  It first has SceRemotePlay's own code (its Glint constructor and block builder, by their offsets in its image) build
+  the block on a new object in its heap, logs every word where this helper's block differs, and tries OpenVideo and
+  Start with SceRemotePlay's block.
   The file is removed at start, so the next start is a normal one.
   (The helper looked for that file and for the module images with `access()`, which checks the real
   user's rights and fails in the root-only data folder; it uses `stat()` now.)
