@@ -60,6 +60,22 @@ All notable changes to this project are documented here. The format follows
 These changes have not been deployed and do not complete wireless capture's hardware acceptance.
 The original injector WIP remains preserved on `wip/capture-inject-restore`.
 
+### Community fork
+Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on top of upstream's
+`develop`. See "Fork notes" in [README.md](README.md).
+- Full-package builds on GitHub Actions (`.github/workflows/build.yml`): core with libdave,
+  FFmpeg's AAC decoder, capture helper, overlay and app, as `PPSA99072.zip` with a SHA256SUMS;
+  a tag `v<VERSION>` publishes a prerelease. The build fails if the core is built without libdave
+  or FFmpeg, or if the package lacks the overlay or the capture helper.
+- Community builds are versioned `<upstream version>.community.<n>` (`0.6.0-alpha.2.community.1`),
+  never `-dev`; `tests/update.c` asserts they order above their upstream base and below every later
+  upstream release.
+- `make overlay` builds the in-game overlay; `make all` includes it, `make release` requires it, so
+  the app's Overlay page is no longer "Not in this build.".
+- `app/tools/fetch-opengl-sdk.sh` downloads the ps5-opengl SDK from `JVK3R/ps5-opengl`
+  (`blackbearreloaded/ps5-opengl` answers 404); the pinned SHA-256 values are unchanged.
+- Settings > About > Source shows `github.com/Booskazed/ps5-discord`.
+
 ## [0.6.0-alpha.2] - 2026-10-31
 
 ### Fixed
