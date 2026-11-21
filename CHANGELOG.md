@@ -102,9 +102,15 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   encoder service's status and the two buffer descriptors it hands out (two `libSceAvcap2` 13.60 entry
   points; logged), then tries once each, without and then with `sceAvcap2EnableScanInEncode`, the 13.60
   parameter block SceRemotePlay's own code builds (with the descriptors, then without) and 13.00's block;
-  the first the encoder accepts is used (`probe:` lines in `capture.log`). 13.00 keeps its validated
-  sequence. If none works, the diagnostic writes the images of SceRemotePlay, `libSceAvcap2` and
-  `libSceResourceArbitrator` to the data folder once (read-only toward the target, never published).
+  the first the encoder accepts is used (`probe:` lines in `capture.log`). On the console the 13.60 block
+  with the service's descriptors opened the encoder at the first try (community.7). 13.00 keeps its
+  validated sequence. If none works, the diagnostic writes the images of SceRemotePlay, `libSceAvcap2`
+  and `libSceResourceArbitrator` to the data folder once (read-only toward the target, never published).
+- Wireless Go Live on 13.60: `sceAvcap2Start` answered `0x80c78000` after the 13.00 bitrate call. SceRemotePlay
+  never calls `sceAvcap2SetVideoBitrate` (the bitrate is in the block) and, when Start is refused, closes the
+  encoder, waits and opens it again until its time budget is spent. The helper now does the same: the first
+  tries start without the bitrate call, the later ones with it, closing and reopening (the same block)
+  between tries; every try is logged (`start try`).
 
 ## [0.6.0-alpha.2] - 2026-10-31
 
