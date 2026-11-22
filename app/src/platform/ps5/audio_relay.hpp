@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -57,18 +58,36 @@ class AudioRelayServer
         const int flags = fcntl(listen_fd_, F_GETFL, 0);
         fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK);
         token_ = (static_cast<std::uint64_t>(sys::monotonic_us()) << 1) ^ 0x4c414231ULL;
-        mkdir(kDir, 0777);
-        if (std::FILE *f = std::fopen(kFile, "wb"))
-        {
-            std::fwrite(&kPort, sizeof kPort, 1, f);
-            std::fwrite(&token_, sizeof token_, 1, f);
-            std::fclose(f);
-        }
-        else
-        {
-            sys::log("[HUI] audio relay could not write %s errno=%d", kFile, errno);
-        }
         sys::log("[HUI] audio relay listening port=%u", static_cast<unsigned>(kPort));
+        // Writing the handshake file this early (VoiceAudio::start() runs
+        // near the very top of main()) sometimes got ENOENT for a directory
+        // this same code had just created, inconsistently across launches
+        // (measured 2026-11-22: failed on one launch, had worked a launch
+        // or two earlier with no code change in between) -- a sandbox mount
+        // not fully up yet looks like the explanation, same reason
+        // tools/audio-probe's app_mic_probe.cpp waits 15 s before its own
+        // first /data write. Retried from a detached thread instead of
+        // blocking start() for that long.
+        const std::uint16_t port = kPort;
+        const std::uint64_t token = token_;
+        std::thread([port, token]
+                    {
+            for (int attempt = 0; attempt < 10; ++attempt)
+            {
+                mkdir(kDir, 0777);
+                if (std::FILE *f = std::fopen(kFile, "wb"))
+                {
+                    std::fwrite(&port, sizeof port, 1, f);
+                    std::fwrite(&token, sizeof token, 1, f);
+                    std::fclose(f);
+                    sys::log("[HUI] audio relay handshake file written (try %d)", attempt + 1);
+                    return;
+                }
+                sys::log("[HUI] audio relay could not write %s errno=%d (try %d)", kFile, errno, attempt + 1);
+                sys::sleep_us(500000);
+            }
+            sys::log("[HUI] audio relay giving up on %s", kFile); })
+            .detach();
         return true;
     }
 
