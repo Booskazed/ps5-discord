@@ -179,8 +179,8 @@ Status of upstream `develop`'s options on firmware 13.60, as tested so far on on
 | Option | State |
 |---|---|
 | Go Live through Remote Play (legacy) | works (tested at the four qualities) |
-| Go Live through the hardware encoder (wireless) | fails: `sceAvcap2OpenVideo` returns `0x81950008` (upstream issue #11) |
-| In-game overlay | refused: the overlay's firmware check accepts 13.00 only |
+| Go Live through the hardware encoder (wireless) | works (720p · 60 fps: a viewer saw the picture live, 2026-11-22; other qualities not checked). Fixed in this fork's capture helper (upstream issue #11) |
+| In-game overlay | allowed on 13.60 (the firmware check lists 13.00 and 13.60); colours, buttons and fonts not checked on the console |
 | Controller audio (USB DualSense in calls) | WIP upstream, not tested |
 | Bluetooth headset through a USB adapter | needs an adapter, not tested |
 

@@ -14,14 +14,17 @@
 #include <sys/types.h>
 #include <sys/sysctl.h>
 
-// The wireless Go Live (the console's hardware encoder, capture/) was only ever seen to work on
-// firmware 13.00; on 13.60 sceAvcap2OpenVideo answers 0x81950008 (upstream issue #11). Anywhere else,
-// and when the firmware cannot be read, the default method is Remote Play (legacy), which works.
+// The wireless Go Live (the console's hardware encoder, capture/) is known to work on firmware 13.00
+// (upstream's tests) and on 13.60 (the community fork's helper opens the encoder the way SceRemotePlay does;
+// on 2026-11-22 a viewer saw the picture live, on one console). Anywhere else, and when the firmware cannot be
+// read, the default method is Remote Play (legacy), which works.
 static int encoder_firmware_validated(void)
 {
     uint32_t sdk = 0;
     size_t len = sizeof sdk;
-    return sysctlbyname("kern.sdk_version", &sdk, &len, NULL, 0) == 0 && len == sizeof sdk && (sdk >> 16) == 0x1300;
+    if (sysctlbyname("kern.sdk_version", &sdk, &len, NULL, 0) != 0 || len != sizeof sdk) return 0;
+    const uint32_t firmware = sdk >> 16; // 0x1300 is 13.00, 0x1360 is 13.60
+    return firmware == 0x1300 || firmware == 0x1360;
 }
 #endif
 

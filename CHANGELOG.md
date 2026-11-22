@@ -87,8 +87,9 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
 - In-game overlay: `overlay/src/core/parent.cpp` allows firmware 13.60 next to 13.00 (an explicit list;
   every other refusal and the Mono signature checks are unchanged). Colours, button bits, fonts and
   labels are still unchecked on 13.60.
-- Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00, where the
-  wireless hardware encoder was seen to work; on 13.60 it fails with `0x81950008`. A saved choice wins.
+- Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00 and 13.60, where the
+  wireless hardware encoder works (13.60: see below; a viewer saw the picture live on one console). A saved
+  choice wins.
 - Wireless Go Live diagnostic (`capture/src/diag_native.c`): when the encoder answers `0x81950008`, the
   helper reads (only reads) SceRemotePlay's code, finds where it calls `sceAvcap2Initialize`,
   `sceAvcap2EnableScanInEncode`, `sceAvcap2OpenVideo` and the resource arbitrator, and writes the code
