@@ -29,16 +29,12 @@ class AudioRelayServer
 {
   public:
     static constexpr std::uint16_t kPort = 9043;
-    // In the order the worker tries them (platform/ps5/audio_relay.hpp's
-    // worker-side counterpart: overlay/src/core/worker.cpp's kCandidateFiles).
-    static constexpr const char *kCandidateDirs[] = {
-        "/data/ps5-discord-audio-relay",
-        "/user/data/ps5-discord-audio-relay",
-        "/data/ps5-discord-community",
-        "/user/data/ps5-discord-community",
-        "/data/discord-overlay-poc",
-        "/user/data/discord-overlay-poc",
-    };
+    // Not /data/...: measured 2026-11-22 that the worker, inside SceShellUI's
+    // own sandbox, gets ENOENT for a file that genuinely exists there on the
+    // real filesystem (confirmed over FTP). /user/data/... is what its own
+    // worker_dir already uses successfully, and is what actually worked here.
+    static constexpr const char *kDir = "/user/data/ps5-discord-audio-relay";
+    static constexpr const char *kFile = "/user/data/ps5-discord-audio-relay/audio-relay.bin";
 
     bool start()
     {
@@ -61,31 +57,16 @@ class AudioRelayServer
         const int flags = fcntl(listen_fd_, F_GETFL, 0);
         fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK);
         token_ = (static_cast<std::uint64_t>(sys::monotonic_us()) << 1) ^ 0x4c414231ULL;
-        // Not /data/discord-overlay-poc: that one is root:755 (created by the
-        // loader, an elfldr payload with full privileges) and this app's own
-        // process could not create a file in it (silently: no audio-relay.bin
-        // ever appeared, measured 2026-11-22). A directory this app creates
-        // itself (as tools/audio-probe's app_mic_probe.cpp already does
-        // under /data/ps5-discord-probe) it owns, and can write into -- but
-        // whether the worker, inside SceShellUI's own sandbox, can read
-        // anything under plain /data/... at all is unmeasured, so this
-        // writes every candidate path the worker will try, cheaply (a few
-        // bytes each), rather than guess which one crosses that boundary.
-        for (const char *dir : kCandidateDirs)
+        mkdir(kDir, 0777);
+        if (std::FILE *f = std::fopen(kFile, "wb"))
         {
-            mkdir(dir, 0777);
-            char file[160];
-            std::snprintf(file, sizeof file, "%s/audio-relay.bin", dir);
-            if (std::FILE *f = std::fopen(file, "wb"))
-            {
-                std::fwrite(&kPort, sizeof kPort, 1, f);
-                std::fwrite(&token_, sizeof token_, 1, f);
-                std::fclose(f);
-            }
-            else
-            {
-                sys::log("[HUI] audio relay could not write %s errno=%d", file, errno);
-            }
+            std::fwrite(&kPort, sizeof kPort, 1, f);
+            std::fwrite(&token_, sizeof token_, 1, f);
+            std::fclose(f);
+        }
+        else
+        {
+            sys::log("[HUI] audio relay could not write %s errno=%d", kFile, errno);
         }
         sys::log("[HUI] audio relay listening port=%u", static_cast<unsigned>(kPort));
         return true;
@@ -143,11 +124,18 @@ class AudioRelayServer
 
     // Raw bytes as received from the core (same stereo S16 48 kHz layout).
     // Best-effort: a stalled client just misses audio, never blocks here.
+    // MSG_NOSIGNAL (a Linux-ism; this console's BSD-derived libkernel does
+    // not support it the same way) made every send() fail outright, closing
+    // the client the moment the next chunk arrived (measured 2026-11-22:
+    // "client connected" immediately followed by "client dropped"). The
+    // rest of this file already ignores SIGPIPE process-wide
+    // (VoiceAudio::start()), which is this codebase's actual answer to a
+    // peer that closed mid-write, so this does not need its own.
     void forward(const void *data, std::size_t n)
     {
         if (client_fd_ < 0 || n == 0)
             return;
-        const ssize_t sent = send(client_fd_, data, n, MSG_DONTWAIT | MSG_NOSIGNAL);
+        const ssize_t sent = send(client_fd_, data, n, MSG_DONTWAIT);
         if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
         {
             close(client_fd_);
