@@ -1371,7 +1371,7 @@ static void lab_scan_found(void *user, const struct diag_block *b)
     log_line("lab: block %d: the qword 0x2e8 is at 0x%llx; the session object would start at 0x%llx", *count,
              (unsigned long long)b->addr, (unsigned long long)(b->addr - 0x238));
     if (!b->have_block) { log_line("lab: block %d could not be read", *count); return; }
-    if (*count <= 2) lab_dump("block", b->block, sizeof b->block);
+    if (*count <= 4) lab_dump("block", b->block, sizeof b->block);
     if (b->have_after) {
         log_line("lab: Configure's arguments in the object: variant %u, id 0x%x, flag %u; session fields +0x2005f8 %u, +0x200600 %u",
                  get32(b->after, 8), get32(b->after, 0xc), b->after[0x10], get32(b->after, 0x20), get32(b->after, 0x28));
@@ -1381,7 +1381,7 @@ static void lab_scan_found(void *user, const struct diag_block *b)
         log_line("lab: session fields: +0x30 %u, +0x34 %u, +0x3c %u, +0x40 %u, +0x1c0 %u, +0x1cc %u, +0x1ec %u", get32(b->before, 0x38),
                  get32(b->before, 0x3c), get32(b->before, 0x44), get32(b->before, 0x48), get32(b->before, 0x1c8),
                  get32(b->before, 0x1d4), get32(b->before, 0x1f4));
-        if (*count <= 2) lab_dump("session head", b->before, sizeof b->before);
+        if (*count <= 4) lab_dump("session head", b->before, sizeof b->before);
     }
     // The block this helper would build for the same profile, and every word where the two differ.
     const uint32_t selector = get32(b->block, 0x20), fps_flag = get32(b->block, 0x24);
