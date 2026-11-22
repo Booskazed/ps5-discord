@@ -43,10 +43,13 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
-// AudioTest is a lab mode (see AudioOutInit..AudioOutClose above): no Mono
-// resolution or hooking at all, just sceAudioOut calls from inside ShellUI.
-enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6};
-inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest;}
+// AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose
+// above): no Mono resolution or hooking at all, just sceAudioOut calls from
+// inside ShellUI. AudioRelay plays real voice PCM piped from the app
+// (platform/ps5/audio_relay.hpp) instead of AudioTest's generated tone, for
+// as long as that connection stays up (minutes, not seconds).
+enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7};
+inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay;}
 inline bool draws(Mode m){return m==Mode::Widget||m==Mode::Service;}
 // Managed Sce.PlayStation.Core.Input.GamePadData layout (value type, 36 bytes).
 struct PadData {
@@ -87,8 +90,11 @@ inline std::uint64_t now_ms(){timespec t{};if(clock_gettime(CLOCK_MONOTONIC,&t))
     return std::uint64_t(t.tv_sec)*1000+std::uint64_t(t.tv_nsec)/1000000;}
 inline bool address(std::uint64_t p){return p>=0x10000&&p<0x800000000000ULL;}
 inline bool valid(const Request& r,int pid,std::uint64_t build,std::uint64_t epoch,std::uint64_t now){
+    // AudioRelay runs for as long as the app stays connected (minutes), so its
+    // deadline window is wider than every other mode's.
+    const std::uint64_t max_window=r.mode==Mode::AudioRelay?650000:120000;
     if(r.signature!=magic||r.protocol!=version||r.size!=sizeof r||r.pid!=pid||r.build!=build||r.epoch!=epoch||!r.epoch||!r.token||
-       !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>120000)return false;
+       !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>max_window)return false;
     for(unsigned i=0;i<FunctionCount;i++)if(!address(r.functions[i])&&!(optional(i)&&!r.functions[i]))return false;
     return true;
 }

@@ -16,7 +16,7 @@ LAB_FLAGS := $(filter-out -DOVERLAY_BUILD=%,$(FLAGS)) -DOVERLAY_BUILD=0x$(LAB_BU
 VENDOR := vendor/shellui-loader
 OBJECTS := build/pt.o build/loader.o build/injector.o build/remote-call.o build/blob.o
 .PHONY: all test inspect clean preview pill-lab lab-preview
-all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf inspect
+all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf inspect
 # The build id is baked into both halves (worker and loader): any change to it rebuilds both,
 # or the loader's request carries an id the embedded worker refuses.
 build/overlay-worker.elf: $(HASH_SOURCES) Makefile
@@ -75,6 +75,11 @@ build/parent-audiotest.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURC
 	@mkdir -p build
 	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=6 -c $< -o $@
 build/overlay-audiotest.elf: build/parent-audiotest.o $(OBJECTS)
+	$(CXX_PS5) $(FLAGS) $^ -o $@
+build/parent-audiorelay.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES) Makefile
+	@mkdir -p build
+	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=7 -c $< -o $@
+build/overlay-audiorelay.elf: build/parent-audiorelay.o $(OBJECTS)
 	$(CXX_PS5) $(FLAGS) $^ -o $@
 # Standalone lab: explicit opt-in, never linked into the app package or normal blobs.
 pill-lab: build/pill-lab.elf

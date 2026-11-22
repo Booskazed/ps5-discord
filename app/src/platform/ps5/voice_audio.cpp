@@ -3,6 +3,7 @@
 
 #include "platform/ps5/voice_audio.hpp"
 
+#include "platform/ps5/audio_relay.hpp"
 #include "platform/ps5/sce_module.hpp"
 #include "platform/ps5/system.hpp"
 
@@ -118,6 +119,9 @@ void sleep_ms(std::uint32_t ms)
     sys::sleep_us(ms * 1000);
 }
 
+// LAB ONLY (see audio_relay.hpp): one relay server for the process.
+AudioRelayServer g_relay;
+
 } // namespace
 
 VoiceAudio::VoiceAudio() = default;
@@ -133,6 +137,8 @@ void VoiceAudio::start(int user)
         return;
     user_ = user;
     std::signal(SIGPIPE, SIG_IGN); // a core that closes mid-write is an error, not a crash
+    if (!g_relay.start())
+        sys::log("[HUI] audio relay failed to listen");
     stop_.store(false);
     if (pthread_create(&mic_thread_, nullptr, &VoiceAudio::mic_main, this) != 0)
     {
@@ -298,6 +304,7 @@ void VoiceAudio::link_run()
         }
 
         stats();
+        g_relay.poll_accept();
         pollfd p{fd, static_cast<short>(POLLIN | (out.empty() ? 0 : POLLOUT)), 0};
         poll(&p, 1, 5);
         if (p.revents & (POLLERR | POLLHUP | POLLNVAL))
@@ -354,6 +361,7 @@ void VoiceAudio::link_run()
                     break;
                 in_left.insert(in_left.end(), buf, buf + got);
                 st_recv += static_cast<std::size_t>(got);
+                g_relay.forward(buf, static_cast<std::size_t>(got));
             }
             const std::size_t frames = in_left.size() / 4;
             if (frames > 0 && want_playback_.load(std::memory_order_relaxed))

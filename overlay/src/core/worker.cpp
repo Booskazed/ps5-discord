@@ -3,11 +3,17 @@
 #include "hook.hpp"
 #include "../app/overlay_ui.hpp"
 #include "../app/overlay_app.cpp"
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdarg>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 using namespace overlay;
 #ifndef OVERLAY_BUILD
 #define OVERLAY_BUILD 0ULL
@@ -867,8 +873,82 @@ State run_audio_test(){
     const State result=errors==0&&writes>0?State::Passed:State::Failed;
     publish(result);return result;
 }
+// Mode::AudioRelay only: like run_audio_test(), but the source is real voice
+// PCM piped from the app over a loopback socket (platform/ps5/audio_relay.hpp),
+// not a generated tone. Runs for as long as that connection stays up (the
+// app closing it, or stop.bin, end it cleanly), bounded by a safety ceiling.
+State run_audio_relay(){
+    publish(State::Observing);
+    char p[256];
+    if(!path(p,sizeof p,parent_dir,"audio-relay.bin")){publish(State::Failed);return State::Failed;}
+    std::FILE* f=std::fopen(p,"rb");
+    if(!f){note("AUDIORELAY no audio-relay.bin; is the app running with a relay build?");publish(State::Failed);return State::Failed;}
+    std::uint16_t port=0;std::uint64_t token=0;
+    const bool got_header=std::fread(&port,sizeof port,1,f)==1&&std::fread(&token,sizeof token,1,f)==1;
+    std::fclose(f);
+    if(!got_header){note("AUDIORELAY audio-relay.bin unreadable");publish(State::Failed);return State::Failed;}
+    const int fd=socket(AF_INET,SOCK_STREAM,0);
+    note("AUDIORELAY socket fd=%d errno=%d",fd,errno);
+    if(fd<0){publish(State::Failed);return State::Failed;}
+    sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(port);a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    const int connect_rc=connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a);
+    note("AUDIORELAY connect port=%u rc=%d errno=%d",unsigned(port),connect_rc,errno);
+    if(connect_rc!=0){close(fd);publish(State::Failed);return State::Failed;}
+    const ssize_t handshake_sent=send(fd,&token,sizeof token,0);
+    if(handshake_sent!=static_cast<ssize_t>(sizeof token)){note("AUDIORELAY handshake failed sent=%zd",handshake_sent);close(fd);publish(State::Failed);return State::Failed;}
+    const int flags=fcntl(fd,F_GETFL,0);fcntl(fd,F_SETFL,flags|O_NONBLOCK);
+
+    const auto init=fn<AudioOutInitCall>(AudioOutInit);
+    const auto open=fn<AudioOutOpenCall>(AudioOutOpen);
+    const auto output=fn<AudioOutOutputCall>(AudioOutOutput);
+    const auto close_out=fn<AudioOutCloseCall>(AudioOutClose);
+    const int init_rc=init();
+    note("AUDIORELAY init rc=0x%08x",unsigned(init_rc));
+    if(init_rc!=0&&init_rc!=static_cast<int>(0x8026000e)){close(fd);publish(State::Failed);return State::Failed;}
+    const int handle=open(0xff,0,0,256,48000,1);
+    note("AUDIORELAY open rc=0x%08x",unsigned(handle));
+    if(handle<0){close(fd);publish(State::Failed);return State::Failed;}
+
+    std::uint8_t pending[4096];std::size_t pending_len=0;
+    alignas(64) std::int16_t grain[256*2];
+    int writes=0,errors=0;std::uint64_t recv_bytes=0;
+    const std::uint64_t until=now_ms()+570000; // under the loader's deadline
+    bool link_closed=false;
+    while(!link_closed&&now_ms()<until){
+        std::uint64_t stop=0;if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+        std::uint8_t buf[4096];
+        const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
+        if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
+            note("AUDIORELAY connection closed rc=%zd errno=%d",got,errno);link_closed=true;break;}
+        if(got>0){
+            recv_bytes+=std::uint64_t(got);
+            std::size_t at=0;
+            while(at<std::size_t(got)){
+                const std::size_t take=std::min(std::size_t(got)-at,sizeof pending-pending_len);
+                std::memcpy(pending+pending_len,buf+at,take);pending_len+=take;at+=take;
+                while(pending_len>=sizeof grain){
+                    std::memcpy(grain,pending,sizeof grain);
+                    std::memmove(pending,pending+sizeof grain,pending_len-sizeof grain);pending_len-=sizeof grain;
+                    const int rc=output(handle,grain);++writes;
+                    if(rc<0){++errors;if(errors<=5||errors%100==0)note("AUDIORELAY write #%d rc=0x%08x",writes,unsigned(rc));}
+                    if(writes%200==0){
+                        note("AUDIORELAY writes=%d errors=%d recv_bytes=%llu",writes,errors,
+                             static_cast<unsigned long long>(recv_bytes));
+                        publish(State::Observing);}
+                }
+            }
+        } else {
+            usleep(2000); // nothing waiting right now; do not spin
+        }
+    }
+    output(handle,nullptr);close_out(handle);close(fd);
+    note("AUDIORELAY done writes=%d errors=%d recv_bytes=%llu",writes,errors,static_cast<unsigned long long>(recv_bytes));
+    const State result=writes>0?State::Passed:State::Failed;
+    publish(result);return result;
+}
 State run(){
     if(request.mode==Mode::AudioTest)return run_audio_test();
+    if(request.mode==Mode::AudioRelay)return run_audio_relay();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
