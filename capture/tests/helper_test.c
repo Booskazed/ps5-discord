@@ -122,7 +122,9 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
         cur_feature = (uint32_t)a[0];
         break;
     case CHANGE_STATE:
-        assert(!strcmp((const char *)(uintptr_t)a[1], "RUNNING") && a[0] == cur_feature && a[3] == 0);
+        // 13.60: the session ends with STOP, as SceRemotePlay's does, before it clears the callback
+        assert((!strcmp((const char *)(uintptr_t)a[1], "RUNNING") || (fw_override == 0x1360 && !strcmp((const char *)(uintptr_t)a[1], "STOP"))) &&
+               a[0] == cur_feature && a[3] == 0);
         break;
     case CLEAR_CALLBACK: assert(a[0] == cur_feature); break;
     case OPEN_VIDEO: {
@@ -144,8 +146,7 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
                    rd64(scratch + 0x220) == 278528);
             assert(rd32(scratch + 0x2b0) == (scenario == MODE_120HZ ? 0x40u : 0x30u));
             assert(rd32(scratch + 0x2b4) == 2 && scratch[0x2c4] == 1 && rd64(scratch + 0x1a8) == 0); // no descriptors on the host
-            assert(rd32(scratch + 0x238) == 0x3f800000u && scratch[0x230] == 0 && scratch[0x2af] == 0); // not the 0xff fill
-            assert(calls[ENABLE_SCAN] == 1); // EnableScanInEncode comes before the open (and is not repeated)
+            assert(rd32(scratch + 0x238) == 0 && rd32(scratch + 0x23c) == 0 && scratch[0x230] == 0 && scratch[0x2af] == 0); // not the 0xff fill, not 1.0
             native_blocks++;
         } else {
             assert(rd32(scratch + 0xd0) == profile.bitrate && rd32(scratch + 0xd4) == profile.bitrate);
@@ -549,27 +550,27 @@ int main(void)
         cases += 2;
     }
 
-    // Firmware 13.60 (upstream issue #11): the 13.00 block is refused there. The helper registers as ever, calls
-    // EnableScanInEncode before opening (without it the encoder is not given the display: a black stream), then
-    // tries 13.60's block (the one SceRemotePlay's own code builds), then 13.00's, and goes on with the first the
-    // encoder accepts; when none is accepted it says so, after exactly those attempts. (The service's status and
-    // buffer queries exist on the console only, so on the host 13.60's block is tried without the buffer descriptors.)
+    // Firmware 13.60 (upstream issue #11): the 13.00 block is refused there. The helper registers as ever, then
+    // tries 13.60's block (the one SceRemotePlay's own code builds), then 13.00's, without and then with
+    // EnableScanInEncode, and goes on with the first the encoder accepts; when none is accepted it says so,
+    // after exactly those attempts. (The service's status and buffer queries exist on the console only, so on
+    // the host 13.60's block is tried without the buffer descriptors.)
     {
         fw_override = 0x1360;
         scenario = FW1360_NATIVE_ONLY; profile = profiles[1]; reset_fake(); // 720p60
         struct seen s; int rc;
         run_helper(&profile, &s, &rc, 1, 1);
-        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 1 && calls[ENABLE_SCAN] == 1 && native_blocks == 1);
+        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 1 && calls[ENABLE_SCAN] == 0 && native_blocks == 1);
         assert(s.videos >= 8 && !s.states[CAP_ERROR] && vstop == 1 && vclose == 1 && calls[TERMINATE] == 1);
-        assert(calls[SET_CALLBACK] == 1 && calls[CHANGE_STATE] == 1 && calls[CLEAR_CALLBACK] == 1);
+        assert(calls[SET_CALLBACK] == 1 && calls[CHANGE_STATE] == 2 && calls[CLEAR_CALLBACK] == 1); // RUNNING, then STOP
         scenario = FW1360_OLD_AFTER_SCAN; profile = profiles[2]; reset_fake(); // 1080p30
         run_helper(&profile, &s, &rc, 1, 1);
-        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 2 && calls[ENABLE_SCAN] == 1 && native_blocks == 1);
+        assert(s.hello && rc == 0 && calls[OPEN_VIDEO] == 4 && calls[ENABLE_SCAN] == 1 && native_blocks == 2);
         assert(s.videos >= 8 && !s.states[CAP_ERROR] && vstop == 1 && vclose == 1);
         scenario = FW1360_REFUSED; reset_fake();
         run_helper(&profile, &s, &rc, 1, 1);
         assert(s.hello && rc == 1 && !s.videos && s.states[CAP_ERROR] == 1 && s.error[0]);
-        assert(calls[OPEN_VIDEO] == 2 && calls[ENABLE_SCAN] == 1 && native_blocks == 1 && vclose == 0 && calls[TERMINATE] == 1);
+        assert(calls[OPEN_VIDEO] == 4 && calls[ENABLE_SCAN] == 1 && native_blocks == 2 && vclose == 0 && calls[TERMINATE] == 1);
         // Once open, the encoder is started without the bitrate call SceRemotePlay never makes; refused, it is
         // closed and opened again (the same block) and started again; the second half of the tries make the
         // bitrate call 13.00 needs; refused every time, the session ends in an error after exactly those tries.

@@ -324,10 +324,9 @@ struct capture {
     uint32_t feature;                // the id registered with the resource arbitrator (and written in the block)
     uint32_t variant;                // the encoder variant written in 13.60's block
     uint8_t written[0x2f0];          // the block as open_encoder() last wrote it (the lab compares it with what the service leaves)
-    unsigned tweak;                  // lab only: TWEAK_* changes to 13.60's block (what a running session's block shows)
+    unsigned tweak;                  // lab only: TWEAK_* changes to 13.60's block
 };
-#define TWEAK_FLOATS 1u              // the two floats at offsets 0x238 and 0x23c are 0.0, as in a running session's block, not 1.0
-#define TWEAK_CAPS 2u                // the two caps at offsets 0x54 and 0x104 are 0x2bb0, as in a running session's block
+#define TWEAK_MASK 1u                // the two floats at offsets 0x238 and 0x23c are 1.0 (SceRemotePlay's builder default: flat pictures)
 
 // One result per session; the supervisor never conflates capture and cleanup.
 struct session_result {
@@ -529,8 +528,9 @@ static void video_params_1360(uint8_t p[0x2f0], uint32_t mode, const struct star
     }
     put64(p, 0x1f8, 0xf8); put64(p, 0x200, 0x28);
     put32(p, 0x214, 384); put32(p, 0x218, 352); put32(p, 0x21c, 512); put64(p, 0x220, 278528);
-    put64(p, 0x228, 0x88);
-    put32(p, 0x238, 0x3f800000u); put32(p, 0x23c, 0x3f800000u);
+    put64(p, 0x228, 0x88); // 0x88 bytes follow: eight 16-byte entries SceRemotePlay's session sets while it runs (all zero in
+                           // a running session; its builder's default has 1.0, 1.0 at offsets 0x238 and 0x23c, and the
+                           // pictures that came out with that default were flat)
     put32(p, 0x2b0, mode); put32(p, 0x2b4, variant == 6 ? 1 : 2); // the code that fills it differs for variant 6
     put64(p, 0x2b8, 0x10); put32(p, 0x2c0, 1); p[0x2c4] = 1;
     put64(p, 0x2c8, 0x10); p[0x2d0] = 1; put32(p, 0x2d4, r->fps == 30 ? 0x37u : 0x6eu);
@@ -550,8 +550,7 @@ static int open_encoder(struct capture *c, intptr_t base, uint32_t *mode, const 
         if (kind == OPEN_13_00) video_params(block, *mode, req, c->feature, 0x2e0);
         else video_params_1360(block, *mode, req, c->feature, c->variant, kind == OPEN_13_60_BUFFERS ? bufs : NULL);
         if (kind != OPEN_13_00) {
-            if (c->tweak & TWEAK_FLOATS) { put32(block, 0x238, 0); put32(block, 0x23c, 0); }
-            if (c->tweak & TWEAK_CAPS) { put32(block, 0x54, 0x2bb0); put32(block, 0x104, 0x2bb0); }
+            if (c->tweak & TWEAK_MASK) { put32(block, 0x238, 0x3f800000u); put32(block, 0x23c, 0x3f800000u); }
         }
         memcpy(c->written, block, len);
         if (sl_inject_write_at(&c->ctx, base, block, len)) return -1;
@@ -647,21 +646,17 @@ static int query_buffers(struct capture *c, intptr_t base, uint32_t mode, const 
 }
 #endif
 
-// Firmware 13.60: registers as the 13.00 sequence does (id 12) and calls EnableScanInEncode as it does, then reads
-// the encoder service's status and buffer descriptors as SceRemotePlay does (logged), then tries each parameter
-// block once: 13.60's block with the descriptors, 13.60's block alone, 13.00's block. Without EnableScanInEncode
-// the encoder opens and starts but is not given the display (community.13's Go Live: a 218-byte key frame and
-// 41-byte pictures for three minutes, a black screen). Returns 1 once the encoder is open, 0 when all were
-// refused, -1 when the session must end.
+// Firmware 13.60: registers as the 13.00 sequence does (id 12), reads the encoder service's status and buffer
+// descriptors as SceRemotePlay does (logged), then tries each parameter block once, without and then with
+// EnableScanInEncode (SceRemotePlay never calls it, and the console showed the encoder needs it for nothing):
+// 13.60's block with the descriptors, 13.60's block alone, 13.00's block. Returns 1 once the encoder is open,
+// 0 when all were refused, -1 when the session must end.
 static int open_1360(struct capture *c, intptr_t base, uint32_t *mode, const struct start_req *req, int64_t *rc)
 {
     struct buffers bufs = {{0}, {0}};
     int have = 0;
     *rc = SL_CALL_ERROR;
     if (arbitrate(c, base, FEATURE, 0)) return -1;
-    const int64_t scan = REMOTE(c, ENABLE_SCAN);
-    if (scan == SL_CALL_ERROR) return -1;
-    if (!good(scan)) log_line("EnableScanInEncode was refused (0x%llx); the picture may be blank", (unsigned long long)scan);
 #ifdef SL_PS5
     probe_status(c, base);
     have = query_buffers(c, base, *mode, req, &bufs) == 0;
@@ -669,12 +664,15 @@ static int open_1360(struct capture *c, intptr_t base, uint32_t *mode, const str
 #endif
     static const enum open_kind plan[] = {OPEN_13_60_BUFFERS, OPEN_13_60, OPEN_13_00};
     static const char *const names[] = {"13.60 block with the service's buffers", "13.60 block", "13.00 block"};
-    for (unsigned k = 0; k < sizeof plan / sizeof *plan; k++) {
-        if (plan[k] == OPEN_13_60_BUFFERS && !have) continue;
-        const int ok = open_encoder(c, base, mode, req, plan[k], &bufs, 0, rc) == 0;
-        log_line("probe: %s -> 0x%llx", names[k], (unsigned long long)*rc);
-        if (ok) { c->kind = plan[k]; c->bufs = bufs; return 1; }
-        if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined) return -1;
+    for (unsigned scan = 0; scan < 2; scan++) {
+        if (scan && !good(REMOTE(c, ENABLE_SCAN))) return -1;
+        for (unsigned k = 0; k < sizeof plan / sizeof *plan; k++) {
+            if (plan[k] == OPEN_13_60_BUFFERS && !have) continue;
+            const int ok = open_encoder(c, base, mode, req, plan[k], &bufs, 0, rc) == 0;
+            log_line("probe: %s, EnableScanInEncode %s -> 0x%llx", names[k], scan ? "on" : "off", (unsigned long long)*rc);
+            if (ok) { c->kind = plan[k]; c->bufs = bufs; return 1; }
+            if (*rc == SL_CALL_ERROR || quit || net_dead || stop_requested || c->ctx.quarantined) return -1;
+        }
     }
     return 0;
 }
@@ -775,6 +773,19 @@ static int start_1360(struct capture *c, intptr_t base, uint32_t *mode, const st
     return -1;
 }
 
+// Firmware 13.60: SceRemotePlay ends a feature with ChangeState(id, "STOP", ...) before it clears the callback.
+// This helper never did, and the resource arbitrator kept the id RUNNING (with its video codec budget and its
+// scan-in slot; the console's kernel log shows it) until the console restarted, which could starve a Remote Play
+// session or the system's own capture started afterwards. Best effort: a refusal is only logged.
+static void leave_state(struct capture *c)
+{
+    static const char stop[] = "STOP";
+    const intptr_t at = c->ctx.scratch + 0x640;
+    if (c->ctx.scratch <= 0 || sl_inject_write_at(&c->ctx, at, stop, sizeof stop)) return;
+    const int64_t rc = REMOTE(c, CHANGE_STATE, c->feature, (uint64_t)at, 0, 0);
+    if (!good(rc)) log_line("the arbitrator did not take STOP for id 0x%x: 0x%llx", c->feature, (unsigned long long)rc);
+}
+
 static void cleanup(struct capture *c)
 {
     c->cleanup = 1;
@@ -793,6 +804,7 @@ static void cleanup(struct capture *c)
                 log_line("HDMI mode before=0x%x after=0x%x", c->output_mode, after);
             }
         }
+        if (c->callback && firmware_is_13_60() && !c->ctx.quarantined) leave_state(c);
         if (c->callback && !good(REMOTE(c, CLEAR_CALLBACK, c->feature))) c->failed = c->cleanup_failed = 1;
         if (c->initialized && !good(REMOTE(c, TERMINATE))) c->failed = c->cleanup_failed = 1;
     } else {
@@ -1300,24 +1312,21 @@ static int lab_run(void)
     // and every picture of a three-minute Go Live was a few dozen bytes: the encoder was not given the display.
     // Each test opens the encoder with this helper's block, starts it and reads pictures (keep something with
     // detail on the screen: a key frame of a flat picture is 200 bytes, of a real one tens of kilobytes).
-    // The kernel log showed SceRemotePlay's session and this helper's get the same scan-in set by the capture
-    // service, and a running session's block differs from this helper's in only six words: the handle, the two
-    // caps and two floats (0.0 in the running session, 1.0 here, in the 0x88-byte sub-block the builder copies
-    // from the session's saved format). So the tests: this helper's block, then the floats as in the running
-    // session, then the floats and the caps, then SceRemotePlay's way of taking its own id with both, then with
-    // EnableScanInEncode too.
+    // What the lab found on 13.60: the flat pictures came from the two floats at block offsets 0x238 and 0x23c
+    // (1.0 in SceRemotePlay's builder default, 0.0 in the block of its running session); with 0.0 the first key
+    // frame is 16634 bytes, not 218. EnableScanInEncode, the arbitrator id and SceRemotePlay's way of taking it
+    // changed nothing. So: this helper's block (what Go Live uses), the same with the builder's floats (flat),
+    // and, if neither of those gave real pictures, SceRemotePlay's way of taking its own id.
     static const struct lab_test tests[] = {
         {"id 12, as this helper does", FEATURE, 2, 0, 0, 0, 0},
-        {"id 12, floats 0", FEATURE, 2, 0, 0, 0, TWEAK_FLOATS},
-        {"id 12, floats 0, caps 0x2bb0", FEATURE, 2, 0, 0, 0, TWEAK_FLOATS | TWEAK_CAPS},
-        {"id 0xb4 (type 0), as SceRemotePlay does, floats 0, caps 0x2bb0", 0xb4u, 2, 0, 1, 0, TWEAK_FLOATS | TWEAK_CAPS},
-        {"id 12, as SceRemotePlay does, scan on, floats 0, caps 0x2bb0", FEATURE, 2, 1, 1, 0, TWEAK_FLOATS | TWEAK_CAPS},
+        {"id 12, with the floats SceRemotePlay's builder leaves (1.0)", FEATURE, 2, 0, 0, 0, TWEAK_MASK},
+        {"id 0xb4 (type 0), as SceRemotePlay does", 0xb4u, 2, 0, 1, 0, 0},
     };
     int scan_on = 0, left_type = -1; // left_type: the type to leave when SceRemotePlay's way took the last id
     size_t biggest = 0; // the largest picture of any test so far
     for (unsigned t = 0; t < sizeof tests / sizeof *tests && result == 0; t++) {
         const struct lab_test *test = &tests[t];
-        if (t >= 2 && biggest > LAB_REAL_PICTURE) { // the plain and the SceRemotePlay way were both seen; a setting that works: the others are not worth the risk of more registrations
+        if (t >= 2 && biggest > LAB_REAL_PICTURE) { // this helper's block gave real pictures: SceRemotePlay's way of taking an id is not needed
             log_line("lab: pictures of %zu bytes: the remaining settings are not tried", biggest);
             break;
         }
