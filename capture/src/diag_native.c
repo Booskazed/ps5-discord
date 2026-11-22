@@ -212,12 +212,13 @@ void diag_native_dump(sl_inject *ctx, const char *dir, diag_log_fn log)
     log("diag: images done in %llu ms", (unsigned long long)(now() - t0));
 }
 
-// The window of the target's address space where its heap lives (a 1 MiB allocation of SceRemotePlay came
-// from 0x8808...); direct memory and the device mappings are left alone.
-#define SCAN_LO 0x800000000ull
-#define SCAN_HI 0xa00000000ull
-#define SCAN_STEP (2u << 20)
-#define SCAN_BUDGET_MS 2500u
+// The windows of the target's address space where its heap lives (a 1 MiB allocation of SceRemotePlay came
+// from 0x8808..., so that one is read first); direct memory and the device mappings are left alone. One read is
+// at most 1 MiB, what the broker between the worker and the supervisor carries.
+static const struct { uint64_t lo, hi; } scan_windows[] = {
+    {0x880000000ull, 0x8c0000000ull}, {0x800000000ull, 0x880000000ull}, {0x8c0000000ull, 0xa00000000ull}};
+#define SCAN_STEP (1u << 20)
+#define SCAN_BUDGET_MS 4000u
 #define SCAN_FOUND_MAX 8u
 
 static int prot_is_rw(int prot)
@@ -233,38 +234,44 @@ size_t diag_native_find_blocks(sl_inject *ctx, diag_log_fn log, diag_block_fn fo
     struct diag_block *b = calloc(1, sizeof *b);
     if (!chunk || !b) { free(chunk); free(b); return 0; }
     size_t nfound = 0, steps = 0, bytes = 0, unreadable = 0;
-    uint64_t at = SCAN_LO;
-    for (; at < SCAN_HI; at += SCAN_STEP) {
-        if (now() - t0 > SCAN_BUDGET_MS) { log("diag: scan: time budget spent at 0x%llx", (unsigned long long)at); break; }
-        if (!prot_is_rw(kernel_get_vmem_protection(pid, (intptr_t)at, PAGE))) continue;
-        steps++;
-        size_t got = SCAN_STEP;
-        if (sl_inject_read_at(ctx, (intptr_t)at, chunk, SCAN_STEP) != 0) { // part of the 2 MiB is not mapped: page by page
-            got = 0;
-            for (size_t off = 0; off < SCAN_STEP; off += PAGE) {
-                if (sl_inject_read_at(ctx, (intptr_t)(at + off), chunk + off, PAGE) == 0) got += PAGE;
-                else { memset(chunk + off, 0, PAGE); unreadable++; }
+    int out_of_time = 0;
+    for (size_t w = 0; w < sizeof scan_windows / sizeof *scan_windows && !out_of_time; w++) {
+        for (uint64_t at = scan_windows[w].lo; at < scan_windows[w].hi; at += SCAN_STEP) {
+            if (now() - t0 > SCAN_BUDGET_MS) {
+                log("diag: scan: time budget spent at 0x%llx", (unsigned long long)at);
+                out_of_time = 1;
+                break;
+            }
+            if (!prot_is_rw(kernel_get_vmem_protection(pid, (intptr_t)at, PAGE))) continue;
+            steps++;
+            size_t got = SCAN_STEP;
+            if (sl_inject_read_at(ctx, (intptr_t)at, chunk, SCAN_STEP) != 0) { // part of the 1 MiB is not mapped: page by page
+                got = 0;
+                for (size_t off = 0; off < SCAN_STEP; off += PAGE) {
+                    if (sl_inject_read_at(ctx, (intptr_t)(at + off), chunk + off, PAGE) == 0) got += PAGE;
+                    else { memset(chunk + off, 0, PAGE); unreadable++; }
+                }
+            }
+            bytes += got;
+            for (size_t i = 0; i + 0x20 <= SCAN_STEP; i += 8) {
+                uint64_t q0, q1;
+                uint32_t variant;
+                memcpy(&q0, chunk + i, 8);
+                if (q0 != 0x2e8) continue;
+                memcpy(&q1, chunk + i + 8, 8);
+                memcpy(&variant, chunk + i + 0x14, 4);
+                if (q1 != 0x28 || (variant != 2 && variant != 6)) continue;
+                if (nfound++ >= SCAN_FOUND_MAX) continue;
+                memset(b, 0, sizeof *b);
+                b->addr = at + i;
+                b->have_block = sl_inject_read_at(ctx, (intptr_t)(b->addr - 8), b->block, sizeof b->block) == 0;
+                b->have_before = sl_inject_read_at(ctx, (intptr_t)(b->addr - 0x240), b->before, sizeof b->before) == 0;
+                b->have_after = sl_inject_read_at(ctx, (intptr_t)(b->addr + 0x2003a0), b->after, sizeof b->after) == 0;
+                found(user, b);
             }
         }
-        bytes += got;
-        for (size_t i = 0; i + 0x20 <= SCAN_STEP; i += 8) {
-            uint64_t q0, q1;
-            uint32_t variant;
-            memcpy(&q0, chunk + i, 8);
-            if (q0 != 0x2e8) continue;
-            memcpy(&q1, chunk + i + 8, 8);
-            memcpy(&variant, chunk + i + 0x14, 4);
-            if (q1 != 0x28 || (variant != 2 && variant != 6)) continue;
-            if (nfound++ >= SCAN_FOUND_MAX) continue;
-            memset(b, 0, sizeof *b);
-            b->addr = at + i;
-            b->have_block = sl_inject_read_at(ctx, (intptr_t)(b->addr - 8), b->block, sizeof b->block) == 0;
-            b->have_before = sl_inject_read_at(ctx, (intptr_t)(b->addr - 0x240), b->before, sizeof b->before) == 0;
-            b->have_after = sl_inject_read_at(ctx, (intptr_t)(b->addr + 0x2003a0), b->after, sizeof b->after) == 0;
-            found(user, b);
-        }
     }
-    log("diag: scan: %zu mapped writable steps of 2 MiB looked at (%zu bytes read, %zu pages unreadable), %zu blocks, %llu ms",
+    log("diag: scan: %zu mapped writable steps of 1 MiB looked at (%zu bytes read, %zu pages unreadable), %zu blocks, %llu ms",
         steps, bytes, unreadable, nfound, (unsigned long long)(now() - t0));
     free(chunk);
     free(b);

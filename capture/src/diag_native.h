@@ -36,7 +36,7 @@ struct diag_block {
 typedef void (*diag_block_fn)(void *user, const struct diag_block *b);
 
 // Looks for live copies of the parameter block SceRemotePlay's own session keeps while it streams: in the
-// target's writable memory (the heap window, 2 MiB at a time, about 2.5 s at most), wherever the qword 0x2e8 is
+// target's writable memory (the heap windows, 1 MiB at a time, about 4 s at most), wherever the qword 0x2e8 is
 // followed by the qword 0x28 and the encoder variant (2 or 6) sits where the block puts it. Calls `found` for
 // each (at most 8), and returns how many there were. Read-only: the target stays stopped and untouched; only
 // its memory is read. Console only.
