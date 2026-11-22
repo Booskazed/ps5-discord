@@ -1415,7 +1415,8 @@ static int lab_scan_run(void)
 }
 #endif
 
-// The worker: connect, wait for the core's start, run the session, recover at most once.static int helper_run(void)
+// The worker: connect, wait for the core's start, run the session, recover at most once.
+static int helper_run(void)
 {
 #ifdef SL_PS5
     if (file_exists(CAP_DIR "/lab")) {
