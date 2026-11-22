@@ -120,6 +120,9 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   the block's encoder variant) and logs each answer and the size of the pictures it gets (`lab:` lines).
   It also has SceRemotePlay's own code (its Glint constructor and block builder, by their offsets in its image) build
   the block on a new object in its heap, and logs every word where this helper's block differs.
+  A second marker, `lab-scan`, makes it read (only) SceRemotePlay's heap while a Go Live of the Remote Play (legacy)
+  method is running, find the parameter block of that live session and log it, the session's fields and the encoder's
+  status against the block this helper builds for the same profile.
   Lab mode on the console showed 13.60's block built by SceRemotePlay's own code differs from this helper's in one word
   of 188 (offset `0xdc`: `0x23`, not the `0xffbf5f14` its read-only data suggested); with its block the encoder opens,
   **Start is accepted**, and the picture headers and H.264 pictures come out. The helper's block now has `0x23`.
