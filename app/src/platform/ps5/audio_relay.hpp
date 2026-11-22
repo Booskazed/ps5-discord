@@ -8,6 +8,7 @@
 
 #include "platform/ps5/system.hpp"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -60,26 +62,48 @@ class AudioRelayServer
         return true;
     }
 
-    // Called every link_run() iteration: non-blocking accept of at most one
-    // waiting connection, replacing any existing client.
+    // Called every link_run() iteration. O_NONBLOCK/SO_RCVTIMEO do not
+    // reliably take effect on this console (see voice_audio.cpp's own note
+    // by its MSG_DONTWAIT sends): a plain accept()/recv() here hung this
+    // thread forever the moment it ran, taking all voice audio down with it
+    // (measured 2026-11-22). poll() with an explicit timeout on every read
+    // is the only part of this file's socket code the console is known to
+    // honour, so every step below goes through it instead.
     void poll_accept()
     {
         if (listen_fd_ < 0)
             return;
+        pollfd lp{listen_fd_, POLLIN, 0};
+        if (poll(&lp, 1, 0) <= 0 || !(lp.revents & POLLIN))
+            return;
         const int fd = accept(listen_fd_, nullptr, nullptr);
         if (fd < 0)
             return;
-        const int flags = fcntl(fd, F_GETFL, 0);
-        timeval tv{2, 0};
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        // Handshake: a few ms total, bounded by polling, never a blocking read.
         std::uint64_t got = 0;
-        const ssize_t n = recv(fd, &got, sizeof got, MSG_WAITALL);
-        if (n != static_cast<ssize_t>(sizeof got) || got != token_)
+        auto *at = reinterpret_cast<std::uint8_t *>(&got);
+        std::size_t have = 0;
+        bool ok = false;
+        for (int tries = 0; tries < 40; ++tries)
+        {
+            pollfd hp{fd, POLLIN, 0};
+            if (poll(&hp, 1, 5) <= 0 || !(hp.revents & POLLIN))
+                continue;
+            const ssize_t n = recv(fd, at + have, sizeof got - have, MSG_DONTWAIT);
+            if (n <= 0)
+                break;
+            have += static_cast<std::size_t>(n);
+            if (have == sizeof got)
+            {
+                ok = true;
+                break;
+            }
+        }
+        if (!ok || got != token_)
         {
             close(fd);
             return;
         }
-        fcntl(fd, F_SETFL, flags | O_NONBLOCK);
         const int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         if (client_fd_ >= 0)
