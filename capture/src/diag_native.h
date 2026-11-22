@@ -22,3 +22,22 @@ void diag_native_dump(sl_inject *ctx, const char *dir, diag_log_fn log);
 
 // The load address of the target's main module (0 when unknown). Console only.
 intptr_t diag_native_main_base(sl_inject *ctx);
+
+// A live copy of the encoder parameter block in the target's memory, with what surrounds it (see
+// diag_native_find_blocks). Offsets follow helper.c: the block starts with the 8-byte output slot, and the
+// qword 0x2e8 is at offset 8.
+struct diag_block {
+    uint64_t addr;           // where the qword 0x2e8 is (offset 8 of the block)
+    uint8_t block[0x2f0];    // the block: addr - 8 up to addr + 0x2e8
+    uint8_t before[0x238];   // the 0x238 bytes before the block (the Glint object's head; the session's fields)
+    uint8_t after[0x80];     // the 0x80 bytes at addr + 0x2003a0 (the Glint object's tail; the session's)
+    int have_block, have_before, have_after;
+};
+typedef void (*diag_block_fn)(void *user, const struct diag_block *b);
+
+// Looks for live copies of the parameter block SceRemotePlay's own session keeps while it streams: in the
+// target's writable memory (the heap window, 2 MiB at a time, about 2.5 s at most), wherever the qword 0x2e8 is
+// followed by the qword 0x28 and the encoder variant (2 or 6) sits where the block puts it. Calls `found` for
+// each (at most 8), and returns how many there were. Read-only: the target stays stopped and untouched; only
+// its memory is read. Console only.
+size_t diag_native_find_blocks(sl_inject *ctx, diag_log_fn log, diag_block_fn found, void *user);

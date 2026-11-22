@@ -1342,15 +1342,89 @@ end:
     log_line("lab: done (%s)", result == 0 ? "all tests ran" : "stopped early");
     return result == 0 ? 0 : 1;
 }
+// Lab scan mode (the file CAP_DIR "/lab-scan", else like lab mode): while SceRemotePlay streams a Go Live of its
+// own (the Remote Play (legacy) method of the stock or the community app), finds the encoder parameter block
+// its session keeps in memory and logs it against the block this helper builds for the same profile, with the
+// encoder's status and the session's fields: what a working session sets that this helper does not. It opens
+// nothing and only reads (the target is stopped for about three seconds at most).
+static uint32_t get32(const uint8_t *p, size_t at)
+{
+    uint32_t n;
+    memcpy(&n, p + at, 4);
+    return n;
+}
+
+static void lab_dump(const char *what, const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; i += 32) {
+        char line[32 * 2 + 1];
+        const size_t m = n - i < 32 ? n - i : 32;
+        for (size_t j = 0; j < m; j++) snprintf(line + j * 2, 3, "%02x", p[i + j]);
+        log_line("lab:   %s +0x%03zx: %s", what, i, line);
+    }
+}
+
+static void lab_scan_found(void *user, const struct diag_block *b)
+{
+    int *count = user;
+    ++*count;
+    log_line("lab: block %d: the qword 0x2e8 is at 0x%llx; the session object would start at 0x%llx", *count,
+             (unsigned long long)b->addr, (unsigned long long)(b->addr - 0x238));
+    if (!b->have_block) { log_line("lab: block %d could not be read", *count); return; }
+    if (*count <= 2) lab_dump("block", b->block, sizeof b->block);
+    if (b->have_after) {
+        log_line("lab: Configure's arguments in the object: variant %u, id 0x%x, flag %u; session fields +0x2005f8 %u, +0x200600 %u",
+                 get32(b->after, 8), get32(b->after, 0xc), b->after[0x10], get32(b->after, 0x20), get32(b->after, 0x28));
+    }
+    if (b->have_before) {
+        // before[0] is the byte at session - 8: session field +X is before[X + 8]
+        log_line("lab: session fields: +0x30 %u, +0x34 %u, +0x3c %u, +0x40 %u, +0x1c0 %u, +0x1cc %u, +0x1ec %u", get32(b->before, 0x38),
+                 get32(b->before, 0x3c), get32(b->before, 0x44), get32(b->before, 0x48), get32(b->before, 0x1c8),
+                 get32(b->before, 0x1d4), get32(b->before, 0x1f4));
+        if (*count <= 2) lab_dump("session head", b->before, sizeof b->before);
+    }
+    // The block this helper would build for the same profile, and every word where the two differ.
+    const uint32_t selector = get32(b->block, 0x20), fps_flag = get32(b->block, 0x24);
+    struct start_req req = {.selector = selector, .fps_flag = fps_flag, .bitrate = get32(b->block, 0xd4),
+                            .width = selector == 4 ? 1920 : 1280, .height = selector == 4 ? 1080 : 720, .fps = fps_flag ? 60 : 30};
+    struct buffers bufs;
+    memcpy(bufs.out1, b->block + 0x1b8, sizeof bufs.out1);
+    memcpy(bufs.out2, b->block + 0x1d8, sizeof bufs.out2);
+    uint8_t ours[0x2f0];
+    video_params_1360(ours, get32(b->block, 0x2b0), &req, get32(b->block, 0x30), get32(b->block, 0x1c), &bufs);
+    unsigned differing = 0;
+    for (size_t i = 0; i < sizeof ours; i += 4) {
+        if (get32(ours, i) == get32(b->block, i)) continue;
+        if (differing++ < 80) log_line("lab: block %d word 0x%zx: this helper's 0x%x, the session's 0x%x", *count, i, get32(ours, i), get32(b->block, i));
+    }
+    log_line("lab: block %d (selector %u, %u fps, %u bit/s): %u of %zu words differ from this helper's", *count, selector, req.fps,
+             req.bitrate, differing, sizeof ours / 4);
+}
+
+static int lab_scan_run(void)
+{
+    struct capture c = {.startup_deadline = now_ms() + 600000u, .feature = FEATURE, .variant = 2};
+    int found = 0;
+    log_line("lab: scan: looking for the encoder parameter block of a running Remote Play session");
+    if (sl_inject_begin("SceRemotePlay", &c.ctx)) { log_line("lab: attach failed: stage=%s", c.ctx.stage); return 1; }
+    if (c.ctx.scratch > 0 && c.ctx.scratch_len >= 0x4000) probe_status(&c, c.ctx.scratch);
+    (void)diag_native_find_blocks(&c.ctx, log_line, lab_scan_found, &found);
+    cleanup(&c);
+    log_line("lab: scan done (%d blocks)", found);
+    return 0;
+}
 #endif
 
-// The worker: connect, wait for the core's start, run the session, recover at most once.
-static int helper_run(void)
+// The worker: connect, wait for the core's start, run the session, recover at most once.static int helper_run(void)
 {
 #ifdef SL_PS5
     if (file_exists(CAP_DIR "/lab")) {
         (void)unlink(CAP_DIR "/lab");
         return lab_run();
+    }
+    if (file_exists(CAP_DIR "/lab-scan")) {
+        (void)unlink(CAP_DIR "/lab-scan");
+        return lab_scan_run();
     }
 #endif
     if (net_connect()) return 1;
