@@ -910,14 +910,16 @@ State run_audio_relay(){
     std::uint8_t pending[4096];std::size_t pending_len=0;
     alignas(64) std::int16_t grain[256*2];
     int writes=0,errors=0;std::uint64_t recv_bytes=0;
-    const std::uint64_t until=now_ms()+570000; // under the loader's deadline
+    const std::uint64_t began=now_ms();
+    const std::uint64_t until=began+570000; // under the loader's deadline
     bool link_closed=false;
+    const char* reason="loop condition false (stop_bin or timeout)";
     while(!link_closed&&now_ms()<until){
-        std::uint64_t stop=0;if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+        std::uint64_t stop=0;if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token){reason="stop.bin";break;}
         std::uint8_t buf[4096];
         const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
         if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
-            note("AUDIORELAY connection closed rc=%zd errno=%d",got,errno);link_closed=true;break;}
+            note("AUDIORELAY connection closed rc=%zd errno=%d",got,errno);link_closed=true;reason="recv closed/error";break;}
         if(got>0){
             recv_bytes+=std::uint64_t(got);
             std::size_t at=0;
@@ -940,7 +942,8 @@ State run_audio_relay(){
         }
     }
     output(handle,nullptr);close_out(handle);close(fd);
-    note("AUDIORELAY done writes=%d errors=%d recv_bytes=%llu",writes,errors,static_cast<unsigned long long>(recv_bytes));
+    note("AUDIORELAY done writes=%d errors=%d recv_bytes=%llu elapsed_ms=%llu reason=%s",writes,errors,
+         static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(now_ms()-began),reason);
     const State result=writes>0?State::Passed:State::Failed;
     publish(result);return result;
 }
