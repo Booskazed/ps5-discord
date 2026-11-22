@@ -211,6 +211,10 @@ jobs:
           set -o pipefail
           make test 2>&1 | tee out/test.log
       - name: App package (cd app && make deps && RELEASE=1 make)
+        env:
+          # lab/audio-out-probe only, never on community: bakes in the debug
+          # audio-out probe (app/src/platform/ps5/audio_out_probe.cpp).
+          APP_DEFINITIONS: HUI_AUDIO_PROBE
         run: |
           set -o pipefail
           cd app
