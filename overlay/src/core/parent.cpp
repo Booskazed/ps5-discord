@@ -79,8 +79,13 @@ static int run(){
     note("RESTART done; expect home screen to reload");
     return 0;
 #endif
+    // AudioTest/AudioRelay never touch Mono or install a hook (no
+    // prepare_update_hook call at all): unlike every other mode, retrying
+    // one on the same ShellUI instance carries none of the risk this
+    // one-attempt marker exists to bound, so they are exempt from it.
+    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay;
     Attempt prior;
-    if(read_file(parent_dir,"attempt.bin",prior)&&prior.signature==magic&&prior.pid==r.pid&&prior.epoch==r.epoch){
+    if(one_shot_only&&read_file(parent_dir,"attempt.bin",prior)&&prior.signature==magic&&prior.pid==r.pid&&prior.epoch==r.epoch){
         note("REFUSED: one attempt already recorded for this ShellUI instance; inspect evidence, do not delete marker to retry");return 1;}
     std::uint32_t mono=0,kernel=0;
     if(kernel_dynlib_handle(r.pid,"libmonosgen-2.0.sprx",&mono)||!mono){
@@ -130,8 +135,9 @@ static int run(){
     // stays up (minutes); everything else is a short, bounded one-shot.
     r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?600000:75000);
     if(!write_file(parent_dir,"request.bin",r)){note("request write failed");return 1;}
-    Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;
-    if(!write_file(parent_dir,"attempt.bin",a))return 1;
+    if(one_shot_only){
+        Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;
+        if(!write_file(parent_dir,"attempt.bin",a))return 1;}
     auto result=common_fps::ps5::inject_shellui_stable(r.pid,overlay_worker_blob,overlay_worker_blob_size);
     note("LOADER target=%d epoch=%llu mapped=%u thread=%u detached=%u auth_restored=%u unresolved=%u first=%s",r.pid,
         (unsigned long long)r.epoch,result.elf_loaded,result.pthread_create_ok,result.detached,result.auth_restored,result.imports_unresolved,
