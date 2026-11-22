@@ -913,9 +913,17 @@ State run_audio_relay(){
     const std::uint64_t began=now_ms();
     const std::uint64_t until=began+570000; // under the loader's deadline
     bool link_closed=false;
-    const char* reason="loop condition false (stop_bin or timeout)";
+    const char* reason="until elapsed";
+    // Not stop.bin: measured 2026-11-22 that the external loader process
+    // (outside ShellUI, forked by parent.cpp's main()) reliably dies within
+    // ~150 ms of starting, for every mode, AudioTest included -- it just
+    // never mattered before, because run_audio_test()'s loop never checks
+    // stop.bin at all and keeps going regardless, independently, inside
+    // ShellUI. This loop used to check it too, and that is what was cutting
+    // every relay off almost immediately, long before the app's own side
+    // even finished dialing in. Left unsolved: why the loader dies that
+    // fast; nothing here or in parent.cpp sends it a signal that early.
     while(!link_closed&&now_ms()<until){
-        std::uint64_t stop=0;if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token){reason="stop.bin";break;}
         std::uint8_t buf[4096];
         const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
         if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
