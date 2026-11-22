@@ -141,6 +141,11 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   as SceRemotePlay does, before it clears its callback: until now the resource arbitrator kept the helper's id
   `RUNNING` (with a video codec budget and a scan-in slot) until the console restarted, which could starve a Remote
   Play session or the system's own capture started afterwards.
+- Capture helper picture dump (console and tests): with the file `dump-video` in the data folder when a Go Live starts
+  (removed at once, so it affects that Go Live only), the helper asks the encoder for a key frame every 2 s, up to 60
+  times, and keeps each one with the picture headers in `video-dump.h264`. Every picture decodes by itself, so the file
+  can be turned into images off the console to check what a viewer sees without needing a viewer (the core sends
+  nothing while `0 watching`). The core gets the same stream as without the dump, plus the extra key frames.
 ## [0.6.0-alpha.2] - 2026-10-31
 
 ### Fixed

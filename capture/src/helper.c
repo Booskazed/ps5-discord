@@ -820,7 +820,6 @@ static void cleanup(struct capture *c)
 
 static void why(const char *text) { if (!segment.why[0]) snprintf(segment.why, sizeof segment.why, "%s", text); }
 
-#ifdef SL_PS5
 // Whether a path exists. Not access(): it checks the real user's rights, and the data folder is root's (0700), so
 // it fails for this process where open() and stat() (the effective user's) succeed.
 static int file_exists(const char *path)
@@ -828,7 +827,60 @@ static int file_exists(const char *path)
     struct stat st;
     return stat(path, &st) == 0;
 }
-#endif
+
+// Picture dump (a diagnostic, for the console and the tests): with the file CAP_DIR "/dump-video" present when the
+// core's start arrives (it is removed at once, so only that one Go Live is affected), every DUMP_EVERY_MS the helper
+// asks the encoder for a key frame and keeps it, with the picture headers, in CAP_DIR "/video-dump.h264" (at most
+// DUMP_MAX pictures). Each one decodes by itself, so the file can be turned into pictures off the console to see
+// what a viewer would see, with no viewer. The core gets the same stream as without the dump plus the extra key frames.
+#define DUMP_PATH CAP_DIR "/video-dump.h264"
+#define DUMP_MARKER CAP_DIR "/dump-video"
+#define DUMP_EVERY_MS 2000u
+#define DUMP_MAX 60u
+static FILE *dump_file;
+static unsigned dump_count;
+static uint64_t dump_next_ms;
+static int dump_want; // a key frame has been asked for and its picture is not kept yet
+
+static void dump_open(void)
+{
+    dump_file = NULL; dump_count = 0; dump_next_ms = 0; dump_want = 0;
+    if (!file_exists(DUMP_MARKER)) return;
+    (void)unlink(DUMP_MARKER);
+    dump_file = fopen(DUMP_PATH, "wb");
+    if (dump_file) log_line("dump: a key frame every %u ms goes to %s (at most %u)", DUMP_EVERY_MS, DUMP_PATH, DUMP_MAX);
+    else log_line("dump: %s could not be opened", DUMP_PATH);
+}
+
+// Before each read: when it is time, ask for a key frame (the loop passes the request on to the encoder).
+static void dump_poll(uint64_t now)
+{
+    if (!dump_file || dump_want || dump_count >= DUMP_MAX || now < dump_next_ms) return;
+    dump_want = 1;
+    key_requested = 1;
+}
+
+// After each picture is sent: keep the first key frame that follows a request.
+static void dump_keep(const uint8_t *headers, size_t headers_len, const uint8_t *au, size_t au_len, int idr, uint64_t now)
+{
+    if (!dump_file || !dump_want || !idr) return;
+    dump_want = 0;
+    dump_next_ms = now + DUMP_EVERY_MS;
+    if (fwrite(headers, 1, headers_len, dump_file) != headers_len || fwrite(au, 1, au_len, dump_file) != au_len ||
+        fflush(dump_file)) {
+        log_line("dump: write failed, stopping the dump");
+        fclose(dump_file); dump_file = NULL;
+        return;
+    }
+    dump_count++;
+    log_line("dump: picture %u kept (%zu bytes)", dump_count, au_len);
+}
+
+static void dump_close(void)
+{
+    if (dump_file) fclose(dump_file);
+    dump_file = NULL; dump_want = 0;
+}
 
 enum session_end { SESS_STOPPED, SESS_RECOVERABLE, SESS_FAILED };
 
@@ -988,6 +1040,7 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
                 }
             }
         }
+        dump_poll(now_ms());
         if (key_requested) {
             key_requested = 0;
             if (!good(REMOTE(&c, KEYFRAME, c.video))) goto done;
@@ -1041,6 +1094,7 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
         if (au_len > window_max) window_max = au_len;
         if (idr && au_len > window_idr) window_idr = au_len;
         last_picture = got;
+        dump_keep(annexb, annexb_len, au, au_len, idr, got);
         segment.frames++;
         segment.last_video_ms = got - segment.begin_ms;
         if (segment.frames <= 3 || segment.frames % (req->fps * 10) == 0) {
@@ -1480,6 +1534,7 @@ static int helper_run(void)
         return 1;
     }
     log_line("start: %ux%u@%u bitrate=%u", req.width, req.height, req.fps, req.bitrate);
+    dump_open();
     if (ALLOW_MODE_40)
         log_line("test build: the 120 Hz output mode (0x40) is allowed");
     net_state(CAP_STARTING, "");
@@ -1505,6 +1560,7 @@ static int helper_run(void)
         net_state(CAP_ERROR, segment.why[0] ? segment.why : "Capture failed.");
         break;
     }
+    dump_close();
     net_close();
     log_line("helper done rc=%d", rc);
     return rc;

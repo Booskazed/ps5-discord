@@ -429,6 +429,7 @@ int main(void)
         scenario = OK; profile = profiles[p];
         reset_fake();
         struct seen s; int rc;
+        if (p == 0) { FILE *marker = fopen("dump-video", "w"); assert(marker); fclose(marker); } // the picture dump, once
         run_helper(&profile, &s, &rc, 1, 1);
         assert(s.hello && rc == 0);
         assert(s.profiles == 1 && s.profile_w == profile.width && s.profile_h == profile.height &&
@@ -446,6 +447,23 @@ int main(void)
         assert(vstop == 1 && vclose == 1 && freed == 1 && calls[CLEAR_CALLBACK] == 1 && calls[TERMINATE] == 1);
         assert(attachments == 1 && detached == 1);
         for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
+        {   // The picture dump: only the run that found the marker keeps pictures, each one the headers then a key frame.
+            struct stat st;
+            assert(stat("dump-video", &st) != 0); // used up by that run
+            FILE *d = fopen("video-dump.h264", "rb");
+            if (p != 0) assert(!d);
+            else {
+                assert(d);
+                uint8_t kept[512];
+                const size_t n = fread(kept, 1, sizeof kept, d);
+                const size_t one = expected_len + 6;
+                assert(n >= one && n % one == 0);
+                for (size_t k = 0; k < n; k += one)
+                    assert(!memcmp(kept + k, expected, expected_len) && !memcmp(kept + k + expected_len, "\0\0\0\1\x65\x80", 6));
+                fclose(d);
+                assert(unlink("video-dump.h264") == 0);
+            }
+        }
         cases++;
     }
 
