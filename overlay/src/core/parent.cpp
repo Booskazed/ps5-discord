@@ -22,8 +22,8 @@
 #ifndef OVERLAY_MODE
 #define OVERLAY_MODE 0
 #endif
-#if OVERLAY_MODE<0||OVERLAY_MODE>5
-#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service"
+#if OVERLAY_MODE<0||OVERLAY_MODE>6
+#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest"
 #endif
 extern "C" {extern const unsigned char overlay_worker_blob[];extern const unsigned int overlay_worker_blob_size;
 volatile sig_atomic_t overlay_abort_requested=0;
@@ -31,7 +31,7 @@ int sceKernelGetAppInfo(pid_t,void*);}
 using namespace overlay;
 // elfldr deploys every payload as payload.elf, so each mode keeps its own USB
 // xlog to keep runs attributable (workspace payload discipline).
-static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service"};
+static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest"};
 static FILE* logfile=nullptr,*usblog=nullptr;
 static void note(const char* fmt,...){
     char line[512];va_list ap;va_start(ap,fmt);std::vsnprintf(line,sizeof line,fmt,ap);va_end(ap);
@@ -86,10 +86,15 @@ static int run(){
     if(kernel_dynlib_handle(r.pid,"libmonosgen-2.0.sprx",&mono)||!mono){
         if(kernel_dynlib_handle(r.pid,"libmonosgen-2.0.0.sprx",&mono)||!mono){note("REFUSED Mono module missing");return 1;}}
     if(kernel_dynlib_handle(r.pid,"libkernel_sys.sprx",&kernel)||!kernel){note("REFUSED kernel module missing");return 1;}
-    std::uint32_t web=0,libc=0,system=0;
+    std::uint32_t web=0,libc=0,system=0,audioout=0;
     (void)kernel_dynlib_handle(r.pid,"libkernel_web.sprx",&web);
     (void)kernel_dynlib_handle(r.pid,"libSceSystemService.sprx",&system);
     (void)kernel_dynlib_handle(r.pid,"libSceLibcInternal.sprx",&libc);
+    // Required only for Mode::AudioTest, but resolved for every mode (cheap,
+    // and ShellUI always has its own system-sound output loaded) so the
+    // generic loop below need not special-case it by mode.
+    if(kernel_dynlib_handle(r.pid,"libSceAudioOut.sprx",&audioout)||!audioout){
+        note("REFUSED libSceAudioOut module missing");return 1;}
     for(unsigned i=0;i<FunctionCount;i++){
         std::uint64_t address_value=0;
         if(optional(i)){
@@ -98,7 +103,10 @@ static int run(){
             if(!address(address_value)){note("optional %s missing: the overlay cannot hold the game",symbols[i]);address_value=0;}
             r.functions[i]=address_value;continue;
         }
-        if(i==TargetMmap||i==TargetMunmap){
+        if(i==AudioOutInit||i==AudioOutOpen||i==AudioOutOutput||i==AudioOutClose){
+            address_value=kernel_dynlib_dlsym(r.pid,audioout,symbols[i]);
+            if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,audioout,nid);}
+        } else if(i==TargetMmap||i==TargetMunmap){
             // Plain mmap/munmap live in whichever BSD-ish module ShellUI loaded.
             const std::uint32_t candidates[3]={web,libc,kernel};
             for(std::uint32_t handle:candidates){

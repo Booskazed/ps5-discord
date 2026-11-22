@@ -19,6 +19,10 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // Reflection, log-only (worker describe_types): what a property's value type is on this firmware.
     SignatureParams,TypeName,ClassFromType,ClassFields,FieldName,FieldType,FieldOffset,ClassProperties,PropertyName,
     ClassMethods,MethodName, // picking an overload by its parameter types
+    // Mode::AudioTest only (lab, libSceAudioOut): does a sound played from
+    // inside SceShellUI itself survive the console's audio/video ownership
+    // switch while a game has focus, unlike the app's own AudioOut?
+    AudioOutInit,AudioOutOpen,AudioOutOutput,AudioOutClose,
     // Optional (0 when ShellUI lacks them; libSceSystemService): the system menu's own way of
     // holding a game while it is over it: the game's app id, the "system UI is over you"
     // status (games that can pause, pause), and controller focus (Request::shell_app).
@@ -35,11 +39,14 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "mono_signature_get_params","mono_type_get_name","mono_class_from_mono_type","mono_class_get_fields",
     "mono_field_get_name","mono_field_get_type","mono_field_get_offset","mono_class_get_properties","mono_property_get_name",
     "mono_class_get_methods","mono_method_get_name",
+    "sceAudioOutInit","sceAudioOutOpen","sceAudioOutOutput","sceAudioOutClose",
     "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
-enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5};
-inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service;}
+// AudioTest is a lab mode (see AudioOutInit..AudioOutClose above): no Mono
+// resolution or hooking at all, just sceAudioOut calls from inside ShellUI.
+enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6};
+inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest;}
 inline bool draws(Mode m){return m==Mode::Widget||m==Mode::Service;}
 // Managed Sce.PlayStation.Core.Input.GamePadData layout (value type, 36 bytes).
 struct PadData {

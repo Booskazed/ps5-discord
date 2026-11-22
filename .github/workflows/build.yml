@@ -247,6 +247,9 @@ jobs:
           test -s "app/dist/$PACKAGE_ID.zip" || { echo "::error::app/dist/$PACKAGE_ID.zip is missing"; exit 1; }
           mkdir -p out/release
           cp "app/dist/$PACKAGE_ID.zip" build/ps5-discord.elf out/release/
+          # lab/audio-out-probe only, never on community: standalone lab tool,
+          # never packaged into the app, sent to elfldr by hand.
+          [[ -s overlay/build/overlay-audiotest.elf ]] && cp overlay/build/overlay-audiotest.elf out/release/
           (cd out/release && sha256sum "$PACKAGE_ID.zip" ps5-discord.elf > SHA256SUMS && cat SHA256SUMS)
       - name: Upload the package
         uses: actions/upload-artifact@v4

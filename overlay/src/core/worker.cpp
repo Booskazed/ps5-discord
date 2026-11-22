@@ -16,6 +16,10 @@ namespace {
 using Object=void;using Method=void;using Update=void(*)(Object*);
 using PadCall=PadData(*)(int);
 using ShareCall=void(*)(void*);
+using AudioOutInitCall=int(*)();
+using AudioOutOpenCall=int(*)(int,int,int,unsigned int,unsigned int,unsigned int);
+using AudioOutOutputCall=int(*)(int,const void*);
+using AudioOutCloseCall=int(*)(int);
 constexpr int kind_void=1,kind_class=0x12,kind_valuetype=0x11;
 constexpr std::uint32_t bit_l3=0x4000,bit_r3=0x8000;
 // Hold Options: the game takes the press first (most open their pause menu), then the
@@ -826,7 +830,45 @@ void publish(State state){
     s.double_presses=double_presses.load();s.last_buttons=last_buttons.load();
     (void)write_file(worker_dir,"status.bin",s);
 }
+// Mode::AudioTest only: no Mono, no hooking, nothing shared with the rest
+// of this file. Just sceAudioOut from inside SceShellUI's own process, to
+// see whether it plays on, or is muted the moment a game takes the
+// console's audio/video ownership the way the app's own AudioOut is
+// (measured 2026-11-22: the app's sound stops the instant AvControl hands
+// AudioOut/VideoOut to another pid, and comes back when it regains focus).
+State run_audio_test(){
+    publish(State::Observing);
+    const auto init=fn<AudioOutInitCall>(AudioOutInit);
+    const auto open=fn<AudioOutOpenCall>(AudioOutOpen);
+    const auto output=fn<AudioOutOutputCall>(AudioOutOutput);
+    const auto close=fn<AudioOutCloseCall>(AudioOutClose);
+    const int init_rc=init();
+    note("AUDIOTEST init rc=0x%08x",unsigned(init_rc));
+    if(init_rc!=0&&init_rc!=0x8026000e){publish(State::Failed);return State::Failed;}
+    const int handle=open(0xff,0,0,256,48000,1);
+    note("AUDIOTEST open rc=0x%08x",unsigned(handle));
+    if(handle<0){publish(State::Failed);return State::Failed;}
+    alignas(64) std::int16_t grain[256*2];
+    double phase=0.0;constexpr double freq=880.0,rate=48000.0;
+    int writes=0,errors=0;
+    const std::uint64_t until=now_ms()+60000;
+    while(now_ms()<until){
+        for(int i=0;i<256;i++){
+            const std::int16_t s=std::int16_t(std::sin(phase)*12000.0);
+            grain[i*2]=s;grain[i*2+1]=s;phase+=2.0*3.14159265358979*freq/rate;
+        }
+        const int rc=output(handle,grain);++writes;
+        if(rc<0){++errors;if(errors<=5||errors%100==0)note("AUDIOTEST write #%d rc=0x%08x",writes,unsigned(rc));}
+        if(writes%200==0){note("AUDIOTEST writes=%d errors=%d",writes,errors);publish(State::Observing);}
+        std::uint64_t stop=0;if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+    }
+    output(handle,nullptr);close(handle);
+    note("AUDIOTEST done writes=%d errors=%d",writes,errors);
+    const State result=errors==0&&writes>0?State::Passed:State::Failed;
+    publish(result);return result;
+}
 State run(){
+    if(request.mode==Mode::AudioTest)return run_audio_test();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
