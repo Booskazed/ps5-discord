@@ -844,7 +844,7 @@ State run_audio_test(){
     const auto close=fn<AudioOutCloseCall>(AudioOutClose);
     const int init_rc=init();
     note("AUDIOTEST init rc=0x%08x",unsigned(init_rc));
-    if(init_rc!=0&&init_rc!=0x8026000e){publish(State::Failed);return State::Failed;}
+    if(init_rc!=0&&init_rc!=static_cast<int>(0x8026000e)){publish(State::Failed);return State::Failed;}
     const int handle=open(0xff,0,0,256,48000,1);
     note("AUDIOTEST open rc=0x%08x",unsigned(handle));
     if(handle<0){publish(State::Failed);return State::Failed;}
