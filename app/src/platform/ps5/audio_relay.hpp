@@ -29,8 +29,16 @@ class AudioRelayServer
 {
   public:
     static constexpr std::uint16_t kPort = 9043;
-    static constexpr const char *kDir = "/data/ps5-discord-audio-relay";
-    static constexpr const char *kFile = "/data/ps5-discord-audio-relay/audio-relay.bin";
+    // In the order the worker tries them (platform/ps5/audio_relay.hpp's
+    // worker-side counterpart: overlay/src/core/worker.cpp's kCandidateFiles).
+    static constexpr const char *kCandidateDirs[] = {
+        "/data/ps5-discord-audio-relay",
+        "/user/data/ps5-discord-audio-relay",
+        "/data/ps5-discord-community",
+        "/user/data/ps5-discord-community",
+        "/data/discord-overlay-poc",
+        "/user/data/discord-overlay-poc",
+    };
 
     bool start()
     {
@@ -58,13 +66,26 @@ class AudioRelayServer
         // process could not create a file in it (silently: no audio-relay.bin
         // ever appeared, measured 2026-11-22). A directory this app creates
         // itself (as tools/audio-probe's app_mic_probe.cpp already does
-        // under /data/ps5-discord-probe) it owns, and can write into.
-        mkdir(kDir, 0777);
-        if (std::FILE *f = std::fopen(kFile, "wb"))
+        // under /data/ps5-discord-probe) it owns, and can write into -- but
+        // whether the worker, inside SceShellUI's own sandbox, can read
+        // anything under plain /data/... at all is unmeasured, so this
+        // writes every candidate path the worker will try, cheaply (a few
+        // bytes each), rather than guess which one crosses that boundary.
+        for (const char *dir : kCandidateDirs)
         {
-            std::fwrite(&kPort, sizeof kPort, 1, f);
-            std::fwrite(&token_, sizeof token_, 1, f);
-            std::fclose(f);
+            mkdir(dir, 0777);
+            char file[160];
+            std::snprintf(file, sizeof file, "%s/audio-relay.bin", dir);
+            if (std::FILE *f = std::fopen(file, "wb"))
+            {
+                std::fwrite(&kPort, sizeof kPort, 1, f);
+                std::fwrite(&token_, sizeof token_, 1, f);
+                std::fclose(f);
+            }
+            else
+            {
+                sys::log("[HUI] audio relay could not write %s errno=%d", file, errno);
+            }
         }
         sys::log("[HUI] audio relay listening port=%u", static_cast<unsigned>(kPort));
         return true;
