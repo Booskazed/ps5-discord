@@ -879,16 +879,14 @@ State run_audio_test(){
 // app closing it, or stop.bin, end it cleanly), bounded by a safety ceiling.
 State run_audio_relay(){
     publish(State::Observing);
-    // Measured 2026-11-22: this worker, inside SceShellUI's own sandbox,
-    // gets ENOENT for /data/... paths that genuinely exist there on the
-    // real filesystem (confirmed over FTP); /user/data/... -- already used
-    // successfully above for worker_dir -- is what actually works.
-    std::FILE* f=std::fopen("/user/data/ps5-discord-audio-relay/audio-relay.bin","rb");
-    if(!f){note("AUDIORELAY no audio-relay.bin; is the app running with a relay build?");publish(State::Failed);return State::Failed;}
-    std::uint16_t port=0;std::uint64_t token=0;
-    const bool got_header=std::fread(&port,sizeof port,1,f)==1&&std::fread(&token,sizeof token,1,f)==1;
-    std::fclose(f);
-    if(!got_header){note("AUDIORELAY audio-relay.bin unreadable");publish(State::Failed);return State::Failed;}
+    // Fixed and known to both ends at compile time (app/src/platform/ps5/
+    // audio_relay.hpp hardcodes the same value): no file handoff, which is
+    // what kept failing (measured 2026-11-22, several different ways,
+    // across both /data/... and /user/data/...: this worker's sandbox and
+    // the app's do not agree on a single path one can write and the other
+    // read). Loopback-only, single-user console: an unauthenticated local
+    // connection is an acceptable trade for not depending on that agreement.
+    constexpr std::uint16_t port=9043;
     const int fd=socket(AF_INET,SOCK_STREAM,0);
     note("AUDIORELAY socket fd=%d errno=%d",fd,errno);
     if(fd<0){publish(State::Failed);return State::Failed;}
@@ -896,8 +894,6 @@ State run_audio_relay(){
     const int connect_rc=connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a);
     note("AUDIORELAY connect port=%u rc=%d errno=%d",unsigned(port),connect_rc,errno);
     if(connect_rc!=0){close(fd);publish(State::Failed);return State::Failed;}
-    const ssize_t handshake_sent=send(fd,&token,sizeof token,0);
-    if(handshake_sent!=static_cast<ssize_t>(sizeof token)){note("AUDIORELAY handshake failed sent=%zd",handshake_sent);close(fd);publish(State::Failed);return State::Failed;}
     const int flags=fcntl(fd,F_GETFL,0);fcntl(fd,F_SETFL,flags|O_NONBLOCK);
 
     const auto init=fn<AudioOutInitCall>(AudioOutInit);

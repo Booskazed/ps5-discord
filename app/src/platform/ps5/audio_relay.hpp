@@ -9,10 +9,8 @@
 #include "platform/ps5/system.hpp"
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <thread>
 
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -20,7 +18,6 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 namespace hui::ps5
@@ -29,13 +26,14 @@ namespace hui::ps5
 class AudioRelayServer
 {
   public:
+    // Fixed and known to both ends at compile time (overlay/src/core/worker.cpp
+    // hardcodes the same value): no file handoff needed at all, which is what
+    // kept failing (measured 2026-11-22, several different ways, across both
+    // /data/... and /user/data/...: this app's own sandbox and SceShellUI's
+    // do not agree on a single path that one can write and the other read).
+    // Loopback-only and this console is single-user, so skipping a handshake
+    // is an acceptable trade for not depending on that filesystem agreement.
     static constexpr std::uint16_t kPort = 9043;
-    // Not /data/...: measured 2026-11-22 that the worker, inside SceShellUI's
-    // own sandbox, gets ENOENT for a file that genuinely exists there on the
-    // real filesystem (confirmed over FTP). /user/data/... is what its own
-    // worker_dir already uses successfully, and is what actually worked here.
-    static constexpr const char *kDir = "/user/data/ps5-discord-audio-relay";
-    static constexpr const char *kFile = "/user/data/ps5-discord-audio-relay/audio-relay.bin";
 
     bool start()
     {
@@ -55,49 +53,16 @@ class AudioRelayServer
             listen_fd_ = -1;
             return false;
         }
-        const int flags = fcntl(listen_fd_, F_GETFL, 0);
-        fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK);
-        token_ = (static_cast<std::uint64_t>(sys::monotonic_us()) << 1) ^ 0x4c414231ULL;
         sys::log("[HUI] audio relay listening port=%u", static_cast<unsigned>(kPort));
-        // Writing the handshake file this early (VoiceAudio::start() runs
-        // near the very top of main()) sometimes got ENOENT for a directory
-        // this same code had just created, inconsistently across launches
-        // (measured 2026-11-22: failed on one launch, had worked a launch
-        // or two earlier with no code change in between) -- a sandbox mount
-        // not fully up yet looks like the explanation, same reason
-        // tools/audio-probe's app_mic_probe.cpp waits 15 s before its own
-        // first /data write. Retried from a detached thread instead of
-        // blocking start() for that long.
-        const std::uint16_t port = kPort;
-        const std::uint64_t token = token_;
-        std::thread([port, token]
-                    {
-            for (int attempt = 0; attempt < 10; ++attempt)
-            {
-                mkdir(kDir, 0777);
-                if (std::FILE *f = std::fopen(kFile, "wb"))
-                {
-                    std::fwrite(&port, sizeof port, 1, f);
-                    std::fwrite(&token, sizeof token, 1, f);
-                    std::fclose(f);
-                    sys::log("[HUI] audio relay handshake file written (try %d)", attempt + 1);
-                    return;
-                }
-                sys::log("[HUI] audio relay could not write %s errno=%d (try %d)", kFile, errno, attempt + 1);
-                sys::sleep_us(500000);
-            }
-            sys::log("[HUI] audio relay giving up on %s", kFile); })
-            .detach();
         return true;
     }
 
-    // Called every link_run() iteration. O_NONBLOCK/SO_RCVTIMEO do not
-    // reliably take effect on this console (see voice_audio.cpp's own note
-    // by its MSG_DONTWAIT sends): a plain accept()/recv() here hung this
-    // thread forever the moment it ran, taking all voice audio down with it
-    // (measured 2026-11-22). poll() with an explicit timeout on every read
-    // is the only part of this file's socket code the console is known to
-    // honour, so every step below goes through it instead.
+    // Called every link_run() iteration. O_NONBLOCK does not reliably take
+    // effect on this console (see voice_audio.cpp's own note by its
+    // MSG_DONTWAIT sends): a plain accept() here hung this thread forever
+    // the moment it ran, taking all voice audio down with it (measured
+    // 2026-11-22). poll() with an explicit timeout first is the part of
+    // this file's socket code the console is known to honour.
     void poll_accept()
     {
         if (listen_fd_ < 0)
@@ -108,31 +73,6 @@ class AudioRelayServer
         const int fd = accept(listen_fd_, nullptr, nullptr);
         if (fd < 0)
             return;
-        // Handshake: a few ms total, bounded by polling, never a blocking read.
-        std::uint64_t got = 0;
-        auto *at = reinterpret_cast<std::uint8_t *>(&got);
-        std::size_t have = 0;
-        bool ok = false;
-        for (int tries = 0; tries < 40; ++tries)
-        {
-            pollfd hp{fd, POLLIN, 0};
-            if (poll(&hp, 1, 5) <= 0 || !(hp.revents & POLLIN))
-                continue;
-            const ssize_t n = recv(fd, at + have, sizeof got - have, MSG_DONTWAIT);
-            if (n <= 0)
-                break;
-            have += static_cast<std::size_t>(n);
-            if (have == sizeof got)
-            {
-                ok = true;
-                break;
-            }
-        }
-        if (!ok || got != token_)
-        {
-            close(fd);
-            return;
-        }
         const int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
         if (client_fd_ >= 0)
@@ -173,7 +113,6 @@ class AudioRelayServer
 
   private:
     int listen_fd_ = -1, client_fd_ = -1;
-    std::uint64_t token_ = 0;
 };
 
 } // namespace hui::ps5
