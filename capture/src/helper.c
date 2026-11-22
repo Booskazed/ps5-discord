@@ -323,7 +323,11 @@ struct capture {
     uint32_t output_mode, final_mode;
     uint32_t feature;                // the id registered with the resource arbitrator (and written in the block)
     uint32_t variant;                // the encoder variant written in 13.60's block
+    uint8_t written[0x2f0];          // the block as open_encoder() last wrote it (the lab compares it with what the service leaves)
+    unsigned tweak;                  // lab only: TWEAK_* changes to 13.60's block (what a running session's block shows)
 };
+#define TWEAK_FLOATS 1u              // the two floats at offsets 0x238 and 0x23c are 0.0, as in a running session's block, not 1.0
+#define TWEAK_CAPS 2u                // the two caps at offsets 0x54 and 0x104 are 0x2bb0, as in a running session's block
 
 // One result per session; the supervisor never conflates capture and cleanup.
 struct session_result {
@@ -362,6 +366,12 @@ static int64_t remote(struct capture *c, enum function id, const uint64_t args[6
 static int good(int64_t rc) { return rc != SL_CALL_ERROR && (int32_t)rc >= 0; }
 static void put32(uint8_t *p, size_t at, uint32_t n) { memcpy(p + at, &n, 4); }
 static void put64(uint8_t *p, size_t at, uint64_t n) { memcpy(p + at, &n, 8); }
+static uint32_t get32(const uint8_t *p, size_t at)
+{
+    uint32_t n;
+    memcpy(&n, p + at, 4);
+    return n;
+}
 
 // Offsets in Glint's scratch block include its leading output-session qword. Selector 3 is
 // 720p and 4 is 1080p (native firmware construction at 0x6f8fe/0x6f964); the fps flag is 0 for
@@ -537,6 +547,11 @@ static int open_encoder(struct capture *c, intptr_t base, uint32_t *mode, const 
     for (unsigned attempt = 0;; attempt++) {
         if (kind == OPEN_13_00) video_params(block, *mode, req, c->feature, 0x2e0);
         else video_params_1360(block, *mode, req, c->feature, c->variant, kind == OPEN_13_60_BUFFERS ? bufs : NULL);
+        if (kind != OPEN_13_00) {
+            if (c->tweak & TWEAK_FLOATS) { put32(block, 0x238, 0); put32(block, 0x23c, 0); }
+            if (c->tweak & TWEAK_CAPS) { put32(block, 0x54, 0x2bb0); put32(block, 0x104, 0x2bb0); }
+        }
+        memcpy(c->written, block, len);
         if (sl_inject_write_at(&c->ctx, base, block, len)) return -1;
         *rc = REMOTE(c, OPEN_VIDEO, base, base + 8, 0);
         if (good(*rc)) return 0;
@@ -1059,6 +1074,17 @@ static int lab_try(struct capture *c, intptr_t base, uint32_t *mode, const struc
         log_line("lab: %s: OpenVideo refused (0x%llx)", what, (unsigned long long)rc);
         return rc == SL_CALL_ERROR || c->ctx.quarantined ? -1 : 0;
     }
+    {   // What the service left in the block (offset 0 is the handle; anything else it changed is an output).
+        uint8_t after[0x2f0];
+        if (sl_inject_read_at(&c->ctx, base, after, sizeof after) == 0) {
+            unsigned changed = 0;
+            for (size_t i = 8; i < sizeof after; i += 4) {
+                if (get32(after, i) == get32(c->written, i)) continue;
+                if (changed++ < 30) log_line("lab: %s: the service changed block word 0x%zx: 0x%x -> 0x%x", what, i, get32(c->written, i), get32(after, i));
+            }
+            log_line("lab: %s: the service changed %u block words after the handle", what, changed);
+        }
+    }
     if (take_handle(c, base) || prepare_stream_buffer(c, base)) return -1;
     c->video_start_attempted = 1;
     rc = REMOTE(c, START, c->video);
@@ -1243,8 +1269,8 @@ static int lab_native(struct capture *c, intptr_t base, uint32_t mode, const str
 // What one picture test changes: the arbitrator id (and the id in the block), the encoder variant, whether
 // EnableScanInEncode has been called (it cannot be undone from here, so the tests that need it come after the ones
 // that do not), and how the id is taken: like_rp is SceRemotePlay's way (request RUNNING, then commit it with
-// the type 0 to 4 of its ids), otherwise this helper's own (SetCallback and ChangeState).
-struct lab_test { const char *what; uint32_t feature, variant; int scan, like_rp; uint32_t type; };
+// the type 0 to 4 of its ids), otherwise this helper's own (SetCallback and ChangeState); 	weak is TWEAK_* flags.
+struct lab_test { const char *what; uint32_t feature, variant; int scan, like_rp; uint32_t type, tweak; };
 
 static int lab_run(void)
 {
@@ -1272,15 +1298,18 @@ static int lab_run(void)
     // and every picture of a three-minute Go Live was a few dozen bytes: the encoder was not given the display.
     // Each test opens the encoder with this helper's block, starts it and reads pictures (keep something with
     // detail on the screen: a key frame of a flat picture is 200 bytes, of a real one tens of kilobytes).
+    // The kernel log showed SceRemotePlay's session and this helper's get the same scan-in set by the capture
+    // service, and a running session's block differs from this helper's in only six words: the handle, the two
+    // caps and two floats (0.0 in the running session, 1.0 here, in the 0x88-byte sub-block the builder copies
+    // from the session's saved format). So the tests: this helper's block, then the floats as in the running
+    // session, then the floats and the caps, then SceRemotePlay's way of taking its own id with both, then with
+    // EnableScanInEncode too.
     static const struct lab_test tests[] = {
-        {"id 12, as this helper does", FEATURE, 2, 0, 0, 0},
-        {"id 12, as SceRemotePlay does", FEATURE, 2, 0, 1, 0},
-        {"id 0xb4 (type 0), as SceRemotePlay does", 0xb4u, 2, 0, 1, 0},
-        {"id 0xb6 (type 1), as SceRemotePlay does", 0xb6u, 2, 0, 1, 1},
-        {"id 0xb9 (type 2), as SceRemotePlay does", 0xb9u, 2, 0, 1, 2},
-        {"id 0xaf (type 3), as SceRemotePlay does", 0xafu, 2, 0, 1, 3},
-        {"id 0xb1 (type 4), as SceRemotePlay does", 0xb1u, 2, 0, 1, 4},
-        {"id 12, as SceRemotePlay does, scan on", FEATURE, 2, 1, 1, 0},
+        {"id 12, as this helper does", FEATURE, 2, 0, 0, 0, 0},
+        {"id 12, floats 0", FEATURE, 2, 0, 0, 0, TWEAK_FLOATS},
+        {"id 12, floats 0, caps 0x2bb0", FEATURE, 2, 0, 0, 0, TWEAK_FLOATS | TWEAK_CAPS},
+        {"id 0xb4 (type 0), as SceRemotePlay does, floats 0, caps 0x2bb0", 0xb4u, 2, 0, 1, 0, TWEAK_FLOATS | TWEAK_CAPS},
+        {"id 12, as SceRemotePlay does, scan on, floats 0, caps 0x2bb0", FEATURE, 2, 1, 1, 0, TWEAK_FLOATS | TWEAK_CAPS},
     };
     int scan_on = 0, left_type = -1; // left_type: the type to leave when SceRemotePlay's way took the last id
     size_t biggest = 0; // the largest picture of any test so far
@@ -1306,6 +1335,7 @@ static int lab_run(void)
             continue;
         }
         c.variant = test->variant;
+        c.tweak = test->tweak;
         if (test->scan && !scan_on) {
             const int64_t rc = REMOTE(&c, ENABLE_SCAN);
             log_line("lab: EnableScanInEncode -> 0x%llx", (unsigned long long)rc);
@@ -1323,6 +1353,7 @@ static int lab_run(void)
         if (started == 1 && (lab_pictures(&c, base, test->what, &largest) || lab_stop(&c))) result = -1;
         if (largest > biggest) biggest = largest;
     }
+    c.tweak = 0;
     // Then how this helper's block compares with SceRemotePlay's for the profiles and bitrates Go Live offers
     // (the differing words are logged; nothing is opened).
     static const struct start_req profiles[] = {
@@ -1347,13 +1378,6 @@ end:
 // its session keeps in memory and logs it against the block this helper builds for the same profile, with the
 // encoder's status and the session's fields: what a working session sets that this helper does not. It opens
 // nothing and only reads (the target is stopped for about three seconds at most).
-static uint32_t get32(const uint8_t *p, size_t at)
-{
-    uint32_t n;
-    memcpy(&n, p + at, 4);
-    return n;
-}
-
 static void lab_dump(const char *what, const uint8_t *p, size_t n)
 {
     for (size_t i = 0; i < n; i += 32) {
