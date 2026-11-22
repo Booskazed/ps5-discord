@@ -653,21 +653,33 @@ static char *voice_json(void)
 
 // Where a system library's function sits in the app. A title's own dlsym finds
 // nothing on 13.00, so the app asks the core, which reads the app's library
-// table through the kernel; the app then calls the address itself.
+// table through the kernel; the app then calls the address itself. The app
+// may already hold a module handle of its own (sceKernelGetModuleList2,
+// sceSysmoduleGetModuleHandleInternal: those work from the app, only its
+// dlsym does not) and pass it directly with "handle=" instead of "lib=",
+// skipping the by-name lookup.
 static void api_dlsym(int c, const char *query)
 {
-    char pid[12], lib[64], sym[64];
-    if (query_get(query, "pid", pid, sizeof pid) != 0 || !is_id(pid) || query_get(query, "lib", lib, sizeof lib) != 0 ||
-        strncmp(lib, "libSce", 6) != 0 || query_get(query, "sym", sym, sizeof sym) != 0 || strncmp(sym, "sce", 3) != 0) {
-        reply(c, "400 Bad Request", "text/plain", "pid lib sym", 11);
+    char pid[12], lib[64], sym[64], handle_str[16];
+    const int have_lib = query_get(query, "lib", lib, sizeof lib) == 0;
+    const int have_handle = query_get(query, "handle", handle_str, sizeof handle_str) == 0;
+    if (query_get(query, "pid", pid, sizeof pid) != 0 || !is_id(pid) ||
+        query_get(query, "sym", sym, sizeof sym) != 0 || strncmp(sym, "sce", 3) != 0 ||
+        (!have_handle && (!have_lib || strncmp(lib, "libSce", 6) != 0))) {
+        reply(c, "400 Bad Request", "text/plain", "pid (lib|handle) sym", 20);
         return;
     }
     long addr = 0;
 #ifdef __PROSPERO__
     uint32_t handle = 0;
-    if (kernel_dynlib_handle(atoi(pid), lib, &handle) == 0)
+    int have = have_handle ? 1 : 0;
+    if (have_handle)
+        handle = (uint32_t)strtoul(handle_str, NULL, 0);
+    else
+        have = kernel_dynlib_handle(atoi(pid), lib, &handle) == 0;
+    if (have)
         addr = (long)kernel_dynlib_dlsym(atoi(pid), handle, sym);
-    LOG("dlsym %s %s in %s: 0x%lx", lib, sym, pid, addr);
+    LOG("dlsym %s %s in %s: 0x%lx", have_handle ? handle_str : lib, sym, pid, addr);
 #endif
     char json[48];
     snprintf(json, sizeof json, "{\"addr\":%ld}", addr > 0 ? addr : 0);
