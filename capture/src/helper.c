@@ -1070,6 +1070,46 @@ static int lab_try(struct capture *c, intptr_t base, uint32_t *mode, const struc
     return 0;
 }
 
+// How SceRemotePlay's own arbitrator wrapper (module+0x6b1a0 and following) takes a feature, read from its code:
+// SetCallback(id, callback, cookie), then a request for the state RUNNING (libSceResourceArbitrator 13.60 +0x1160:
+// the id and the state name; it answers 1 when granted, 2 to wait, 0 or less when refused), and only if granted
+// ChangeState(id, "RUNNING", cookie, type) where type is 0 to 4 (the ids 0xb4, 0xb6, 0xb9, 0xaf, 0xb1). This
+// helper has only ever done the SetCallback and ChangeState steps (with a zero cookie and its process id as the
+// last argument), never the request. To leave, SceRemotePlay does ChangeState(id, "STOP", cookie, type).
+#define ARB_REQUEST 0x1160
+static int64_t lab_call(struct capture *c, intptr_t fn, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, uint64_t a4,
+                        uint64_t a5);
+static int lab_arbitrate_like_rp(struct capture *c, intptr_t base, uint32_t id, uint32_t type)
+{
+    const intptr_t arb = sl_module_base(c->ctx.target_pid, "libSceResourceArbitrator.sprx");
+    if (arb <= 0) { log_line("lab: libSceResourceArbitrator not found"); return -1; }
+    if (c->callback) {
+        if (!good(REMOTE(c, CLEAR_CALLBACK, c->feature))) return -1;
+        c->callback = 0;
+    }
+    c->feature = id;
+    const uint64_t cookie = (uint64_t)(base + 0x680);
+    static const char running[] = "RUNNING";
+    if (sl_inject_write_at(&c->ctx, base + 0x600, running, sizeof running)) return -1;
+    if (!good(REMOTE(c, SET_CALLBACK, id, c->fn[REMOTE_GETPID], cookie))) return -1;
+    c->callback = 1;
+    const int64_t granted = lab_call(c, arb + ARB_REQUEST, id, (uint64_t)(base + 0x600), 0, 0, 0, 0);
+    log_line("lab: arbitrator request (id 0x%x, RUNNING) -> 0x%llx", id, (unsigned long long)granted);
+    if (granted == SL_CALL_ERROR) return -1;
+    const int64_t changed = REMOTE(c, CHANGE_STATE, id, (uint64_t)(base + 0x600), cookie, type);
+    if (changed == SL_CALL_ERROR) return -1;
+    return 0;
+}
+
+// SceRemotePlay's way out of the state: ChangeState(id, "STOP", cookie, type). 0 on success.
+static int lab_leave_like_rp(struct capture *c, intptr_t base, uint32_t type)
+{
+    static const char stop[] = "STOP";
+    if (sl_inject_write_at(&c->ctx, base + 0x640, stop, sizeof stop)) return -1;
+    const int64_t rc = REMOTE(c, CHANGE_STATE, c->feature, (uint64_t)(base + 0x640), (uint64_t)(base + 0x680), type);
+    return rc == SL_CALL_ERROR ? -1 : 0;
+}
+
 // Reads pictures from the started encoder and logs what they say about the picture: Annex-B units for a real
 // display are tens of kilobytes for a 720p key frame, a few hundred bytes when the encoder is given nothing to
 // encode (community.13's Go Live: a 218-byte key frame and 41-byte pictures for three minutes, a black screen).
@@ -1200,10 +1240,11 @@ static int lab_native(struct capture *c, intptr_t base, uint32_t mode, const str
     return differing ? 0 : 1;
 }
 
-// What one picture test changes: the arbitrator id (and the id in the block), the encoder variant, and whether
+// What one picture test changes: the arbitrator id (and the id in the block), the encoder variant, whether
 // EnableScanInEncode has been called (it cannot be undone from here, so the tests that need it come after the ones
-// that do not).
-struct lab_test { const char *what; uint32_t feature, variant; int scan; };
+// that do not), and how the id is taken: like_rp is SceRemotePlay's way (request RUNNING, then commit it with
+// the type 0 to 4 of its ids), otherwise this helper's own (SetCallback and ChangeState).
+struct lab_test { const char *what; uint32_t feature, variant; int scan, like_rp; uint32_t type; };
 
 static int lab_run(void)
 {
@@ -1232,21 +1273,34 @@ static int lab_run(void)
     // Each test opens the encoder with this helper's block, starts it and reads pictures (keep something with
     // detail on the screen: a key frame of a flat picture is 200 bytes, of a real one tens of kilobytes).
     static const struct lab_test tests[] = {
-        {"id 12, scan off", FEATURE, 2, 0},
-        {"id 12, scan on", FEATURE, 2, 1},
-        {"id 12, scan on, variant 6", FEATURE, 6, 1},
-        {"id 0xb4, scan on", 0xb4u, 2, 1},
-        {"id 0xb9, scan on", 0xb9u, 2, 1},
+        {"id 12, as this helper does", FEATURE, 2, 0, 0, 0},
+        {"id 12, as SceRemotePlay does", FEATURE, 2, 0, 1, 0},
+        {"id 0xb4 (type 0), as SceRemotePlay does", 0xb4u, 2, 0, 1, 0},
+        {"id 0xb6 (type 1), as SceRemotePlay does", 0xb6u, 2, 0, 1, 1},
+        {"id 0xb9 (type 2), as SceRemotePlay does", 0xb9u, 2, 0, 1, 2},
+        {"id 0xaf (type 3), as SceRemotePlay does", 0xafu, 2, 0, 1, 3},
+        {"id 0xb1 (type 4), as SceRemotePlay does", 0xb1u, 2, 0, 1, 4},
+        {"id 12, as SceRemotePlay does, scan on", FEATURE, 2, 1, 1, 0},
     };
-    int scan_on = 0;
+    int scan_on = 0, left_type = -1; // left_type: the type to leave when SceRemotePlay's way took the last id
     size_t biggest = 0; // the largest picture of any test so far
     for (unsigned t = 0; t < sizeof tests / sizeof *tests && result == 0; t++) {
         const struct lab_test *test = &tests[t];
-        if (t >= 2 && biggest > LAB_REAL_PICTURE) { // scan off and on were both seen; a setting that works: the others are not worth the risk of more registrations
+        if (t >= 2 && biggest > LAB_REAL_PICTURE) { // the plain and the SceRemotePlay way were both seen; a setting that works: the others are not worth the risk of more registrations
             log_line("lab: pictures of %zu bytes: the remaining settings are not tried", biggest);
             break;
         }
-        if (c.feature != test->feature && arbitrate(&c, base, test->feature, test->feature == FEATURE ? 0 : (uint64_t)c.ctx.target_pid)) {
+        if (left_type >= 0 && lab_leave_like_rp(&c, base, (uint32_t)left_type)) { result = -1; break; }
+        left_type = -1;
+        if (test->like_rp) {
+            if (lab_arbitrate_like_rp(&c, base, test->feature, test->type)) {
+                log_line("lab: %s: the arbitrator refused the id", test->what);
+                if (c.failed || c.ctx.quarantined) result = -1;
+                continue;
+            }
+            left_type = (int)test->type;
+        } else if (c.feature != test->feature &&
+                   arbitrate(&c, base, test->feature, test->feature == FEATURE ? 0 : (uint64_t)c.ctx.target_pid)) {
             log_line("lab: %s: the arbitrator refused the id", test->what);
             if (c.failed || c.ctx.quarantined) result = -1;
             continue;
@@ -1276,6 +1330,9 @@ static int lab_run(void)
         {4, 1, 8000000, 1920, 1080, 60}, {3, 1, 10000000, 1280, 720, 60}, {4, 1, 20000000, 1920, 1080, 60},
         {3, 0, 1000000, 1280, 720, 30}, {4, 0, 12500000, 1920, 1080, 30},
     };
+    if (left_type >= 0 && lab_leave_like_rp(&c, base, (uint32_t)left_type)) result = -1;
+    if (c.remote_frame && REMOTE(&c, REMOTE_FREE, c.remote_frame) == SL_CALL_ERROR) result = -1;
+    c.remote_frame = 0;
     c.feature = FEATURE; c.variant = 2;
     if (result == 0 && arbitrate(&c, base, FEATURE, 0)) result = -1;
     for (unsigned p = 0; p < sizeof profiles / sizeof *profiles && result == 0 && c.ctx.attached && !c.failed && !c.ctx.quarantined; p++)
