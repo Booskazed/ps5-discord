@@ -753,6 +753,14 @@ bool prepare_update_hook(void* entry){
     auto query=fn<ProtectionQuery>(QueryProtection);
     note("HOOKSTEP prepare begin");
     if(!prepare_hook(update_hook_store,entry,reinterpret_cast<void*>(&update_hook),query,fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap),hook_step)){
+        // prepare_hook copies 16 bytes into .before before it can refuse at the
+        // decode step; log them even on refusal, so a mismatched firmware's
+        // real prologue is visible instead of guessed at.
+        note("PROLOGUE bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+            update_hook_store.before[0],update_hook_store.before[1],update_hook_store.before[2],update_hook_store.before[3],
+            update_hook_store.before[4],update_hook_store.before[5],update_hook_store.before[6],update_hook_store.before[7],
+            update_hook_store.before[8],update_hook_store.before[9],update_hook_store.before[10],update_hook_store.before[11],
+            update_hook_store.before[12],update_hook_store.before[13],update_hook_store.before[14],update_hook_store.before[15]);
         note("REFUSED Update alignment, permissions or relocatable prologue");return false;}
     auto length=native_patch_length(update_hook_store.before);
     note("HOOKSTEP prepared len=%zu bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x tramp=%p",
