@@ -366,12 +366,14 @@ static int64_t remote(struct capture *c, enum function id, const uint64_t args[6
 static int good(int64_t rc) { return rc != SL_CALL_ERROR && (int32_t)rc >= 0; }
 static void put32(uint8_t *p, size_t at, uint32_t n) { memcpy(p + at, &n, 4); }
 static void put64(uint8_t *p, size_t at, uint64_t n) { memcpy(p + at, &n, 8); }
+#ifdef SL_PS5
 static uint32_t get32(const uint8_t *p, size_t at)
 {
     uint32_t n;
     memcpy(&n, p + at, 4);
     return n;
 }
+#endif
 
 // Offsets in Glint's scratch block include its leading output-session qword. Selector 3 is
 // 720p and 4 is 1080p (native firmware construction at 0x6f8fe/0x6f964); the fps flag is 0 for
