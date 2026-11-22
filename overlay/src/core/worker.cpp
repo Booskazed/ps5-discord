@@ -879,9 +879,12 @@ State run_audio_test(){
 // app closing it, or stop.bin, end it cleanly), bounded by a safety ceiling.
 State run_audio_relay(){
     publish(State::Observing);
-    char p[256];
-    if(!path(p,sizeof p,parent_dir,"audio-relay.bin")){publish(State::Failed);return State::Failed;}
-    std::FILE* f=std::fopen(p,"rb");
+    // Not parent_dir (/data/discord-overlay-poc): that one is root:755, created
+    // by this very loader, and the app's own process could not create a file
+    // there (measured 2026-11-22). The app writes its own, separate directory
+    // instead (platform/ps5/audio_relay.hpp), which this worker -- running
+    // with the loader's full privileges -- can read regardless of who owns it.
+    std::FILE* f=std::fopen("/data/ps5-discord-audio-relay/audio-relay.bin","rb");
     if(!f){note("AUDIORELAY no audio-relay.bin; is the app running with a relay build?");publish(State::Failed);return State::Failed;}
     std::uint16_t port=0;std::uint64_t token=0;
     const bool got_header=std::fread(&port,sizeof port,1,f)==1&&std::fread(&token,sizeof token,1,f)==1;

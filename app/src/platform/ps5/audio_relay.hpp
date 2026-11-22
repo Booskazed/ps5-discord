@@ -29,6 +29,8 @@ class AudioRelayServer
 {
   public:
     static constexpr std::uint16_t kPort = 9043;
+    static constexpr const char *kDir = "/data/ps5-discord-audio-relay";
+    static constexpr const char *kFile = "/data/ps5-discord-audio-relay/audio-relay.bin";
 
     bool start()
     {
@@ -51,8 +53,14 @@ class AudioRelayServer
         const int flags = fcntl(listen_fd_, F_GETFL, 0);
         fcntl(listen_fd_, F_SETFL, flags | O_NONBLOCK);
         token_ = (static_cast<std::uint64_t>(sys::monotonic_us()) << 1) ^ 0x4c414231ULL;
-        mkdir("/data/discord-overlay-poc", 0777);
-        if (std::FILE *f = std::fopen("/data/discord-overlay-poc/audio-relay.bin", "wb"))
+        // Not /data/discord-overlay-poc: that one is root:755 (created by the
+        // loader, an elfldr payload with full privileges) and this app's own
+        // process could not create a file in it (silently: no audio-relay.bin
+        // ever appeared, measured 2026-11-22). A directory this app creates
+        // itself (as tools/audio-probe's app_mic_probe.cpp already does
+        // under /data/ps5-discord-probe) it owns, and can write into.
+        mkdir(kDir, 0777);
+        if (std::FILE *f = std::fopen(kFile, "wb"))
         {
             std::fwrite(&kPort, sizeof kPort, 1, f);
             std::fwrite(&token_, sizeof token_, 1, f);
