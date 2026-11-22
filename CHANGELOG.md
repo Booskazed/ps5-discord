@@ -129,7 +129,18 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   The file is removed at start, so the next start is a normal one.
   (The helper looked for that file and for the module images with `access()`, which checks the real
   user's rights and fails in the root-only data folder; it uses `stat()` now.)
-
+- Wireless Go Live on 13.60: with the encoder started, the picture was flat for the whole Go Live (a 218-byte
+  key frame and 41-byte pictures: viewers saw a black screen). Lab mode, the kernel log and a read of the block of a
+  running Remote Play session showed the capture service sets the same scan-in for this helper's encoder as for
+  SceRemotePlay's, and that the two blocks differ in six words, among them two floats at offsets `0x238` and
+  `0x23c` (`0.0` in the running session, `1.0` in the default SceRemotePlay's builder leaves in the 0x88-byte
+  sub-block that starts at `0x230`). `sceAvcap2EnableScanInEncode`, the arbitrator id (`12`, `0xb4`, `0xb6`,
+  `0xaf`, `0xb1`), the encoder variant and SceRemotePlay's way of taking its id (a request for `RUNNING`, then
+  `ChangeState` with the id's type) changed nothing. This helper's block now has `0.0` there; with it the first
+  key frame is 16 KB on the console. At the end of a 13.60 session the helper also sends `ChangeState(id, "STOP")`,
+  as SceRemotePlay does, before it clears its callback: until now the resource arbitrator kept the helper's id
+  `RUNNING` (with a video codec budget and a scan-in slot) until the console restarted, which could starve a Remote
+  Play session or the system's own capture started afterwards.
 ## [0.6.0-alpha.2] - 2026-10-31
 
 ### Fixed
