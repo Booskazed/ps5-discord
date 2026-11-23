@@ -39,6 +39,9 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // Optional lab (Mode::TileDiscord, Mono): read one STATIC field of an already initialised class (VoiceChatModule.m_cblist),
     // the only way found to reach the live React Native module instance without scanning GC handles or memory.
     MonoClassVtable,MonoFieldStaticGet,
+    // Optional lab (Mode::TileDiscord, Mono): nested type iteration (IpcTypes.SceVoiceChat*Event are nested types, which
+    // mono_class_from_name cannot return) and a class's image (to reach corlib's Marshal from a string's class).
+    MonoNestedTypes,MonoClassImage,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -56,7 +59,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser",
     "sceKernelLoadStartModule","sceKernelDlsym","sysctl",
     "O1lQ2+do5r4","0zsTiDhM0nU",
-    "mono_class_vtable","mono_field_static_get_value"};
+    "mono_class_vtable","mono_field_static_get_value",
+    "mono_class_get_nested_types","mono_class_get_image"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
 // AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose

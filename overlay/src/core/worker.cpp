@@ -1790,6 +1790,88 @@ void tile_rn_event(void* inst,void* rnk,const char* json,const char* evt_name,bo
     note("TILE RN onUserDataEvent(%d,\"%s\",jobject) invoked (method %p) ex=%p",uid,evt_name,mu,ex);
     if(ex)tile_log_tostring(ex,"emit exception");
 }
+void* tile_find_method(void* klass,const char* name,int count,const char* first_param){
+    void* iter=nullptr;
+    for(int i=0;i<512;++i){
+        void* m=fn<void*(*)(void*,void**)>(ClassMethods)(klass,&iter);if(!m)break;
+        const char* n=fn<const char*(*)(void*)>(MethodName)(m);
+        if(!n||std::strcmp(n,name))continue;
+        void* sig=fn<void*(*)(void*)>(MethodSignature)(m);if(!sig)continue;
+        if(int(fn<unsigned(*)(void*)>(SignatureCount)(sig))!=count)continue;
+        void* it=nullptr;void* pt=fn<void*(*)(void*,void**)>(SignatureParams)(sig,&it);
+        const char* pn=pt?fn<const char*(*)(void*)>(TypeName)(pt):nullptr;
+        if(first_param&&(!pn||std::strcmp(pn,first_param)))continue;
+        return m;}
+    return nullptr;
+}
+// Ground-truth native event: instead of guessing the layout, let the runtime build it. A managed
+// IpcTypes.SceVoiceChat<Kind>Event (nested type, found through mono_class_get_nested_types) gets its dataJsonString set,
+// Marshal.StructureToPtr writes it into unmanaged memory exactly as the module's own marshalling expects, the pure
+// Convert<Kind>EventDataToJObject verifies it (logged), and only with `emit` the module's own _OnVoiceChat<Kind>Event is
+// invoked on that pointer (marker file, one-shot). Never reads or writes memory we did not allocate through Marshal.
+void tile_rn_native(void* inst,void* rnk,void* rn,const char* json,const char* evt_name,bool emit){
+    if(!inst||!rnk||!rn)return;
+    const char* p=std::strstr(evt_name,"voiceChat");
+    if(!p){note("TILE NATIVE: unusable event name");return;}
+    char kind[32]{};{const char* a=p+9;const char* e=std::strstr(a,"Event");std::size_t n=e?std::size_t(e-a):std::strlen(a);if(n>=sizeof kind)n=sizeof kind-1;std::memcpy(kind,a,n);}
+    if(!request.functions[MonoNestedTypes]||!request.functions[MonoClassImage]){note("TILE NATIVE: Mono exports missing");return;}
+    void* ipc=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,"ReactNative.Modules.ShellUI.VoiceChat","IpcTypes");
+    char want[64];std::snprintf(want,sizeof want,"SceVoiceChat%sEvent",kind);
+    void* evk=nullptr;
+    if(ipc){void* it=nullptr;
+        for(int i=0;i<64;++i){
+            void* nk=fn<void*(*)(void*,void**)>(MonoNestedTypes)(ipc,&it);if(!nk)break;
+            const char* nn=fn<const char*(*)(void*)>(ClassNameGet)(nk);
+            if(nn&&!std::strcmp(nn,want)){evk=nk;break;}}}
+    note("TILE NATIVE IpcTypes=%p %s=%p",ipc,want,evk);
+    if(!evk)return;
+    void* js=fn<void*(*)(void*,const char*)>(StringNew)(domain,json);
+    void* corlib=fn<void*(*)(void*)>(MonoClassImage)(fn<void*(*)(void*)>(ObjectClass)(js));
+    void* mk=corlib?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(corlib,"System.Runtime.InteropServices","Marshal"):nullptr;
+    void* m_alloc=mk?tile_find_method(mk,"AllocHGlobal",1,"System.Int32"):nullptr;
+    void* m_s2p=mk?tile_find_method(mk,"StructureToPtr",3,"System.Object"):nullptr;
+    note("TILE NATIVE corlib=%p Marshal=%p AllocHGlobal(int)=%p StructureToPtr(object,..)=%p",corlib,mk,m_alloc,m_s2p);
+    if(!m_alloc||!m_s2p)return;
+    long long size=4096;void* a1[1]={&size};void* ex=nullptr;
+    void* boxed=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_alloc,nullptr,a1,&ex);
+    void* ptr=boxed?*(void**)fn<void*(*)(void*)>(ObjectUnbox)(boxed):nullptr;
+    note("TILE NATIVE AllocHGlobal -> %p ex=%p",ptr,ex);
+    if(!ptr)return;
+    std::memset(ptr,0,4096);
+    void* obj=fn<void*(*)(void*,void*)>(ObjectNew)(domain,evk);
+    bool set=false;
+    {void* fit=nullptr;
+     for(int i=0;i<16;++i){
+         void* f=fn<void*(*)(void*,void**)>(ClassFields)(evk,&fit);if(!f)break;
+         const char* fname=fn<const char*(*)(void*)>(FieldName)(f);
+         if(fname&&!std::strcmp(fname,"dataJsonString")){unsigned off=fn<unsigned(*)(void*)>(FieldOffset)(f);
+             if(off>=16&&off<256){*(void**)((char*)obj+off)=js;set=true;}break;}}}
+    note("TILE NATIVE struct object=%p field set=%d",obj,int(set));
+    if(!obj||!set)return;
+    long long no_delete=0;void* a3[3]={obj,&ptr,&no_delete};
+    ex=nullptr;
+    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_s2p,nullptr,a3,&ex);
+    note("TILE NATIVE StructureToPtr ex=%p",ex);
+    if(ex){tile_log_tostring(ex,"s2p exception");return;}
+    {const std::uint64_t* q=(const std::uint64_t*)ptr;
+     note("TILE NATIVE buffer qwords: %016llx %016llx %016llx %016llx",(unsigned long long)q[0],(unsigned long long)q[1],(unsigned long long)q[2],(unsigned long long)q[3]);}
+    char mn[96];std::snprintf(mn,sizeof mn,"Convert%sEventDataToJObject",kind);
+    void* mc=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,mn,1);
+    void* argp=ptr;void* ca[1]={&argp};ex=nullptr;
+    void* jo=mc?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mc,inst,ca,&ex):nullptr;
+    void* exk=ex?fn<void*(*)(void*)>(ObjectClass)(ex):nullptr;
+    const char* exn=exk?fn<const char*(*)(void*)>(ClassNameGet)(exk):nullptr;
+    note("TILE NATIVE %s(marshalled) -> %p ex=%s",mn,jo,exn?exn:"none");
+    if(jo)tile_log_tostring(jo,"native converted");
+    if(!emit){note("TILE NATIVE emit skipped (no tile-emit-native marker)");return;}
+    if(!jo){note("TILE NATIVE emit refused: conversion gave no object");return;}
+    std::snprintf(mn,sizeof mn,"_OnVoiceChat%sEvent",kind);
+    void* me=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,mn,1);
+    argp=ptr;ex=nullptr;
+    if(me)fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(me,inst,ca,&ex);
+    note("TILE NATIVE %s invoked (method %p) ex=%p",mn,me,ex);
+    if(ex)tile_log_tostring(ex,"native emit exception");
+}
 // Native event buffer for the RN VoiceChatModule: its event structs hold one field, `string dataJsonString` (metadata of
 // IpcTypes.SceVoiceChat*Event), so the IntPtr is taken to point at {char* json}. Convert*EventDataToJObject is a pure
 // conversion (logged); _OnVoiceChat*Event emits to the Control Center's JavaScript and only runs when `emit` is set
@@ -1944,7 +2026,14 @@ State run_tile_discord(){
                         if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);emit_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;
                             std::remove(pth);}}}   // one-shot: the marker is consumed here
                     if(emit_index>=ninst)emit_index=ninst-1;
-                    if(inst_rn)tile_rn_event(emit_index>=0?insts[emit_index]:inst_rn,rnk,json_cstr,evt_name,emit_index>=0);}
+                    if(inst_rn)tile_rn_event(emit_index>=0?insts[emit_index]:inst_rn,rnk,json_cstr,evt_name,emit_index>=0);
+                    // Ground-truth native path (verification always; the real call only with the one-shot marker tile-emit-native).
+                    int nat_index=-1;
+                    {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit-native")){FILE* mf=std::fopen(pth,"rb");
+                        if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);nat_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;
+                            std::remove(pth);}}}
+                    if(nat_index>=ninst)nat_index=ninst-1;
+                    if(inst_rn)tile_rn_native(nat_index>=0?insts[nat_index]:inst_rn,rnk,rn,json_cstr,evt_name,nat_index>=0);}
                 break;}
         }
     }

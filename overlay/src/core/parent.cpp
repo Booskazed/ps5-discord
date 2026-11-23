@@ -116,7 +116,7 @@ static int run(){
                 else note("resolved ipmi %s in module %u",symbols[i],unsigned(ipmi));
                 r.functions[i]=address_value;continue;
             }
-            if(i==MonoClassVtable||i==MonoFieldStaticGet){
+            if(i==MonoClassVtable||i==MonoFieldStaticGet||i==MonoNestedTypes||i==MonoClassImage){
                 // Tile lab: standard Mono embedding exports; a miss only disables the static-field read.
                 address_value=kernel_dynlib_dlsym(r.pid,mono,symbols[i]);
                 if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,mono,nid);}
