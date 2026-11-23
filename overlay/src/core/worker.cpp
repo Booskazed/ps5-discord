@@ -1656,7 +1656,13 @@ State run_tile_discord(){
     if(ex){
         // Diagnostic: print Exception.ToString() (type, message, first stack lines), split in 200-char lines.
         void* eclass=fn<void*(*)(void*)>(ObjectClass)(ex);
-        void* mts=eclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(eclass,"ToString",0):nullptr;
+        {
+            const char* en=eclass?fn<const char*(*)(void*)>(ClassNameGet)(eclass):nullptr;
+            note("TILE exc class=%s",en?en:"?");
+        }
+        void* mts=nullptr;
+        for(void* walk=eclass;walk&&!mts;walk=fn<void*(*)(void*)>(ClassParent)(walk))
+            mts=fn<void*(*)(void*,const char*,int)>(MethodFromName)(walk,"ToString",0);
         void* ex2=nullptr;
         void* s=mts?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mts,ex,nullptr,&ex2):nullptr;
         note("TILE exception ToString=%p class=%p ex2=%p",s,eclass,ex2);
