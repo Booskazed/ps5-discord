@@ -128,7 +128,8 @@ verification challenge.
   Remote Play pairing, made once in Settings, Voice & audio. Above 720p30 needs Nitro or a
   boosted server. After a Go Live, replug the controller before the next one (the app asks).
 - During a game the mic is only available through Go Live (the console refuses payloads the
-  mic); outside it, voice needs the app on screen.
+  mic); outside it, voice needs the app on screen. (The community build adds an audio worker
+  inside the console's UI process that lifts this limit, see "Fork notes" below.)
 
 ## Target
 
@@ -181,6 +182,7 @@ Status of upstream `develop`'s options on firmware 13.60, as tested so far on on
 | Go Live through Remote Play (legacy) | works (tested at the four qualities) |
 | Go Live through the hardware encoder (wireless) | works (720p · 60 fps: a viewer saw the picture live, 2026-11-22; other qualities not checked). Fixed in this fork's capture helper (upstream issue #11) |
 | In-game overlay | allowed on 13.60 (the firmware check lists 13.00 and 13.60); colours, buttons and fonts not checked on the console |
+| Voice while a game is in front, wireless DualSense with a wired headset | works in the community build (`PPSA99073`), added by this fork: friends heard both ways in a game and in the app (2026-11-23, one console, a session with friends); see [VOICE_AND_GO_LIVE.md](VOICE_AND_GO_LIVE.md) |
 | Controller audio (USB DualSense in calls) | WIP upstream, not tested |
 | Bluetooth headset through a USB adapter | needs an adapter, not tested |
 

@@ -87,6 +87,36 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
 - In-game overlay: `overlay/src/core/parent.cpp` allows firmware 13.60 next to 13.00 (an explicit list;
   every other refusal and the Mono signature checks are unchanged). Colours, button bits, fonts and
   labels are still unchecked on 13.60.
+- Voice while a game is in front, over a wireless controller (side-by-side `PPSA99073` build only;
+  measured on firmware 13.60). The console ends the app when a game starts (`[SceLncService]
+  KillApp()` in the kernel log; it does not suspend it) while the core keeps the call, and the sound
+  an ordinary app plays is removed when another title takes AV focus (`[AvControl] AudioOut:
+  shared`). Sound played and a microphone captured from inside SceShellUI survive both.
+  - The core listens on a third loopback port, `127.0.0.1:9044` (the "tap"), authenticated with the
+    control key like the other two. It streams the mixed call to its client as stereo S16 48 kHz PCM
+    (20 ms frames) and takes the client's microphone back as mono S16 48 kHz on the same socket. While
+    a tap client is connected the app is no longer sent the playback (no doubled sound); the tap
+    microphone counts only while the app delivers none, and the core creates
+    `/data/discord-overlay-poc/tap-mic` while the worker may capture. Mic gain, Call volume, Mute and
+    Deafen stay in the core and apply to this path too.
+  - The audio worker (`overlay/src/core/worker.cpp`, mode AudioRelay, `overlay-audiorelay.elf`) is a
+    thread injected into SceShellUI. It plays the tap with its own `sceAudioOutOpen` and captures the
+    foreground user's microphone with `sceAudioIn` (type 0, 48 kHz, grains of 256 samples). It does
+    not touch the Mono runtime or the overlay hook, so it is exempt from the one-attempt-per-ShellUI
+    guard. SceShellUI sees `/user/data` but not `/data/homebrew`, so it reads the key from
+    `/user/data/homebrew/<title>/control.key`.
+  - The core starts it (`voice_shell_keeper` in `src/overlay.c`: 15 seconds after start, then whenever
+    the worker's `audio-alive` heartbeat is older than 15 seconds; a live worker is never started
+    twice, as each launch maps another copy of the ELF into SceShellUI). Control files in
+    `/data/discord-overlay-poc/`: `stop-audio` ends the worker, `no-mic` stops its capture.
+  - Found while measuring it, all fixed: the capture is read in step with the playback (one grain of
+    each per pass), as playing every queued grain first read the mic at 30% of real time; the
+    console's audio clock runs 0.5 to 1.3% slower than the core's 20 ms mix, so the playback queue
+    is time-compressed by 1.6% above 8 KB instead of dropping grains (2 to 3 clicks a second); and
+    the tap socket sets `TCP_NODELAY`: with Nagle on, the mic reached the core in 100 ms bursts
+    whenever nobody was talking, which its 80 ms lag guard cut to 40% and replayed at double speed.
+  - Not covered: other firmware versions, other consoles, the stock `PPSA99072` build (it does not
+    ship the worker), sessions of several hours.
 - Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00 and 13.60, where the
   wireless hardware encoder works (13.60: see below; a viewer saw the picture live on one console). A saved
   choice wins.

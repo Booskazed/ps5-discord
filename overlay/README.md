@@ -85,3 +85,12 @@ integration into the real overlay; the lab does not apply them there.
 Background PNGs are versioned under the same `lab/` directory and regenerate
 only when raster geometry/materials change and input settles. The previous
 PNG is deleted after switching images; the final PNG remains on teardown.
+
+## Audio worker (mode AudioRelay)
+
+`overlay-audiorelay.elf` injects a thread into SceShellUI that carries a call's sound and microphone
+while a game is in front. It does not touch the Mono runtime or the overlay hook. The core's tap
+(`src/voice_audio.c`, loopback port 9044) feeds it the mixed call and takes the microphone back; the
+core starts it and supervises it (`voice_shell_keeper` in `src/overlay.c`). Design, measurements and
+the control files (`stop-audio`, `no-mic`, `audio-alive`, `worker.log`) are in the "Community fork"
+section of the top-level CHANGELOG.md and in VOICE_AND_GO_LIVE.md.
