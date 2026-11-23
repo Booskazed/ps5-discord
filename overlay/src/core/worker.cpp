@@ -1664,7 +1664,7 @@ void tile_observe(void* inst,const char* label){
 // Read-only structural dump of a managed object (lab): every instance field with its value, recursing into reference
 // fields. Arrays are only measured (length), never indexed, and nothing is invoked: reference fields hold either null or
 // a valid object, so ObjectClass on them is safe; no pointer is followed that the metadata does not mark as a reference.
-[[maybe_unused]] void tile_dump(void* obj,const char* path_,int depth,int& budget){
+[[maybe_unused]] void tile_dump(void* obj,const char* path_,int depth,int& budget,bool strings_only=false){
     if(!obj||budget<=0)return;
     --budget;
     void* k=fn<void*(*)(void*)>(ObjectClass)(obj);
@@ -1673,7 +1673,7 @@ void tile_observe(void* inst,const char* label){
         int slen=*(int*)((char*)obj+16);const unsigned short* su=(const unsigned short*)((char*)obj+20);
         char buf[72];int w=0;for(int j=0;j<slen&&j<int(sizeof buf)-1;++j)buf[w++]=(su[j]<0x80)?char(su[j]):'?';buf[w]='\0';
         note("TILE dump %s = string \"%s\"",path_,buf);return;}
-    note("TILE dump %s : %s",path_,cn?cn:"?");
+    if(!strings_only)note("TILE dump %s : %s",path_,cn?cn:"?");
     if(!k)return;
     for(void* walk=k;walk;walk=fn<void*(*)(void*)>(ClassParent)(walk)){
         void* iter=nullptr;
@@ -1686,6 +1686,10 @@ void tile_observe(void* inst,const char* label){
             int kind=ft?fn<int(*)(void*)>(TypeKind)(ft):-1;
             if(off<16||off>4096)continue;                          // static / literal fields report small offsets
             const char* nm=fname?fname:"?";
+            if(strings_only){
+                // identity hunt: only reference fields, never delegates / weak references / event handlers
+                if(kind!=18&&kind!=21&&kind!=28)continue;
+                if(ftype&&(std::strstr(ftype,"Delegate")||std::strstr(ftype,"Handler")||std::strstr(ftype,"WeakReference")||std::strstr(ftype,"Action")||std::strstr(ftype,"Func")))continue;}
             switch(kind){
             case 2:case 4:case 5:note("TILE dump %s.%s = %d (%s)",path_,nm,int(*((unsigned char*)obj+off)),ftype?ftype:"?");break;
             case 6:case 7:note("TILE dump %s.%s = %d (%s)",path_,nm,int(*(unsigned short*)((char*)obj+off)),ftype?ftype:"?");break;
@@ -1697,8 +1701,8 @@ void tile_observe(void* inst,const char* label){
                 if(!child){note("TILE dump %s.%s = null (%s)",path_,nm,ftype?ftype:"?");break;}
                 if(ftype&&(std::strstr(ftype,"KeyValuePair")||!std::strncmp(ftype,"System.Nullable",15))){note("TILE dump %s.%s = (skipped %s)",path_,nm,ftype);break;}
                 char np[192];std::snprintf(np,sizeof np,"%s.%s",path_,nm);
-                if(depth>0)tile_dump(child,np,depth-1,budget);
-                else note("TILE dump %s = %p (%s, depth limit)",np,child,ftype?ftype:"?");
+                if(depth>0)tile_dump(child,np,depth-1,budget,strings_only);
+                else if(!strings_only)note("TILE dump %s = %p (%s, depth limit)",np,child,ftype?ftype:"?");
                 break;}
             default:break;}}}
 }
@@ -2042,7 +2046,7 @@ State run_tile_discord(){
                     for(int ii=0;ii<ninst;++ii){
                         void* cx=tile_get_context(insts[ii]);
                         char cp[32];std::snprintf(cp,sizeof cp,"ctx[%d]",ii);
-                        int cb=45;tile_dump(cx,cp,2,cb);}
+                        int cb=80;tile_dump(cx,cp,4,cb,true);}
                     int emit_index=-1;
                     {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit")){FILE* mf=std::fopen(pth,"rb");
                         if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);emit_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;
