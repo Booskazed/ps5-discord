@@ -1739,6 +1739,7 @@ void* tile_enum_callbacks(void* dict,void* rnk,void** list=nullptr,int* count=nu
             if(mt){ex=nullptr;tgt=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mt,e,nullptr,&ex);}
             void* tk=tgt?fn<void*(*)(void*)>(ObjectClass)(tgt):nullptr;
             const char* tn=tk?fn<const char*(*)(void*)>(ClassNameGet)(tk):nullptr;
+            (void)en_;(void)tn;
             void* cand=(rnk&&ek==rnk)?e:((rnk&&tk==rnk)?tgt:nullptr);
             if(cand){
                 if(!found)found=cand;
