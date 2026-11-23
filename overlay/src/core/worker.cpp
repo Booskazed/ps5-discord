@@ -1766,6 +1766,13 @@ void tile_log_tostring(void* o,const char* label){
     if(w){line[w]='\0';note("TILE RN %s: %s",label,line);}
 }
 void* tile_find_method(void* klass,const char* name,int count,const char* first_param);
+void* tile_get_context(void* inst){
+    void* mctx=nullptr;
+    for(void* w=fn<void*(*)(void*)>(ObjectClass)(inst);w&&!mctx;w=fn<void*(*)(void*)>(ClassParent)(w))
+        mctx=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"get_Context",0);
+    void* ex=nullptr;
+    return mctx?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mctx,inst,nullptr,&ex):nullptr;
+}
 // Managed path (no native struct, no raw pointer): ConvertJsonStringToJObject(string) is the module's own text->JObject
 // helper (the native Convert* methods call it with the struct's dataJsonString; 10 guessed native layouts all failed, and
 // the method bodies are not readable here: the image carries precompiled code with 1-byte IL stubs). The module also has
@@ -1780,21 +1787,17 @@ void tile_rn_event(void* inst,void* rnk,const char* json,const char* evt_name,bo
     note("TILE RN ConvertJsonStringToJObject -> %p ex=%p",jo,ex);
     if(jo)tile_log_tostring(jo,"converted");
     if(ex)tile_log_tostring(ex,"convert exception");
-    if(!emit){note("TILE RN emit skipped (no tile-emit marker)");return;}
-    if(!jo){note("TILE RN emit refused: no JObject");return;}
     // The module's own way to reach JavaScript: its base class gives get_Context() (ReactContext), and the framework helper
     // ReactNative.Vsh.Common.EventEmitterUtility.emitDeviceEvent(ReactContext, string, object) emits a device event. The JS
     // event names are literals of the shell assembly (voiceChatChannelEvent, voiceChatDaemonEvent, ..., partySessionEvent
     // VshNMVoiceChat, ...). No native struct, no raw pointer: only managed objects.
-    void* mctx=nullptr;
-    for(void* w=fn<void*(*)(void*)>(ObjectClass)(inst);w&&!mctx;w=fn<void*(*)(void*)>(ClassParent)(w))
-        mctx=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"get_Context",0);
-    ex=nullptr;
-    void* ctx=mctx?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mctx,inst,nullptr,&ex):nullptr;
+    void* ctx=tile_get_context(inst);
     void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
     void* eu=cimg?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(cimg,"ReactNative.Vsh.Common","EventEmitterUtility"):nullptr;
     void* me=eu?tile_find_method(eu,"emitDeviceEvent",3,"ReactNative.Bridge.ReactContext"):nullptr;
-    note("TILE RN context=%p (get_Context %p ex=%p) EventEmitterUtility=%p emitDeviceEvent=%p",ctx,mctx,ex,eu,me);
+    note("TILE RN context=%p EventEmitterUtility=%p emitDeviceEvent=%p",ctx,eu,me);
+    if(!emit){note("TILE RN emit skipped (no tile-emit marker)");return;}
+    if(!jo){note("TILE RN emit refused: no JObject");return;}
     if(!ctx||!me){note("TILE RN emit refused: no context or emitter");return;}
     void* name=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
     void* a3[3]={ctx,name,jo};
@@ -2034,6 +2037,12 @@ State run_tile_discord(){
                         int nz=0;for(int gi=0;gi<11;++gi)if(*(std::uint64_t*)((char*)insts[ii]+56+8*gi))++nz;
                         note("TILE RN inst[%d]=%p _emittable=%d contexts_set=%d channelCtx=%llx",ii,insts[ii],
                              int(*((unsigned char*)insts[ii]+48)),nz,(unsigned long long)*(std::uint64_t*)((char*)insts[ii]+72));}
+                    // Which instance belongs to the Control Center? Each RN app has its own module + ReactContext: dump the
+                    // contexts' strings (read-only reference walk) so the app/bundle identity shows up.
+                    for(int ii=0;ii<ninst;++ii){
+                        void* cx=tile_get_context(insts[ii]);
+                        char cp[32];std::snprintf(cp,sizeof cp,"ctx[%d]",ii);
+                        int cb=45;tile_dump(cx,cp,2,cb);}
                     int emit_index=-1;
                     {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit")){FILE* mf=std::fopen(pth,"rb");
                         if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);emit_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;
