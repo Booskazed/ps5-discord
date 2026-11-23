@@ -1579,6 +1579,92 @@ State run_scene_probe(){
     note("PROBE done");
     publish(State::Passed);return State::Passed;
 }
+// Tile observation helpers (lab, read-only): log the object graph reachable from the delegate targets that sit in
+// VoiceChatModule's handler dictionary and, when a PartyStatusMonitor shows up, its live state. Only managed field
+// reads on reference-typed fields plus a few getters; nothing is written, no handler is called.
+const char* tile_cls_name(void* obj){
+    void* c=obj?fn<void*(*)(void*)>(ObjectClass)(obj):nullptr;
+    return c?fn<const char*(*)(void*)>(ClassNameGet)(c):nullptr;
+}
+void tile_log_string_set(void* coll,const char* label){
+    if(!coll){note("TILE set %s = null",label);return;}
+    void* c=fn<void*(*)(void*)>(ObjectClass)(coll);
+    void* mcount=c?fn<void*(*)(void*,const char*,int)>(MethodFromName)(c,"get_Count",0):nullptr;
+    void* ex=nullptr;
+    void* b=mcount?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mcount,coll,nullptr,&ex):nullptr;
+    note("TILE set %s count=%d ex=%p",label,b?*(int*)fn<void*(*)(void*)>(ObjectUnbox)(b):-1,ex);
+    void* menum=c?fn<void*(*)(void*,const char*,int)>(MethodFromName)(c,"GetEnumerator",0):nullptr;
+    ex=nullptr;
+    void* en=menum?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(menum,coll,nullptr,&ex):nullptr;
+    void* ec=en?fn<void*(*)(void*)>(ObjectClass)(en):nullptr;
+    void* mnext=ec?fn<void*(*)(void*,const char*,int)>(MethodFromName)(ec,"MoveNext",0):nullptr;
+    void* mcurr=ec?fn<void*(*)(void*,const char*,int)>(MethodFromName)(ec,"get_Current",0):nullptr;
+    void* ethis=en?fn<void*(*)(void*)>(ObjectUnbox)(en):nullptr;
+    if(!(mnext&&mcurr&&ethis))return;
+    for(int i=0;i<32;++i){
+        ex=nullptr;
+        void* bn=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mnext,ethis,nullptr,&ex);
+        if(!bn||!*(int*)fn<void*(*)(void*)>(ObjectUnbox)(bn))break;
+        ex=nullptr;
+        void* s=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mcurr,ethis,nullptr,&ex);
+        if(!s)continue;
+        int slen=*(int*)((char*)s+16);
+        const unsigned short* su=(const unsigned short*)((char*)s+20);
+        char buf[128];int w=0;
+        for(int j=0;j<slen&&j<int(sizeof(buf))-1;++j)buf[w++]=(su[j]<0x80)?char(su[j]):'?';
+        buf[w]='\0';
+        note("TILE set %s[%d]=\"%s\"",label,i,buf);}
+}
+void tile_graph(void* obj,const char* path,int depth,int& budget){
+    if(!obj||budget<=0)return;
+    --budget;
+    void* k=fn<void*(*)(void*)>(ObjectClass)(obj);
+    const char* cn=k?fn<const char*(*)(void*)>(ClassNameGet)(k):nullptr;
+    note("TILE graph %s : %s",path,cn?cn:"?");
+    if(!cn)return;
+    if(!std::strcmp(cn,"PartyStatusMonitor")){
+        note("TILE PSM m_isInParty=%d m_userId=%d",int(*((unsigned char*)obj+32)),*(int*)((char*)obj+36));
+        tile_log_string_set(*(void**)((char*)obj+24),"PSM.m_joinedTargetChannels");
+        return;}
+    if(depth<=0||std::strchr(cn,'`'))return;
+    for(void* walk=k;walk;walk=fn<void*(*)(void*)>(ClassParent)(walk)){
+        void* iter=nullptr;
+        for(int i=0;i<64;++i){
+            void* f=fn<void*(*)(void*,void**)>(ClassFields)(walk,&iter);if(!f)break;
+            void* ft=fn<void*(*)(void*)>(FieldType)(f);
+            const char* fname=fn<const char*(*)(void*)>(FieldName)(f);
+            const char* ftype=ft?fn<const char*(*)(void*)>(TypeName)(ft):nullptr;
+            unsigned off=fn<unsigned(*)(void*)>(FieldOffset)(f);
+            int kind=ft?fn<int(*)(void*)>(TypeKind)(ft):-1;
+            if(off<16||off>4096)continue;                        // static fields report small offsets
+            if(kind!=18&&kind!=21&&kind!=28)continue;            // reference-typed fields only
+            if(ftype&&(!std::strncmp(ftype,"System.Nullable",15)||std::strstr(ftype,"KeyValuePair")))continue;
+            void* child=*(void**)((char*)obj+off);
+            if(!child)continue;
+            char np[192];std::snprintf(np,sizeof np,"%s.%s",path,fname?fname:"?");
+            tile_graph(child,np,depth-1,budget);}}
+}
+void tile_observe(void* inst,const char* label){
+    note("TILE obs %s begin",label);
+    void* dict=*(void**)((char*)inst+16);
+    void* dclass=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
+    void* mitem=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Item",1):nullptr;
+    static const char* const keys[]={"voiceChatChannelEvent","voiceChatDaemonEvent"};
+    for(const char* kn:keys){
+        void* key=fn<void*(*)(void*,const char*)>(StringNew)(domain,kn);
+        void* a[1]={key};void* ex=nullptr;
+        void* h=mitem?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mitem,dict,a,&ex):nullptr;
+        if(!h){note("TILE obs %s: no handler",kn);continue;}
+        void* mt=nullptr;
+        for(void* w=fn<void*(*)(void*)>(ObjectClass)(h);w&&!mt;w=fn<void*(*)(void*)>(ClassParent)(w))
+            mt=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"get_Target",0);
+        ex=nullptr;
+        void* tgt=mt?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mt,h,nullptr,&ex):nullptr;
+        note("TILE obs %s handler=%p target=%p ex=%p",kn,h,tgt,ex);
+        int budget=120;char p[96];std::snprintf(p,sizeof p,"%s.target",kn);
+        tile_graph(tgt,p,4,budget);}
+    note("TILE obs %s end",label);
+}
 // Mode::TileDiscord (lab): forges a Newtonsoft JObject from a JSON string (read from tile.json on disk, or a
 // safe default) and dispatches it through VoiceChatModule's own voiceChatModuleEventHandlerDic, as if the
 // native voice-chat daemon had raised the event itself. The event name is read from tile-event.txt (default
@@ -1637,6 +1723,7 @@ State run_tile_discord(){
     void* jobj=mconv?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mconv,inst,cargs,&ex):nullptr;
     note("TILE ConvertJsonStringToJObject -> %p ex=%p",jobj,ex);
     if(!jobj){fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    tile_observe(inst,"before");
     void* dict=*(void**)((char*)inst+16);
     void* dclass=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
     void* mitem=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Item",1):nullptr;
@@ -1653,6 +1740,8 @@ State run_tile_discord(){
     ex=nullptr;
     fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minvoke,handler,vargs,&ex);
     note("TILE handler.Invoke done ex=%p",ex);
+    usleep(1000000);
+    tile_observe(inst,"after");
     if(ex){
         // Diagnostic: print Exception.ToString() (type, message, first stack lines), split in 200-char lines.
         void* eclass=fn<void*(*)(void*)>(ObjectClass)(ex);
