@@ -1719,6 +1719,26 @@ State run_tile_discord(){
             void* k=rn?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,e.ns,e.name):nullptr;
             note("TILE RN class %s.%s=%p",e.ns,e.name,k);
             if(k){probe_fields(k,e.name);probe_methods(k,e.name);describe_properties(k,e.name);}}
+        // Native event struct types of the RN module: tells whether the IntPtr handed to _OnVoiceChat*Event is text or a struct.
+        static const char* const evts[]={"SceVoiceChatChannelEvent","SceVoiceChatMemberEvent","SceVoiceChatVoiceEvent",
+            "SceVoiceChatDaemonEvent","SceVoiceChatChannelId","SceVoiceChatMemberAddressData"};
+        static const char* const evns[]={"ReactNative.Modules.ShellUI.VoiceChat.IpcTypes","ReactNative.Modules.ShellUI.VoiceChat"};
+        for(const char* en:evts){
+            void* k=nullptr;const char* used="";
+            for(const char* ns:evns){k=rn?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,ns,en):nullptr;if(k){used=ns;break;}}
+            note("TILE RN evtclass %s=%p ns=%s",en,k,used);
+            if(k)probe_fields(k,en);}
+        // Find the live RN VoiceChatModule instance by walking GC handle ids (read-only: get_target on each id).
+        void* rnk=rn?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,"ReactNative.Modules.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
+        void* rninst=nullptr;
+        for(std::uint32_t h=1;rnk&&h<(1u<<20)&&!rninst;++h){
+            void* o=fn<void*(*)(std::uint32_t)>(GcTarget)(h);
+            if(o&&fn<void*(*)(void*)>(ObjectClass)(o)==rnk){rninst=o;note("TILE RN instance=%p gchandle=%u",o,unsigned(h));}}
+        if(!rninst)note("TILE RN instance not found (class=%p)",rnk);
+        else{
+            note("TILE RN _emittable=%d",int(*((unsigned char*)rninst+48)));
+            static const char* const gcn[]={"daemon","accessibility","channel","member","rangedMember","voice","screenShare","sharePlay","partySessionList","partySession","partyHistory"};
+            for(int i=0;i<11;++i)note("TILE RN gcContext.%s=%llx",gcn[i],(unsigned long long)*(std::uint64_t*)((char*)rninst+56+8*i));}
     }
     void* img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.VoiceChat.dll");
     void* vcm=img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img,"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
