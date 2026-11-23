@@ -1442,25 +1442,25 @@ State run_scene_probe(){
     note("PROBE image Sce.Vsh.ShellUI.VoiceChat.dll=%p",img_voice);
     if(img_voice){
         struct Ent{const char* ns;const char* name;};
-        // Probe v2: adds the four types v1 dump flagged as missing (Session, EventHeader, the two delegate types),
-        // plus a few close-by Session subtypes the bridge layer may expose. v1 confirmed the Common.* namespace is
-        // empty, so it is no longer re-checked. Still metadata-only; no Mono method is invoked here.
+        // Probe v3: v2 showed Session is the Go Live streamer record, not a voice-chat participant. The participant
+        // data for the tile with pseudos and mic state goes through the CHANNEL path (_OnVoiceChatChannelEvent and
+        // ConvertChannelEventDataToJObject). v3 walks that path: ChannelEvent/ChannelEventData, their likely member
+        // types, and MemberAddress (Session.streamer references it). Still metadata-only; no Mono method invoked.
         static const Ent entries[]={
             {"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"},
-            {"Sce.Vsh.ShellUI.VoiceChat","SessionEventData"},
-            {"Sce.Vsh.ShellUI.VoiceChat","SessionEvent"},
+            // Channel path — the voice-chat participants tile.
+            {"Sce.Vsh.ShellUI.VoiceChat","ChannelEvent"},
+            {"Sce.Vsh.ShellUI.VoiceChat","ChannelEventData"},
+            {"Sce.Vsh.ShellUI.VoiceChat","Channel"},
+            {"Sce.Vsh.ShellUI.VoiceChat","ChannelMember"},
+            {"Sce.Vsh.ShellUI.VoiceChat","ChannelParticipant"},
+            {"Sce.Vsh.ShellUI.VoiceChat","ChannelUser"},
+            {"Sce.Vsh.ShellUI.VoiceChat","ChannelState"},
+            {"Sce.Vsh.ShellUI.VoiceChat","ChannelInfo"},
+            {"Sce.Vsh.ShellUI.VoiceChat","MemberAddress"},
+            // Known types kept as a cross-check between probe runs.
             {"Sce.Vsh.ShellUI.VoiceChat","Session"},
-            {"Sce.Vsh.ShellUI.VoiceChat","EventHeader"},
-            {"Sce.Vsh.ShellUI.VoiceChat.IpcTypes","VoiceChatModuleEventHandler"},
-            {"Sce.Vsh.ShellUI.VoiceChat","StreamStateChangedHandler"},
-            {"Sce.Vsh.ShellUI.VoiceChat","PartyStatusMonitor"},
-            {"Sce.Vsh.ShellUI.VoiceChat","StreamStateMonitor"},
-            {"Sce.Vsh.ShellUI.VoiceChat","ForegroundUserMonitor"},
-            // Likely member types the Session carries; harmless if absent (the probe just logs class=NULL).
-            {"Sce.Vsh.ShellUI.VoiceChat","Member"},
-            {"Sce.Vsh.ShellUI.VoiceChat","Participant"},
-            {"Sce.Vsh.ShellUI.VoiceChat","SessionMember"},
-            {"Sce.Vsh.ShellUI.VoiceChat","User"}};
+            {"Sce.Vsh.ShellUI.VoiceChat","EventHeader"}};
         for(const auto& e:entries){
             void* k=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img_voice,e.ns,e.name);
             note("PROBE class %s.%s=%p",e.ns,e.name,k);
