@@ -85,8 +85,11 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   red since 45c8b78 for that reason).
 - Settings > About > Source shows `github.com/Booskazed/ps5-discord`.
 - In-game overlay: `overlay/src/core/parent.cpp` allows firmware 13.60 next to 13.00 (an explicit list;
-  every other refusal and the Mono signature checks are unchanged). Colours, button bits, fonts and
-  labels are still unchecked on 13.60.
+  every other refusal and the Mono signature checks are unchanged). The visual overlay still does
+  not load on 13.60: the hook on `Application.Update` refuses (`REFUSED Update alignment,
+  permissions or relocatable prologue`; the target starts with a 6-byte JIT jump stub), so the app
+  reports an error and "Not loaded". The injection into SceShellUI itself works, and carries the
+  audio worker below.
 - Voice while a game is in front, over a wireless controller (side-by-side `PPSA99073` build only;
   measured on firmware 13.60). The console ends the app when a game starts (`[SceLncService]
   KillApp()` in the kernel log; it does not suspend it) while the core keeps the call, and the sound
