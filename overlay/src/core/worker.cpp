@@ -1765,6 +1765,7 @@ void tile_log_tostring(void* o,const char* label){
         line[w++]=(c>=0x20&&c<0x7f)?char(c):'?';}
     if(w){line[w]='\0';note("TILE RN %s: %s",label,line);}
 }
+void* tile_find_method(void* klass,const char* name,int count,const char* first_param);
 // Managed path (no native struct, no raw pointer): ConvertJsonStringToJObject(string) is the module's own text->JObject
 // helper (the native Convert* methods call it with the struct's dataJsonString; 10 guessed native layouts all failed, and
 // the method bodies are not readable here: the image carries precompiled code with 1-byte IL stubs). The module also has
@@ -1781,13 +1782,25 @@ void tile_rn_event(void* inst,void* rnk,const char* json,const char* evt_name,bo
     if(ex)tile_log_tostring(ex,"convert exception");
     if(!emit){note("TILE RN emit skipped (no tile-emit marker)");return;}
     if(!jo){note("TILE RN emit refused: no JObject");return;}
-    void* mu=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"onUserDataEvent",3);
-    int uid=514672008;                                   // the console profile's user id (m_userId seen on PartyStatusMonitor)
-    void* name=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
-    void* a3[3]={&uid,name,jo};
+    // The module's own way to reach JavaScript: its base class gives get_Context() (ReactContext), and the framework helper
+    // ReactNative.Vsh.Common.EventEmitterUtility.emitDeviceEvent(ReactContext, string, object) emits a device event. The JS
+    // event names are literals of the shell assembly (voiceChatChannelEvent, voiceChatDaemonEvent, ..., partySessionEvent
+    // VshNMVoiceChat, ...). No native struct, no raw pointer: only managed objects.
+    void* mctx=nullptr;
+    for(void* w=fn<void*(*)(void*)>(ObjectClass)(inst);w&&!mctx;w=fn<void*(*)(void*)>(ClassParent)(w))
+        mctx=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"get_Context",0);
     ex=nullptr;
-    if(mu)fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mu,inst,a3,&ex);
-    note("TILE RN onUserDataEvent(%d,\"%s\",jobject) invoked (method %p) ex=%p",uid,evt_name,mu,ex);
+    void* ctx=mctx?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mctx,inst,nullptr,&ex):nullptr;
+    void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
+    void* eu=cimg?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(cimg,"ReactNative.Vsh.Common","EventEmitterUtility"):nullptr;
+    void* me=eu?tile_find_method(eu,"emitDeviceEvent",3,"ReactNative.Bridge.ReactContext"):nullptr;
+    note("TILE RN context=%p (get_Context %p ex=%p) EventEmitterUtility=%p emitDeviceEvent=%p",ctx,mctx,ex,eu,me);
+    if(!ctx||!me){note("TILE RN emit refused: no context or emitter");return;}
+    void* name=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
+    void* a3[3]={ctx,name,jo};
+    ex=nullptr;
+    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(me,nullptr,a3,&ex);
+    note("TILE RN emitDeviceEvent(ctx,\"%s\",jobject) invoked ex=%p",evt_name,ex);
     if(ex)tile_log_tostring(ex,"emit exception");
 }
 void* tile_find_method(void* klass,const char* name,int count,const char* first_param){
@@ -1809,7 +1822,7 @@ void* tile_find_method(void* klass,const char* name,int count,const char* first_
 // Marshal.StructureToPtr writes it into unmanaged memory exactly as the module's own marshalling expects, the pure
 // Convert<Kind>EventDataToJObject verifies it (logged), and only with `emit` the module's own _OnVoiceChat<Kind>Event is
 // invoked on that pointer (marker file, one-shot). Never reads or writes memory we did not allocate through Marshal.
-void tile_rn_native(void* inst,void* rnk,void* rn,const char* json,const char* evt_name,bool emit){
+[[maybe_unused]] void tile_rn_native(void* inst,void* rnk,void* rn,const char* json,const char* evt_name,bool emit){
     if(!inst||!rnk||!rn)return;
     const char* p=std::strstr(evt_name,"voiceChat");
     if(!p){note("TILE NATIVE: unusable event name");return;}
@@ -2033,7 +2046,8 @@ State run_tile_discord(){
                         if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);nat_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;
                             std::remove(pth);}}}
                     if(nat_index>=ninst)nat_index=ninst-1;
-                    if(inst_rn)tile_rn_native(nat_index>=0?insts[nat_index]:inst_rn,rnk,rn,json_cstr,evt_name,nat_index>=0);}
+                    // DISABLED: Marshal.StructureToPtr on the managed struct crashed ShellUI (run 12, 2026-11-24 00:19).
+                    (void)nat_index;}
                 break;}
         }
     }
