@@ -1442,15 +1442,25 @@ State run_scene_probe(){
     note("PROBE image Sce.Vsh.ShellUI.VoiceChat.dll=%p",img_voice);
     if(img_voice){
         struct Ent{const char* ns;const char* name;};
+        // Probe v2: adds the four types v1 dump flagged as missing (Session, EventHeader, the two delegate types),
+        // plus a few close-by Session subtypes the bridge layer may expose. v1 confirmed the Common.* namespace is
+        // empty, so it is no longer re-checked. Still metadata-only; no Mono method is invoked here.
         static const Ent entries[]={
             {"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"},
             {"Sce.Vsh.ShellUI.VoiceChat","SessionEventData"},
             {"Sce.Vsh.ShellUI.VoiceChat","SessionEvent"},
+            {"Sce.Vsh.ShellUI.VoiceChat","Session"},
+            {"Sce.Vsh.ShellUI.VoiceChat","EventHeader"},
+            {"Sce.Vsh.ShellUI.VoiceChat.IpcTypes","VoiceChatModuleEventHandler"},
+            {"Sce.Vsh.ShellUI.VoiceChat","StreamStateChangedHandler"},
             {"Sce.Vsh.ShellUI.VoiceChat","PartyStatusMonitor"},
-            {"Sce.Vsh.ShellUI.VoiceChat.Common","SessionEventData"},
-            {"Sce.Vsh.ShellUI.VoiceChat.Common","SessionEvent"},
             {"Sce.Vsh.ShellUI.VoiceChat","StreamStateMonitor"},
-            {"Sce.Vsh.ShellUI.VoiceChat","ForegroundUserMonitor"}};
+            {"Sce.Vsh.ShellUI.VoiceChat","ForegroundUserMonitor"},
+            // Likely member types the Session carries; harmless if absent (the probe just logs class=NULL).
+            {"Sce.Vsh.ShellUI.VoiceChat","Member"},
+            {"Sce.Vsh.ShellUI.VoiceChat","Participant"},
+            {"Sce.Vsh.ShellUI.VoiceChat","SessionMember"},
+            {"Sce.Vsh.ShellUI.VoiceChat","User"}};
         for(const auto& e:entries){
             void* k=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img_voice,e.ns,e.name);
             note("PROBE class %s.%s=%p",e.ns,e.name,k);
