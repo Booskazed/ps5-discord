@@ -1653,6 +1653,25 @@ State run_tile_discord(){
     ex=nullptr;
     fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minvoke,handler,vargs,&ex);
     note("TILE handler.Invoke done ex=%p",ex);
+    if(ex){
+        // Diagnostic: print Exception.ToString() (type, message, first stack lines), split in 200-char lines.
+        void* eclass=fn<void*(*)(void*)>(ObjectClass)(ex);
+        void* mts=eclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(eclass,"ToString",0):nullptr;
+        void* ex2=nullptr;
+        void* s=mts?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mts,ex,nullptr,&ex2):nullptr;
+        note("TILE exception ToString=%p class=%p ex2=%p",s,eclass,ex2);
+        if(s){
+            int slen=*(int*)((char*)s+16);
+            const unsigned short* su=(const unsigned short*)((char*)s+20);
+            if(slen>1800)slen=1800;
+            char line[208];int w=0;
+            for(int j=0;j<slen;++j){
+                unsigned short c=su[j];
+                if(c=='\n'||c=='\r'||w>=200){if(w){line[w]='\0';note("TILE exc: %s",line);w=0;}if(c=='\n'||c=='\r')continue;}
+                line[w++]=(c>=0x20&&c<0x7f)?char(c):'?';}
+            if(w){line[w]='\0';note("TILE exc: %s",line);}
+        }
+    }
     // Idle so the user can see the tile and the stop file can cut us short.
     const std::uint64_t deadline=request.deadline_ms>6000?request.deadline_ms-6000:now_ms()+20000;
     while(now_ms()<deadline){
