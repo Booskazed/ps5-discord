@@ -1765,11 +1765,36 @@ void tile_log_tostring(void* o,const char* label){
         line[w++]=(c>=0x20&&c<0x7f)?char(c):'?';}
     if(w){line[w]='\0';note("TILE RN %s: %s",label,line);}
 }
+// Managed path (no native struct, no raw pointer): ConvertJsonStringToJObject(string) is the module's own text->JObject
+// helper (the native Convert* methods call it with the struct's dataJsonString; 10 guessed native layouts all failed, and
+// the method bodies are not readable here: the image carries precompiled code with 1-byte IL stubs). The module also has
+// onUserDataEvent(int, string, JObject). Conversion alone is always done and logged; the single onUserDataEvent call
+// happens only if the marker file tile-emit exists, and the marker is deleted right away so it cannot repeat.
+void tile_rn_event(void* inst,void* rnk,const char* json,const char* evt_name,bool emit){
+    if(!rnk||!inst)return;
+    void* m=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"ConvertJsonStringToJObject",1);
+    void* js=fn<void*(*)(void*,const char*)>(StringNew)(domain,json);
+    void* a1[1]={js};void* ex=nullptr;
+    void* jo=m?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m,inst,a1,&ex):nullptr;
+    note("TILE RN ConvertJsonStringToJObject -> %p ex=%p",jo,ex);
+    if(jo)tile_log_tostring(jo,"converted");
+    if(ex)tile_log_tostring(ex,"convert exception");
+    if(!emit){note("TILE RN emit skipped (no tile-emit marker)");return;}
+    if(!jo){note("TILE RN emit refused: no JObject");return;}
+    void* mu=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"onUserDataEvent",3);
+    int uid=514672008;                                   // the console profile's user id (m_userId seen on PartyStatusMonitor)
+    void* name=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
+    void* a3[3]={&uid,name,jo};
+    ex=nullptr;
+    if(mu)fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mu,inst,a3,&ex);
+    note("TILE RN onUserDataEvent(%d,\"%s\",jobject) invoked (method %p) ex=%p",uid,evt_name,mu,ex);
+    if(ex)tile_log_tostring(ex,"emit exception");
+}
 // Native event buffer for the RN VoiceChatModule: its event structs hold one field, `string dataJsonString` (metadata of
 // IpcTypes.SceVoiceChat*Event), so the IntPtr is taken to point at {char* json}. Convert*EventDataToJObject is a pure
 // conversion (logged); _OnVoiceChat*Event emits to the Control Center's JavaScript and only runs when `emit` is set
 // (marker file tile-emit) and the conversion produced an object.
-void tile_rn_event(void* inst,void* rnk,const char* json,const char* evt_name,bool emit){
+[[maybe_unused]] void tile_rn_event_native(void* inst,void* rnk,const char* json,const char* evt_name,bool emit){
     const char* p=std::strstr(evt_name,"voiceChat");
     if(!p||!rnk||!inst)return;
     char kind[32]{};{const char* a=p+9;const char* e=std::strstr(a,"Event");std::size_t n=e?std::size_t(e-a):std::strlen(a);if(n>=sizeof kind)n=sizeof kind-1;std::memcpy(kind,a,n);}
@@ -1916,7 +1941,8 @@ State run_tile_discord(){
                              int(*((unsigned char*)insts[ii]+48)),nz,(unsigned long long)*(std::uint64_t*)((char*)insts[ii]+72));}
                     int emit_index=-1;
                     {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit")){FILE* mf=std::fopen(pth,"rb");
-                        if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);emit_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;}}}
+                        if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);emit_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;
+                            std::remove(pth);}}}   // one-shot: the marker is consumed here
                     if(emit_index>=ninst)emit_index=ninst-1;
                     if(inst_rn)tile_rn_event(emit_index>=0?insts[emit_index]:inst_rn,rnk,json_cstr,evt_name,emit_index>=0);}
                 break;}
