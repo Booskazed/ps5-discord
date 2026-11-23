@@ -2043,16 +2043,15 @@ State run_tile_discord(){
                              int(*((unsigned char*)insts[ii]+48)),nz,(unsigned long long)*(std::uint64_t*)((char*)insts[ii]+72));}
                     // Which instance belongs to the Control Center? Each RN app has its own module + ReactContext: dump the
                     // contexts' strings (read-only reference walk) so the app/bundle identity shows up.
-                    for(int ii=0;ii<ninst;++ii){
-                        void* cx=tile_get_context(insts[ii]);
-                        char cp[32];std::snprintf(cp,sizeof cp,"ctx[%d]",ii);
-                        int cb=80;tile_dump(cx,cp,4,cb,true);}
-                    int emit_index=-1;
+                    // (the context graph holds no identity strings: dumped at depth 4 in run 15, nothing found)
+                    int emit_index=-1;bool emit_all=false;
                     {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit")){FILE* mf=std::fopen(pth,"rb");
                         if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);emit_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;
+                            if(got&&d[0]=='a')emit_all=true;     // marker "a": every instance gets the event once (which one is the Control Center is unknown)
                             std::remove(pth);}}}   // one-shot: the marker is consumed here
                     if(emit_index>=ninst)emit_index=ninst-1;
-                    if(inst_rn)tile_rn_event(emit_index>=0?insts[emit_index]:inst_rn,rnk,json_cstr,evt_name,emit_index>=0);
+                    if(emit_all&&inst_rn){for(int ii=0;ii<ninst;++ii){note("TILE RN emitting to instance %d",ii);tile_rn_event(insts[ii],rnk,json_cstr,evt_name,true);}}
+                    else if(inst_rn)tile_rn_event(emit_index>=0?insts[emit_index]:inst_rn,rnk,json_cstr,evt_name,emit_index>=0);
                     // Ground-truth native path (verification always; the real call only with the one-shot marker tile-emit-native).
                     int nat_index=-1;
                     {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit-native")){FILE* mf=std::fopen(pth,"rb");
