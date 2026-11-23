@@ -980,9 +980,13 @@ State run_audio_direct(char key[64]){
         const std::uint64_t now=now_ms();
         if(mic>=0){ // blocks for one 5 ms grain: this loop's clock while the probe runs
             const int rc=fn<AudioInInputCall>(AudioInInput)(mic,mic_grain);++mic_reads;
-            if(rc<0){++mic_errors;if(mic_errors<=5||mic_errors%200==0)note("AUDIOIN read #%llu rc=0x%08x",
-                static_cast<unsigned long long>(mic_reads),unsigned(rc));usleep(5000);}
-            else{
+            if(rc<0){
+                ++mic_errors;
+                if(mic_errors<=5||mic_errors%200==0){
+                    note("AUDIOIN read #%llu rc=0x%08x",static_cast<unsigned long long>(mic_reads),unsigned(rc));
+                }
+                usleep(5000);
+            } else {
                 for(int i=0;i<256;i++){const int a=mic_grain[i]<0?-int(mic_grain[i]):int(mic_grain[i]);
                     if(a>mic_peak)mic_peak=a;mic_sq+=double(mic_grain[i])*double(mic_grain[i]);}
                 mic_n+=256;
