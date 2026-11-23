@@ -27,6 +27,10 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // holding a game while it is over it: the game's app id, the "system UI is over you"
     // status (games that can pause, pause), and controller focus (Request::shell_app).
     RunningBigApp,SetImposeStatus,SetControllerFocus,
+    // Optional lab (0 when ShellUI has not loaded the module): the microphone from inside ShellUI
+    // (libSceAudioIn) and the foreground user id (libSceUserService), to measure whether a
+    // ShellUI-hosted mic survives a game taking AV focus after the console killed the app.
+    AudioInOpen,AudioInInput,AudioInClose,UserGetForegroundUser,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -40,7 +44,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "mono_field_get_name","mono_field_get_type","mono_field_get_offset","mono_class_get_properties","mono_property_get_name",
     "mono_class_get_methods","mono_method_get_name",
     "sceAudioOutInit","sceAudioOutOpen","sceAudioOutOutput","sceAudioOutClose",
-    "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus"};
+    "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus",
+    "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
 // AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose

@@ -302,6 +302,8 @@ static int64_t tap_pending_ms;
 static uint8_t tap_buf[OUT_CAP * OUT_FRAME_BYTES];
 static size_t tap_len;
 static unsigned st_tap_bytes;
+static unsigned st_tap_mic_bytes;
+static int64_t app_mic_ms; // when the app's own socket last delivered mic bytes (tap mic yields to it)
 
 // The external device (vau_ext_*). Its thread must never wait on the engine, which
 // holds mu through Opus and DAVE, so the two meet only in these rings under ext_mu.
@@ -540,6 +542,8 @@ static void read_mic(void)
     uint8_t buf[4096];
     for (int i = 0; i < 8 && audio_clients.current >= 0; i++) {
         ssize_t r = recv(audio_clients.current, buf, sizeof buf, MSG_DONTWAIT);
+        if (r > 0 && !audio_clients.usb)
+            app_mic_ms = now_ms();
         if (r > 0 && ext_owner && !audio_clients.usb) { // drain app mic, retaining sample alignment
             mic_skip = ((mic_carry >= 0 || mic_skip) + (int)(r & 1)) & 1;
             mic_carry = -1;
@@ -642,10 +646,18 @@ static void tap_service(void)
             }
         }
     }
-    if (tap_fd >= 0) { // the client never sends after its key: anything but "nothing yet" is a goodbye
-        char b[64];
+    if (tap_fd >= 0) {
+        // After its key the client may send its microphone (mono S16 LE 48 kHz), captured inside
+        // SceShellUI where it survives the console killing the app for a game. It counts only while
+        // the app is not delivering a mic itself, so the two sources never mix.
+        uint8_t b[2048];
         ssize_t r = recv(tap_fd, b, sizeof b, MSG_DONTWAIT);
-        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        if (r > 0) {
+            if (audio_clients.current < 0 || now_ms() - app_mic_ms > 300) {
+                mic_push(b, (size_t)r);
+                st_tap_mic_bytes += (unsigned)r;
+            }
+        } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
             LOG("voice audio: tap disconnected");
             tap_close(&tap_fd);
             tap_len = 0;
@@ -789,8 +801,8 @@ static void stats(int64_t now)
             "mic %u B, sent %u (seal failed %u)", st_rx, st_nopeer, st_nokey, st_open_fail, st_decoded, st_mixed,
             st_out_bytes, st_mic_bytes, st_sent, st_seal_fail);
     if (st_at && tap_fd >= 0)
-        LOG("voice audio: 5 s tap %u B", st_tap_bytes);
-    st_tap_bytes = 0;
+        LOG("voice audio: 5 s tap %u B out, mic %u B in", st_tap_bytes, st_tap_mic_bytes);
+    st_tap_bytes = st_tap_mic_bytes = 0;
     st_rx = st_nopeer = st_nokey = st_open_fail = st_decoded = st_mixed = st_out_bytes = st_mic_bytes = st_sent = 0;
     st_seal_fail = 0;
     st_at = now;

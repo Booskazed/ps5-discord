@@ -91,8 +91,12 @@ static int run(){
     if(kernel_dynlib_handle(r.pid,"libmonosgen-2.0.sprx",&mono)||!mono){
         if(kernel_dynlib_handle(r.pid,"libmonosgen-2.0.0.sprx",&mono)||!mono){note("REFUSED Mono module missing");return 1;}}
     if(kernel_dynlib_handle(r.pid,"libkernel_sys.sprx",&kernel)||!kernel){note("REFUSED kernel module missing");return 1;}
-    std::uint32_t web=0,libc=0,system=0,audioout=0;
+    std::uint32_t web=0,libc=0,system=0,audioout=0,audioin=0,userservice=0;
     (void)kernel_dynlib_handle(r.pid,"libkernel_web.sprx",&web);
+    // Lab (mic from ShellUI): absent from ShellUI's module list is a valid answer; logged, not fatal.
+    if(kernel_dynlib_handle(r.pid,"libSceAudioIn.sprx",&audioin)||!audioin){audioin=0;note("lab: libSceAudioIn is not loaded in ShellUI");}
+    else note("lab: libSceAudioIn handle %u",unsigned(audioin));
+    if(kernel_dynlib_handle(r.pid,"libSceUserService.sprx",&userservice)||!userservice){userservice=0;note("lab: libSceUserService is not loaded in ShellUI");}
     (void)kernel_dynlib_handle(r.pid,"libSceSystemService.sprx",&system);
     (void)kernel_dynlib_handle(r.pid,"libSceLibcInternal.sprx",&libc);
     // Required only for Mode::AudioTest, but resolved for every mode (cheap,
@@ -103,8 +107,11 @@ static int run(){
     for(unsigned i=0;i<FunctionCount;i++){
         std::uint64_t address_value=0;
         if(optional(i)){
-            if(system){address_value=kernel_dynlib_dlsym(r.pid,system,symbols[i]);
-                if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,system,nid);}}
+            // The mic and user-service lab functions live in their own modules, not in SystemService.
+            const std::uint32_t home=(i==AudioInOpen||i==AudioInInput||i==AudioInClose)?audioin:
+                                     (i==UserGetForegroundUser)?userservice:system;
+            if(home){address_value=kernel_dynlib_dlsym(r.pid,home,symbols[i]);
+                if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,home,nid);}}
             if(!address(address_value)){note("optional %s missing: the overlay cannot hold the game",symbols[i]);address_value=0;}
             r.functions[i]=address_value;continue;
         }

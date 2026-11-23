@@ -26,6 +26,10 @@ using AudioOutInitCall=int(*)();
 using AudioOutOpenCall=int(*)(int,int,int,unsigned int,unsigned int,unsigned int);
 using AudioOutOutputCall=int(*)(int,const void*);
 using AudioOutCloseCall=int(*)(int);
+using AudioInOpenCall=int(*)(int,int,int,unsigned int,unsigned int,unsigned int);
+using AudioInInputCall=int(*)(int,void*);
+using AudioInCloseCall=int(*)(int);
+using UserForegroundCall=int(*)(int*);
 constexpr int kind_void=1,kind_class=0x12,kind_valuetype=0x11;
 constexpr std::uint32_t bit_l3=0x4000,bit_r3=0x8000;
 // Hold Options: the game takes the press first (most open their pause menu), then the
@@ -930,6 +934,34 @@ State run_audio_direct(char key[64]){
     const int handle=open(0xff,0,0,256,48000,1);
     note("AUDIODIRECT open rc=0x%08x",unsigned(handle));
     if(handle<0){publish(State::Failed);return State::Failed;}
+    // LAB, opt-in by an empty marker file `mic-probe` next to worker.log (so the playback test stays
+    // unconfounded): open the microphone from inside ShellUI, same arguments as the app's own mic
+    // (type 0, 48 kHz, S16 mono, grain 256) and log its level once a second. Measures whether a
+    // ShellUI-hosted mic keeps delivering after the console kills the app for a game.
+    int mic=-1;std::uint64_t mic_reads=0,mic_errors=0,mic_sent=0;int mic_peak=0;double mic_sq=0;std::uint64_t mic_n=0;
+    {
+        char mp[256];FILE* marker=path(mp,sizeof mp,worker_dir,"mic-probe")?std::fopen(mp,"rb"):nullptr;
+        const bool want=marker!=nullptr;if(marker)std::fclose(marker);
+        if(want){
+            const bool have=request.functions[AudioInOpen]&&request.functions[AudioInInput]&&request.functions[AudioInClose];
+            note("AUDIOIN requested; functions %s",have?"resolved":"MISSING (libSceAudioIn not loaded in ShellUI?)");
+            if(have){
+                int user=-1;
+                if(request.functions[UserGetForegroundUser]){
+                    int u=-1;const int rc=fn<UserForegroundCall>(UserGetForegroundUser)(&u);
+                    note("AUDIOIN foreground user rc=0x%08x id=0x%08x",unsigned(rc),unsigned(u));
+                    if(rc==0)user=u;}
+                const int users[2]={user,0xff};
+                for(int u:users){
+                    if(u<0)continue;
+                    mic=fn<AudioInOpenCall>(AudioInOpen)(u,0,0,256,48000,1);
+                    note("AUDIOIN open user=0x%x rc=0x%08x",unsigned(u),unsigned(mic));
+                    if(mic>=0)break;
+                }
+            }
+        }
+    }
+    alignas(64) std::int16_t mic_grain[256];
     int fd=-1;std::uint64_t next_try=0,last_data=0,connects=0;
     std::uint8_t pending[8192];std::size_t pending_len=0;
     alignas(64) std::int16_t grain[256*2];
@@ -946,6 +978,28 @@ State run_audio_direct(char key[64]){
     };
     while(now_ms()<until){
         const std::uint64_t now=now_ms();
+        if(mic>=0){ // blocks for one 5 ms grain: this loop's clock while the probe runs
+            const int rc=fn<AudioInInputCall>(AudioInInput)(mic,mic_grain);++mic_reads;
+            if(rc<0){++mic_errors;if(mic_errors<=5||mic_errors%200==0)note("AUDIOIN read #%llu rc=0x%08x",
+                static_cast<unsigned long long>(mic_reads),unsigned(rc));usleep(5000);}
+            else{
+                for(int i=0;i<256;i++){const int a=mic_grain[i]<0?-int(mic_grain[i]):int(mic_grain[i]);
+                    if(a>mic_peak)mic_peak=a;mic_sq+=double(mic_grain[i])*double(mic_grain[i]);}
+                mic_n+=256;
+                // Forward the grain to the core over the same socket (the core only uses it while the app
+                // is not delivering its own mic). Best effort: never blocks, a lost grain is a 5 ms gap.
+                if(fd>=0){
+                    const ssize_t sent=send(fd,mic_grain,sizeof mic_grain,MSG_DONTWAIT);
+                    if(sent>0&&sent<ssize_t(sizeof mic_grain))note("AUDIOIN partial send %zd",sent);
+                    else if(sent>0)mic_sent+=std::uint64_t(sent);
+                }
+            }
+            if(mic_reads%200==0){
+                const double rms=mic_n?std::sqrt(mic_sq/double(mic_n)):0.0;
+                note("AUDIOIN reads=%llu errors=%llu peak=%d rms=%d sent=%llu",static_cast<unsigned long long>(mic_reads),
+                     static_cast<unsigned long long>(mic_errors),mic_peak,int(rms),static_cast<unsigned long long>(mic_sent));
+                mic_peak=0;mic_sq=0;mic_n=0;}
+        }
         if(fd<0){
             if(now>=next_try){
                 next_try=now+1000;
@@ -982,6 +1036,7 @@ State run_audio_direct(char key[64]){
         }
     }
     if(fd>=0)close(fd);
+    if(mic>=0)fn<AudioInCloseCall>(AudioInClose)(mic);
     output(handle,nullptr);close_out(handle);
     note("AUDIODIRECT done writes=%d errors=%d recv_bytes=%llu elapsed_ms=%llu",writes,errors,
          static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(now_ms()-began));
