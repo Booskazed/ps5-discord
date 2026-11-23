@@ -1579,11 +1579,97 @@ State run_scene_probe(){
     note("PROBE done");
     publish(State::Passed);return State::Passed;
 }
+// Mode::TileDiscord (lab): forges a Newtonsoft JObject from a JSON string (read from tile.json on disk, or a
+// safe default) and dispatches it through VoiceChatModule's own voiceChatModuleEventHandlerDic, as if the
+// native voice-chat daemon had raised the event itself. The event name is read from tile-event.txt (default
+// "voiceChatDaemonEvent"; the other valid one is "voiceChatChannelEvent"). The native Control Center tile
+// then renders with our strings. No hook, no IPMI call, no audio, no PSN: only managed reflection and one
+// Invoke on a handler the RN tile itself registered. Idles on probe.lock so it coexists with the audio relay.
+State run_tile_discord(){
+    publish(State::Observing);
+    note("TILE start pid=%d build=0x%016llx",int(getpid()),(unsigned long long)OVERLAY_BUILD);
+    static const char default_json[]=
+        "{\"header\":{\"type\":\"streamStarted\",\"userId\":1},"
+         "\"data\":{\"sessions\":[{\"streamer\":{\"accountId\":\"Discord\",\"deviceId\":0,\"platformType\":0,\"userId\":1},"
+         "\"meStreamState\":\"streaming\",\"titleId\":\"Discord\"}]}}";
+    char json_buf[4096]; int json_len=0;
+    {
+        char pth[256];
+        if(path(pth,sizeof pth,worker_dir,"tile.json")){
+            FILE* f=std::fopen(pth,"rb");
+            if(f){
+                long n=long(std::fread(json_buf,1,sizeof(json_buf)-1,f));
+                if(n<0)n=0; json_buf[n]='\0'; json_len=int(n);
+                std::fclose(f); note("TILE read tile.json (%d bytes)",json_len);
+            }
+        }
+    }
+    const char* json_cstr=json_len>0?json_buf:default_json;
+    char evt_name[64]="voiceChatDaemonEvent";
+    {
+        char pth[256];
+        if(path(pth,sizeof pth,worker_dir,"tile-event.txt")){
+            FILE* f=std::fopen(pth,"rb");
+            if(f){
+                long n=long(std::fread(evt_name,1,sizeof(evt_name)-1,f));
+                if(n<0)n=0; evt_name[n]='\0';
+                while(n>0&&(evt_name[n-1]=='\n'||evt_name[n-1]=='\r'||evt_name[n-1]==' '||evt_name[n-1]=='\t'))evt_name[--n]='\0';
+                std::fclose(f);
+            }
+        }
+    }
+    note("TILE event=%s json_len=%d",evt_name,int(std::strlen(json_cstr)));
+    domain=fn<void*(*)()>(RootDomain)();
+    if(!domain){note("TILE refused: Mono root domain missing");publish(State::Failed);return State::Failed;}
+    void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);
+    if(!thread){note("TILE refused: Mono thread attach");publish(State::Failed);return State::Failed;}
+    void* img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.VoiceChat.dll");
+    void* vcm=img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img,"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
+    void* mget=vcm?fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm,"GetInstance",0):nullptr;
+    void* ex=nullptr;
+    void* inst=mget?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mget,nullptr,nullptr,&ex):nullptr;
+    note("TILE VoiceChatModule inst=%p ex=%p",inst,ex);
+    if(!inst){fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    void* mconv=vcm?fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm,"ConvertJsonStringToJObject",1):nullptr;
+    void* mstr=fn<void*(*)(void*,const char*)>(StringNew)(domain,json_cstr);
+    void* cargs[1]={mstr};
+    ex=nullptr;
+    void* jobj=mconv?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mconv,inst,cargs,&ex):nullptr;
+    note("TILE ConvertJsonStringToJObject -> %p ex=%p",jobj,ex);
+    if(!jobj){fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    void* dict=*(void**)((char*)inst+16);
+    void* dclass=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
+    void* mitem=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Item",1):nullptr;
+    void* key=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
+    void* iargs[1]={key};
+    ex=nullptr;
+    void* handler=mitem?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mitem,dict,iargs,&ex):nullptr;
+    note("TILE handler for %s = %p ex=%p",evt_name,handler,ex);
+    if(!handler){fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    void* hclass=fn<void*(*)(void*)>(ObjectClass)(handler);
+    void* minvoke=hclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(hclass,"Invoke",2):nullptr;
+    void* key2=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
+    void* vargs[2]={key2,jobj};
+    ex=nullptr;
+    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minvoke,handler,vargs,&ex);
+    note("TILE handler.Invoke done ex=%p",ex);
+    // Idle so the user can see the tile and the stop file can cut us short.
+    const std::uint64_t deadline=request.deadline_ms>6000?request.deadline_ms-6000:now_ms()+20000;
+    while(now_ms()<deadline){
+        std::uint64_t stop=0;
+        if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+        publish(State::Observing);
+        usleep(500000);}
+    fn<void(*)(void*)>(ThreadDetach)(thread);
+    note("TILE done");
+    publish(State::Passed);return State::Passed;
+}
 State run(){
     if(request.mode==Mode::AudioTest)return run_audio_test();
     if(request.mode==Mode::AudioRelay)return run_audio_relay();
     if(request.mode==Mode::PartyProbe)return run_party_probe();
     if(request.mode==Mode::SceneProbe)return run_scene_probe();
+    if(request.mode==Mode::TileDiscord)return run_tile_discord();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
@@ -1663,7 +1749,7 @@ extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
     // The party probe (a lab tool) has its own lock: the audio worker holds worker.lock for hours, and a second
     // worker that does not get its lock returns without a word.
     Request peek;
-    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe);
+    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe||peek.mode==Mode::TileDiscord);
     char p[256];if(!path(p,sizeof p,worker_dir,probe?"probe.lock":"worker.lock"))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
     if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}
