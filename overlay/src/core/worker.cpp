@@ -1739,11 +1739,58 @@ void* tile_enum_callbacks(void* dict,void* rnk){
             if(mt){ex=nullptr;tgt=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mt,e,nullptr,&ex);}
             void* tk=tgt?fn<void*(*)(void*)>(ObjectClass)(tgt):nullptr;
             const char* tn=tk?fn<const char*(*)(void*)>(ClassNameGet)(tk):nullptr;
-            note("TILE cb %s[%d] %s=%p target=%s=%p",g,i,en_?en_:"?",e,tn?tn:"-",tgt);
+            if(tn||ek==rnk)note("TILE cb %s[%d] %s=%p target=%s=%p",g,i,en_?en_:"?",e,tn?tn:"-",tgt);
             if(rnk&&ek==rnk&&!found)found=e;
             if(rnk&&tk==rnk&&!found)found=tgt;}
     }
     return found;
+}
+void tile_log_tostring(void* o,const char* label){
+    void* k=o?fn<void*(*)(void*)>(ObjectClass)(o):nullptr;
+    void* mts=nullptr;
+    for(void* w=k;w&&!mts;w=fn<void*(*)(void*)>(ClassParent)(w))
+        mts=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"ToString",0);
+    void* ex2=nullptr;
+    void* s=mts?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mts,o,nullptr,&ex2):nullptr;
+    if(!s){note("TILE RN %s: no ToString (%p)",label,o);return;}
+    int slen=*(int*)((char*)s+16);const unsigned short* su=(const unsigned short*)((char*)s+20);
+    if(slen>900)slen=900;
+    char line[208];int w=0;
+    for(int j=0;j<slen;++j){
+        unsigned short c=su[j];
+        if(c=='\n'||c=='\r'||w>=200){if(w){line[w]='\0';note("TILE RN %s: %s",label,line);w=0;}if(c=='\n'||c=='\r')continue;}
+        line[w++]=(c>=0x20&&c<0x7f)?char(c):'?';}
+    if(w){line[w]='\0';note("TILE RN %s: %s",label,line);}
+}
+// Native event buffer for the RN VoiceChatModule: its event structs hold one field, `string dataJsonString` (metadata of
+// IpcTypes.SceVoiceChat*Event), so the IntPtr is taken to point at {char* json}. Convert*EventDataToJObject is a pure
+// conversion (logged); _OnVoiceChat*Event emits to the Control Center's JavaScript and only runs when `emit` is set
+// (marker file tile-emit) and the conversion produced an object.
+void tile_rn_event(void* inst,void* rnk,const char* json,const char* evt_name,bool emit){
+    const char* p=std::strstr(evt_name,"voiceChat");
+    if(!p||!rnk||!inst)return;
+    char kind[32]{};{const char* a=p+9;const char* e=std::strstr(a,"Event");std::size_t n=e?std::size_t(e-a):std::strlen(a);if(n>=sizeof kind)n=sizeof kind-1;std::memcpy(kind,a,n);}
+    alignas(16) static char buf[8192];
+    std::size_t n=std::strlen(json);if(n>8000)n=8000;
+    std::memset(buf,0,sizeof buf);
+    std::memcpy(buf+16,json,n);
+    *(void**)buf=buf+16;
+    void* argp=buf;void* args[1]={&argp};
+    char mn[96];std::snprintf(mn,sizeof mn,"Convert%sEventDataToJObject",kind);
+    void* m=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,mn,1);
+    void* ex=nullptr;
+    void* jo=m?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m,inst,args,&ex):nullptr;
+    note("TILE RN %s -> %p ex=%p (method %p)",mn,jo,ex,m);
+    if(jo)tile_log_tostring(jo,"converted");
+    if(ex)tile_log_tostring(ex,"convert exception");
+    if(!emit){note("TILE RN emit skipped (no tile-emit marker)");return;}
+    if(!jo){note("TILE RN emit refused: conversion gave no object");return;}
+    std::snprintf(mn,sizeof mn,"_OnVoiceChat%sEvent",kind);
+    void* m2=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,mn,1);
+    ex=nullptr;
+    if(m2)fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m2,inst,args,&ex);
+    note("TILE RN %s invoked (method %p) ex=%p",mn,m2,ex);
+    if(ex)tile_log_tostring(ex,"emit exception");
 }
 // Mode::TileDiscord (lab): forges a Newtonsoft JObject from a JSON string (read from tile.json on disk, or a
 // safe default) and dispatches it through VoiceChatModule's own voiceChatModuleEventHandlerDic, as if the
@@ -1842,7 +1889,10 @@ State run_tile_discord(){
                     if(inst_rn){
                         note("TILE RN _emittable=%d",int(*((unsigned char*)inst_rn+48)));
                         static const char* const gcn[]={"daemon","accessibility","channel","member","rangedMember","voice","screenShare","sharePlay","partySessionList","partySession","partyHistory"};
-                        for(int gi=0;gi<11;++gi)note("TILE RN gcContext.%s=%llx",gcn[gi],(unsigned long long)*(std::uint64_t*)((char*)inst_rn+56+8*gi));}}
+                        for(int gi=0;gi<11;++gi)note("TILE RN gcContext.%s=%llx",gcn[gi],(unsigned long long)*(std::uint64_t*)((char*)inst_rn+56+8*gi));
+                        bool emit=false;
+                        {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit")){FILE* mf=std::fopen(pth,"rb");if(mf){emit=true;std::fclose(mf);}}}
+                        tile_rn_event(inst_rn,rnk,json_cstr,evt_name,emit);}}
                 break;}
         }
     }
