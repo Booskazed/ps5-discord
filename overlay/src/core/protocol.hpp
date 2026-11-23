@@ -60,8 +60,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
 // inside ShellUI. AudioRelay plays real voice PCM piped from the app
 // (platform/ps5/audio_relay.hpp) instead of AudioTest's generated tone, for
 // as long as that connection stays up (minutes, not seconds).
-enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7,PartyProbe=8};
-inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay||m==Mode::PartyProbe;}
+enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7,PartyProbe=8,SceneProbe=9};
+inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay||m==Mode::PartyProbe||m==Mode::SceneProbe;}
 inline bool draws(Mode m){return m==Mode::Widget||m==Mode::Service;}
 // Managed Sce.PlayStation.Core.Input.GamePadData layout (value type, 36 bytes).
 struct PadData {
@@ -105,7 +105,8 @@ inline bool valid(const Request& r,int pid,std::uint64_t build,std::uint64_t epo
     // AudioRelay runs for as long as the app stays connected (minutes), so its
     // deadline window is wider than every other mode's.
     // PartyProbe (lab) may hold a voice-chat registration for a few minutes so someone can look at the tile.
-    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:r.mode==Mode::PartyProbe?650000:120000;
+    // SceneProbe (lab) walks the Mono metadata of the Control Center voice tile types; a wide window keeps the worker alive for post-run introspection.
+    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:(r.mode==Mode::PartyProbe||r.mode==Mode::SceneProbe)?650000:120000;
     if(r.signature!=magic||r.protocol!=version||r.size!=sizeof r||r.pid!=pid||r.build!=build||r.epoch!=epoch||!r.epoch||!r.token||
        !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>max_window)return false;
     for(unsigned i=0;i<FunctionCount;i++)if(!address(r.functions[i])&&!(optional(i)&&!r.functions[i]))return false;

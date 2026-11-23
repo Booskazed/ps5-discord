@@ -16,7 +16,7 @@ LAB_FLAGS := $(filter-out -DOVERLAY_BUILD=%,$(FLAGS)) -DOVERLAY_BUILD=0x$(LAB_BU
 VENDOR := vendor/shellui-loader
 OBJECTS := build/pt.o build/loader.o build/injector.o build/remote-call.o build/blob.o
 .PHONY: all test inspect clean preview pill-lab lab-preview
-all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf build/overlay-partyprobe.elf inspect
+all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf build/overlay-partyprobe.elf build/overlay-sceneprobe.elf inspect
 # The build id is baked into both halves (worker and loader): any change to it rebuilds both,
 # or the loader's request carries an id the embedded worker refuses.
 build/overlay-worker.elf: $(HASH_SOURCES) Makefile
@@ -85,6 +85,12 @@ build/parent-partyprobe.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOUR
 	@mkdir -p build
 	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=8 -c $< -o $@
 build/overlay-partyprobe.elf: build/parent-partyprobe.o $(OBJECTS)
+	$(CXX_PS5) $(FLAGS) $^ -o $@
+# Lab only (never packaged): read-only Mono reflection on the Control Center's voice tile types.
+build/parent-sceneprobe.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES) Makefile
+	@mkdir -p build
+	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=9 -c $< -o $@
+build/overlay-sceneprobe.elf: build/parent-sceneprobe.o $(OBJECTS)
 	$(CXX_PS5) $(FLAGS) $^ -o $@
 # Standalone lab: explicit opt-in, never linked into the app package or normal blobs.
 pill-lab: build/pill-lab.elf

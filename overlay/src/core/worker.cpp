@@ -1398,10 +1398,84 @@ State run_party_probe(){
     const State result=problems==0?State::Passed:State::Failed;
     publish(result);return result;
 }
+// Mode::SceneProbe (lab, read-only Mono reflection, no hooking, no IPMI, no audio): walks the .NET metadata of the
+// Control Center's voice tile types (Sce.Vsh.ShellUI.VoiceChat.dll) and dumps their fields, methods and properties
+// to worker.log so a later run can forge a SessionEventData and invoke OnDaemonEvent to raise the native tile with
+// our own content. Nothing is called that touches the party service or any other system daemon; only the managed
+// classes already present in ShellUI are introspected. If the assembly is not loaded in ShellUI, AssemblyOpen reads
+// it off disk and returns an image that is as introspectable as the running one for metadata purposes.
+void probe_fields(void* klass,const char* cls){
+    if(!klass){note("PROBE fields %s: class is null",cls);return;}
+    void* iter=nullptr;
+    for(int i=0;i<256;++i){
+        void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)break;
+        void* ft=fn<void*(*)(void*)>(FieldType)(f);
+        const char* fname=fn<const char*(*)(void*)>(FieldName)(f);
+        const char* ftype=ft?fn<const char*(*)(void*)>(TypeName)(ft):nullptr;
+        unsigned offset=fn<unsigned(*)(void*)>(FieldOffset)(f);
+        int kind=ft?fn<int(*)(void*)>(TypeKind)(ft):-1;
+        note("PROBE field %s.%s : %s (kind %d) @%u",cls,fname?fname:"?",ftype?ftype:"?",kind,offset);}
+}
+void probe_methods(void* klass,const char* cls){
+    if(!klass){note("PROBE methods %s: class is null",cls);return;}
+    void* iter=nullptr;
+    for(int i=0;i<256;++i){
+        void* m=fn<void*(*)(void*,void**)>(ClassMethods)(klass,&iter);if(!m)break;
+        const char* n=fn<const char*(*)(void*)>(MethodName)(m);
+        void* sig=fn<void*(*)(void*)>(MethodSignature)(m);
+        int params=sig?int(fn<unsigned(*)(void*)>(SignatureCount)(sig)):-1;
+        int is_inst=sig?fn<int(*)(void*)>(SignatureInstance)(sig):-1;
+        void* ret=sig?fn<void*(*)(void*)>(SignatureReturn)(sig):nullptr;
+        const char* rt=ret?fn<const char*(*)(void*)>(TypeName)(ret):nullptr;
+        note("PROBE method %s.%s params=%d instance=%d returns=%s",cls,n?n:"?",params,is_inst,rt?rt:"?");}
+}
+State run_scene_probe(){
+    publish(State::Observing);
+    note("PROBE start pid=%d shell_app=0x%x build=0x%016llx",int(getpid()),unsigned(request.shell_app),
+         (unsigned long long)OVERLAY_BUILD);
+    domain=fn<void*(*)()>(RootDomain)();
+    if(!domain){note("PROBE refused: Mono root domain missing");publish(State::Failed);return State::Failed;}
+    void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);
+    if(!thread){note("PROBE refused: Mono thread attach failed");publish(State::Failed);return State::Failed;}
+    // The assembly that owns VoiceChatModule, SessionEventData and the daemon event plumbing of the Control Center.
+    void* img_voice=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.VoiceChat.dll");
+    note("PROBE image Sce.Vsh.ShellUI.VoiceChat.dll=%p",img_voice);
+    if(img_voice){
+        struct Ent{const char* ns;const char* name;};
+        static const Ent entries[]={
+            {"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"},
+            {"Sce.Vsh.ShellUI.VoiceChat","SessionEventData"},
+            {"Sce.Vsh.ShellUI.VoiceChat","SessionEvent"},
+            {"Sce.Vsh.ShellUI.VoiceChat","PartyStatusMonitor"},
+            {"Sce.Vsh.ShellUI.VoiceChat.Common","SessionEventData"},
+            {"Sce.Vsh.ShellUI.VoiceChat.Common","SessionEvent"},
+            {"Sce.Vsh.ShellUI.VoiceChat","StreamStateMonitor"},
+            {"Sce.Vsh.ShellUI.VoiceChat","ForegroundUserMonitor"}};
+        for(const auto& e:entries){
+            void* k=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img_voice,e.ns,e.name);
+            note("PROBE class %s.%s=%p",e.ns,e.name,k);
+            if(k){probe_fields(k,e.name);probe_methods(k,e.name);describe_properties(k,e.name);}}}
+    // Context: a few neighbouring assemblies that back the Control Center voice tile's JavaScript bridge.
+    static const char* const neighbours[]={
+        "/system_ex/common_ex/lib/Sce.Vsh.PartyCommon.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.Np.SessionService.dll"};
+    for(const char* p:neighbours){void* im=image(p);note("PROBE image %s=%p",p,im);}
+    // Stay alive for a bounded window so the loader sees the Observing state and the stop file can cut us short.
+    const std::uint64_t deadline=request.deadline_ms>6000?request.deadline_ms-6000:now_ms()+20000;
+    while(now_ms()<deadline){
+        std::uint64_t stop=0;
+        if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+        publish(State::Observing);
+        usleep(500000);}
+    fn<void(*)(void*)>(ThreadDetach)(thread);
+    note("PROBE done");
+    publish(State::Passed);return State::Passed;
+}
 State run(){
     if(request.mode==Mode::AudioTest)return run_audio_test();
     if(request.mode==Mode::AudioRelay)return run_audio_relay();
     if(request.mode==Mode::PartyProbe)return run_party_probe();
+    if(request.mode==Mode::SceneProbe)return run_scene_probe();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
@@ -1481,7 +1555,7 @@ extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
     // The party probe (a lab tool) has its own lock: the audio worker holds worker.lock for hours, and a second
     // worker that does not get its lock returns without a word.
     Request peek;
-    const bool probe=read_file(worker_dir,"request.bin",peek)&&peek.mode==Mode::PartyProbe;
+    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe);
     char p[256];if(!path(p,sizeof p,worker_dir,probe?"probe.lock":"worker.lock"))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
     if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}
