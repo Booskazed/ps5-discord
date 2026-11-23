@@ -884,7 +884,7 @@ State run_audio_test(){
 // The core's key (src/core_key.h): 64 hex characters the core writes next to the app
 // (/app0 on the app side). Whether SceShellUI sees that real path is one of the things this
 // lab measures; the key is never logged, only whether and from where it was read.
-bool read_core_key(char out[64]){
+bool read_core_key(char out[64],bool verbose){
     static constexpr const char* paths[]={
         // ShellUI's /data is not the one the app and the core see (measured 2026-11-23: ENOENT on
         // /data/homebrew/PPSA99073/control.key), but its /user/data is the real partition (the
@@ -896,10 +896,10 @@ bool read_core_key(char out[64]){
     };
     for(const char* p:paths){
         FILE* f=std::fopen(p,"rb");
-        if(!f){note("AUDIODIRECT key %s open errno=%d",p,errno);continue;}
+        if(!f){if(verbose)note("AUDIODIRECT key %s open errno=%d",p,errno);continue;}
         char buf[65]{};const std::size_t got=std::fread(buf,1,64,f);
         const int extra=std::fgetc(f);std::fclose(f);
-        note("AUDIODIRECT key %s read %zu bytes trailing=%s",p,got,extra==EOF?"none":"some");
+        if(verbose)note("AUDIODIRECT key %s read %zu bytes trailing=%s",p,got,extra==EOF?"none":"some");
         if(got==64){std::memcpy(out,buf,64);return true;}
     }
     return false;
@@ -936,40 +936,40 @@ State run_audio_direct(char key[64]){
     const int handle=open(0xff,0,0,256,48000,1);
     note("AUDIODIRECT open rc=0x%08x",unsigned(handle));
     if(handle<0){publish(State::Failed);return State::Failed;}
-    // LAB, opt-in by an empty marker file `mic-probe` next to worker.log (so the playback test stays
-    // unconfounded): open the microphone from inside ShellUI, same arguments as the app's own mic
-    // (type 0, 48 kHz, S16 mono, grain 256) and log its level once a second. Measures whether a
-    // ShellUI-hosted mic keeps delivering after the console kills the app for a game.
-    int mic=-1;std::uint64_t mic_reads=0,mic_errors=0,mic_sent=0;int mic_peak=0;double mic_sq=0;std::uint64_t mic_n=0;
-    {
-        char mp[256];FILE* marker=path(mp,sizeof mp,worker_dir,"mic-probe")?std::fopen(mp,"rb"):nullptr;
-        const bool want=marker!=nullptr;if(marker)std::fclose(marker);
-        if(want){
-            const bool have=request.functions[AudioInOpen]&&request.functions[AudioInInput]&&request.functions[AudioInClose];
-            note("AUDIOIN requested; functions %s",have?"resolved":"MISSING (libSceAudioIn not loaded in ShellUI?)");
-            if(have){
-                int user=-1;
-                if(request.functions[UserGetForegroundUser]){
-                    int u=-1;const int rc=fn<UserForegroundCall>(UserGetForegroundUser)(&u);
-                    note("AUDIOIN foreground user rc=0x%08x id=0x%08x",unsigned(rc),unsigned(u));
-                    if(rc==0)user=u;}
-                const int users[2]={user,0xff};
-                for(int u:users){
-                    if(u<0)continue;
-                    mic=fn<AudioInOpenCall>(AudioInOpen)(u,0,0,256,48000,1);
-                    note("AUDIOIN open user=0x%x rc=0x%08x",unsigned(u),unsigned(mic));
-                    if(mic>=0)break;
-                }
-            }
+    // The microphone, captured inside ShellUI (type 0, 48 kHz, S16 mono, grain 256, the app's own arguments):
+    // the console kills the app when a game launches, and the app was the only thing that captured it. It is
+    // opened only while the core says the app is not delivering one (the marker file `tap-mic`, which the
+    // core creates and removes), so it never competes with the app's own capture in the call screen or the
+    // PS menu; an empty file `no-mic` next to worker.log turns the whole thing off.
+    int mic=-1;std::uint64_t mic_reads=0,mic_errors=0,mic_sent=0,next_mic_check=0,mic_open_fails=0;
+    int mic_peak=0;double mic_sq=0;std::uint64_t mic_n=0;
+    auto file_exists=[&](const char* name){
+        char fp[256];if(!path(fp,sizeof fp,worker_dir,name))return false;
+        FILE* ff=std::fopen(fp,"rb");if(!ff)return false;std::fclose(ff);return true;};
+    auto open_mic=[&]()->int{
+        if(!(request.functions[AudioInOpen]&&request.functions[AudioInInput]&&request.functions[AudioInClose])){
+            if(mic_open_fails++==0)note("AUDIOIN functions MISSING (libSceAudioIn not loaded in ShellUI?)");
+            return -1;}
+        int user=-1;
+        if(request.functions[UserGetForegroundUser]){
+            int u=-1;const int rc=fn<UserForegroundCall>(UserGetForegroundUser)(&u);
+            if(rc==0)user=u;}
+        const int users[2]={user,0xff};
+        for(int u:users){
+            if(u<0)continue;
+            const int h=fn<AudioInOpenCall>(AudioInOpen)(u,0,0,256,48000,1);
+            if(h>=0){note("AUDIOIN open user=0x%x handle=0x%x",unsigned(u),unsigned(h));return h;}
+            if(mic_open_fails<3||mic_open_fails%120==0)note("AUDIOIN open user=0x%x rc=0x%08x",unsigned(u),unsigned(h));
         }
-    }
+        ++mic_open_fails;return -1;
+    };
     alignas(64) std::int16_t mic_grain[256];
     int fd=-1;std::uint64_t next_try=0,last_data=0,connects=0;
     static std::uint8_t pending[32768];std::size_t pending_len=0; // ~170 ms of stereo, off the thread stack
     alignas(64) std::int16_t grain[256*2];
     int writes=0,errors=0;std::uint64_t recv_bytes=0;
     const std::uint64_t began=now_ms();
-    const std::uint64_t until=began+3550000; // under request.deadline_ms (parent.cpp)
+    const std::uint64_t until=began+86300000; // 24 h, under request.deadline_ms (parent.cpp); the core relaunches a dead worker
     auto play_grain=[&]{
         const int rc=output(handle,grain);++writes;
         if(rc<0){++errors;if(errors<=5||errors%100==0)note("AUDIODIRECT write #%d rc=0x%08x",writes,unsigned(rc));}
@@ -985,6 +985,7 @@ State run_audio_direct(char key[64]){
     std::uint64_t last_stop_check=0;
     std::uint64_t pass_max=0,slow_passes=0,send_eagain=0,dropped_bytes=0,compressed=0; // timing evidence, logged with the mic level
     bool compressing=false;
+    std::uint64_t last_beat=0,fail_streak=0;
     // Playback queue marks (bytes of stereo S16): the console's audio clock runs 0.5-1.3 % slower than the
     // core's 20 ms mix clock (measured 2026-11-23: the queue sat at its 32 KB cap and dropped 2-3 grains a
     // second, each drop a click), so above kHigh the next grains are time-compressed by 1.6 % until the queue
@@ -998,12 +999,28 @@ State run_audio_direct(char key[64]){
             char sp[256];FILE* sf=path(sp,sizeof sp,worker_dir,"stop-audio")?std::fopen(sp,"rb"):nullptr;
             if(sf){std::fclose(sf);note("AUDIODIRECT stop-audio marker found: ending");break;}
         }
+        if(now-last_beat>2000){ // a heartbeat the core looks at (src/overlay.c): a stale one gets the worker launched again
+            last_beat=now;
+            char hp[256];FILE* hf=path(hp,sizeof hp,worker_dir,"audio-alive")?std::fopen(hp,"wb"):nullptr;
+            if(hf){std::fputc('1',hf);std::fclose(hf);}
+        }
+        if(now>=next_mic_check){ // follow the core's `tap-mic` marker: the mic is ours only while the app has none
+            next_mic_check=now+(mic>=0?500:1000);
+            const bool wanted=file_exists("tap-mic")&&!file_exists("no-mic");
+            if(wanted&&mic<0)mic=open_mic();
+            else if(!wanted&&mic>=0){fn<AudioInCloseCall>(AudioInClose)(mic);mic=-1;note("AUDIOIN closed (the app delivers its own mic again)");}
+        }
         if(fd<0&&now>=next_try){
-            next_try=now+1000;
+            // The core may not be running (app closed): retry every second at first, then every 5 s, and
+            // keep the log quiet (the first few failures, then one in 60).
+            next_try=now+(fail_streak<10?1000:5000);
             char current[64];
-            if(read_core_key(current))std::memcpy(key,current,64); // the key is per boot: re-read it
+            const bool verbose=fail_streak<3||fail_streak%60==0;
+            if(read_core_key(current,verbose))std::memcpy(key,current,64); // the key is per boot: re-read it
             fd=connect_tap(key);
-            note("AUDIODIRECT tap connect %s (attempt %llu)",fd>=0?"ok":"failed",static_cast<unsigned long long>(++connects));
+            ++connects;
+            if(fd>=0){fail_streak=0;note("AUDIODIRECT tap connect ok (attempt %llu)",static_cast<unsigned long long>(connects));}
+            else{++fail_streak;if(verbose)note("AUDIODIRECT tap connect failed (streak %llu)",static_cast<unsigned long long>(fail_streak));}
             pending_len=0;
         }
         if(fd>=0){
@@ -1080,7 +1097,7 @@ State run_audio_direct(char key[64]){
                 mic_peak=0;mic_sq=0;mic_n=0;pass_max=0;}
         }
         {const std::uint64_t took=now_ms()-pass_began;if(took>pass_max)pass_max=took;if(took>15)++slow_passes;}
-        if(!busy)usleep(fd>=0?2000:20000); // nothing to play or capture right now; do not spin
+        if(!busy)usleep(fd>=0?4000:(mic>=0?4000:100000)); // nothing to play or capture right now; do not spin
     }
     if(fd>=0)close(fd);
     if(mic>=0)fn<AudioInCloseCall>(AudioInClose)(mic);
@@ -1091,9 +1108,11 @@ State run_audio_direct(char key[64]){
     publish(result);return result;
 }
 State run_audio_relay(){
-    {char key[64];
-     if(read_core_key(key))return run_audio_direct(key);
-     note("AUDIODIRECT no readable core key: falling back to the app-fed relay (port 9043)");}
+    {char key[64]{};
+     // Always the direct path now: the core may not be running yet (the worker is launched by the core
+     // itself, or by hand), and run_audio_direct() re-reads the key at every connection attempt.
+     (void)read_core_key(key,true);
+     return run_audio_direct(key);}
     publish(State::Observing);
     // Fixed and known to both ends at compile time (app/src/platform/ps5/
     // audio_relay.hpp hardcodes the same value): no file handoff, which is

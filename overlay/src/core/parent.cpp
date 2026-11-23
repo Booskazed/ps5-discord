@@ -140,7 +140,7 @@ static int run(){
     r.token=(now_ms()<<17)^std::uint64_t(getpid());
     // AudioRelay keeps running for as long as the app's relay connection
     // stays up (minutes); everything else is a short, bounded one-shot.
-    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?3600000:75000);
+    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:75000);
     if(!write_file(parent_dir,"request.bin",r)){note("request write failed");return 1;}
     if(one_shot_only){
         Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;
@@ -150,6 +150,9 @@ static int run(){
         (unsigned long long)r.epoch,result.elf_loaded,result.pthread_create_ok,result.detached,result.auth_restored,result.imports_unresolved,
         result.first_unresolved?result.first_unresolved:"");
     if(!result.elf_loaded||!result.pthread_create_ok||!result.detached||!result.auth_restored||result.imports_unresolved)return 1;
+    // The audio worker runs on its own inside ShellUI (its own lock, heartbeat and 24 h window): this loader is
+    // done, so it frees parent.lock and a later launch (the core sends the worker again if the heartbeat goes stale) works.
+    if(r.mode==Mode::AudioRelay){note("LOADER: audio worker injected, loader exits");return 0;}
     int previous=999;
 #if OVERLAY_MODE==5
     // Service: no fixed end. A heartbeat every second keeps the worker; on SIGTERM (or a

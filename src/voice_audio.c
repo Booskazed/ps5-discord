@@ -601,6 +601,43 @@ static void tap_close(int *fd)
     *fd = -1;
 }
 
+#ifdef __PROSPERO__
+#define TAP_MIC_MARKER "/data/discord-overlay-poc/tap-mic"
+#endif
+static int tap_mic_marker;
+static int64_t tap_mic_want_since;
+// The worker captures the mic inside SceShellUI only while the app does not (the console kills the app when a game
+// launches), so the two never compete for the device: the core creates OVERLAY_DIR/tap-mic after the app has
+// delivered no mic for 2 s (or is gone) for 1 s, and removes it the moment the app delivers one again.
+static void tap_mic_marker_update(void)
+{
+#ifdef __PROSPERO__
+    const int64_t now = now_ms();
+    const int want = tap_fd >= 0 && tap_v2 && (audio_clients.current < 0 || now - app_mic_ms > 2000);
+    if (!want) {
+        tap_mic_want_since = 0;
+        if (tap_mic_marker) {
+            unlink(TAP_MIC_MARKER);
+            tap_mic_marker = 0;
+            LOG("voice audio: tap mic off");
+        }
+        return;
+    }
+    if (!tap_mic_want_since)
+        tap_mic_want_since = now;
+    if (!tap_mic_marker && now - tap_mic_want_since > 1000) {
+        FILE *f = fopen(TAP_MIC_MARKER, "wb");
+        if (f) {
+            fclose(f);
+            tap_mic_marker = 1;
+            LOG("voice audio: tap mic on");
+        }
+    }
+#else
+    (void)tap_mic_marker; // the host build has no worker and no marker file
+    (void)tap_mic_want_since;
+#endif
+}
 // Admits one tap client at a time (a new one replaces the old) and notices its departure.
 // poll() before accept(): a bare accept() on a descriptor this console may not keep
 // non-blocking must never be able to stall the engine thread.
@@ -680,6 +717,7 @@ static void tap_service(void)
                 break;
         }
     }
+    tap_mic_marker_update();
 }
 
 static void tap_push(const int16_t *stereo)
@@ -945,7 +983,7 @@ static void play(void)
         st_mixed++;
     } else if (any && (audio_clients.current >= 0 || tap_fd >= 0)) {
         vau_mix_out(acc, out);
-        if (audio_clients.current >= 0)
+        if (audio_clients.current >= 0 && !(tap_fd >= 0 && tap_v2)) // a live worker plays it: the app would double it
             out_push(out);
         tap_push(out);
         st_mixed++;
@@ -1069,6 +1107,9 @@ void vau_init(void)
     listen_fd = listen_loopback(VAU_PORT);
     usb_listen_fd = listen_loopback(VAU_USB_PORT);
     tap_listen_fd = listen_loopback(VAU_TAP_PORT);
+#ifdef __PROSPERO__
+    unlink(TAP_MIC_MARKER); // a marker left by a core that died
+#endif
     LOG("voice audio: tap PCM listener %s on 127.0.0.1:%d", tap_listen_fd >= 0 ? "ready" : "unavailable", VAU_TAP_PORT);
     if (usb_listen_fd < 0)
         LOG("voice audio: USB PCM listener unavailable on 127.0.0.1:%d", VAU_USB_PORT);

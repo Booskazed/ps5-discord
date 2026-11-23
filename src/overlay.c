@@ -1040,7 +1040,7 @@ static void send_text(const char *text, const char *target)
 static uint64_t launched_at;
 static volatile int reloading;
 // A payload from the app's assets to elfldr.
-static void send_elf(const char *path)
+static void send_elf_unlocked(const char *path)
 {
     FILE *f = fopen(path, "rb");
     if (!f)
@@ -1059,6 +1059,37 @@ static void send_elf(const char *path)
             sent += (size_t)w;
     close(fd);
     LOG("overlay: sent %s to elfldr (%zu of %zu bytes)", path, sent, n);
+}
+
+static pthread_mutex_t elf_mu = PTHREAD_MUTEX_INITIALIZER; // send_elf_unlocked shares one static buffer
+static void send_elf(const char *path)
+{
+    pthread_mutex_lock(&elf_mu);
+    send_elf_unlocked(path);
+    pthread_mutex_unlock(&elf_mu);
+}
+
+// The community build ships the voice-in-game worker (overlay/, AudioRelay mode, assets/overlay-audiorelay.elf).
+// It lives inside SceShellUI, where the console keeps audio running under a game that has just killed the app,
+// and talks to this core on 127.0.0.1:9044 (voice_audio.c). It writes OVERLAY_DIR/audio-alive every 2 s; when
+// that goes stale (first start, a system UI restart, the end of its 24 h window) the core sends the worker to
+// elfldr again. A live worker is never relaunched: every launch maps another copy of the ELF into SceShellUI.
+static void *voice_shell_keeper(void *arg)
+{
+    (void)arg;
+    struct stat st;
+    if (stat(APP_ASSETS "/overlay-audiorelay.elf", &st) != 0)
+        return NULL; // this edition does not ship it
+    sleep(15); // the core finishes starting first
+    for (;;) {
+        const int alive = stat(OVERLAY_DIR "/audio-alive", &st) == 0 && time(NULL) - st.st_mtime <= 15;
+        if (!alive) {
+            send_elf(APP_ASSETS "/overlay-audiorelay.elf");
+            sleep(40); // a few seconds to start, then its first heartbeat
+        }
+        sleep(10);
+    }
+    return NULL;
 }
 
 // The overlay service (overlay/, built into the app), when Settings have it on. A second
@@ -1251,6 +1282,7 @@ void overlay_init(void)
     pthread_create(&t, &attr, avatar_thread, NULL);
     chat_set_message_sink(on_message);
     pthread_create(&t, &attr, mentions_thread, NULL);
+    pthread_create(&t, &attr, voice_shell_keeper, NULL);
     pthread_attr_destroy(&attr);
 }
 #else

@@ -97,7 +97,7 @@ inline bool address(std::uint64_t p){return p>=0x10000&&p<0x800000000000ULL;}
 inline bool valid(const Request& r,int pid,std::uint64_t build,std::uint64_t epoch,std::uint64_t now){
     // AudioRelay runs for as long as the app stays connected (minutes), so its
     // deadline window is wider than every other mode's.
-    const std::uint64_t max_window=r.mode==Mode::AudioRelay?3650000:120000;
+    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:120000;
     if(r.signature!=magic||r.protocol!=version||r.size!=sizeof r||r.pid!=pid||r.build!=build||r.epoch!=epoch||!r.epoch||!r.token||
        !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>max_window)return false;
     for(unsigned i=0;i<FunctionCount;i++)if(!address(r.functions[i])&&!(optional(i)&&!r.functions[i]))return false;

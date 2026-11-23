@@ -285,6 +285,12 @@ done
 [[ ! -f $root/../overlay/build/overlay-service.elf ]] || cp "$root/../overlay/build/overlay-service.elf" "$app/assets/overlay.elf"
 [[ ! -f $root/../overlay/build/overlay-restart.elf ]] || cp "$root/../overlay/build/overlay-restart.elf" "$app/assets/overlay-restart.elf"
 [[ ! -f $root/../overlay/build/overlay.build ]] || cp "$root/../overlay/build/overlay.build" "$app/assets/overlay.build"
+# The voice-in-game worker (overlay/, AudioRelay mode): it lives inside SceShellUI, where the console keeps audio running
+# under a game that killed the app, and the core launches it itself (src/overlay.c). Only the side-by-side community
+# edition ships it: its key path names that edition.
+if [[ ${EDITION_TITLE_ID:-} == PPSA99073 && -f $root/../overlay/build/overlay-audiorelay.elf ]]; then
+    cp "$root/../overlay/build/overlay-audiorelay.elf" "$app/assets/overlay-audiorelay.elf"
+fi
 # Build the helper from current sources on every packaging path, including direct app builds.
 # GPL-3.0-only: ship separately with its license, never linked into the core.
 make -C "$root/.." capture
