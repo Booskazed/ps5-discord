@@ -1496,6 +1496,73 @@ State run_scene_probe(){
             note("PROBE resolve %s via %s(param %d)=%p",p.label,p.method,p.param,kls);
             if(kls){probe_fields(kls,p.label);probe_methods(kls,p.label);}}
     }
+    // Probe v6: read the live VoiceChatModule.Instance, dump its voiceChatModuleEventHandlerDic class fields, then
+    // walk that Dictionary's keys to collect every event name the RN voice tile actually listens for. This is the
+    // last metadata gap before the tile code: given a key, forging the tile reduces to calling the matching
+    // handler with our own (string, JObject). The walk uses only read-only runtime_invoke on managed getters;
+    // no handler is called, nothing is registered or unregistered, no system service is touched.
+    if(img_voice){
+        void* vcm=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img_voice,"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule");
+        void* mget=vcm?fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm,"GetInstance",0):nullptr;
+        void* ex=nullptr;
+        void* inst=mget?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mget,nullptr,nullptr,&ex):nullptr;
+        note("PROBE live VoiceChatModule.GetInstance()=%p ex=%p",inst,ex);
+        if(inst){
+            // Field voiceChatModuleEventHandlerDic sits at @16 of the instance (v2/v4 dumps).
+            void* dict=*(void**)((char*)inst+16);
+            note("PROBE live voiceChatModuleEventHandlerDic=%p",dict);
+            if(dict){
+                void* dclass=fn<void*(*)(void*)>(ObjectClass)(dict);
+                const char* dname=dclass?fn<const char*(*)(void*)>(ClassNameGet)(dclass):nullptr;
+                note("PROBE dict class=%p name=%s",dclass,dname?dname:"?");
+                if(dclass){probe_fields(dclass,"Dictionary");}
+                // Call get_Count() on the dict to publish the count, then walk via get_Keys().GetEnumerator().
+                void* mcount=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Count",0):nullptr;
+                if(mcount){
+                    ex=nullptr;
+                    void* boxed=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mcount,dict,nullptr,&ex);
+                    int cnt=boxed?*(int*)fn<void*(*)(void*)>(ObjectUnbox)(boxed):-1;
+                    note("PROBE dict count=%d ex=%p",cnt,ex);}
+                void* mkeys=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Keys",0):nullptr;
+                ex=nullptr;
+                void* keys=mkeys?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mkeys,dict,nullptr,&ex):nullptr;
+                note("PROBE dict.get_Keys()=%p ex=%p",keys,ex);
+                if(keys){
+                    void* kclass=fn<void*(*)(void*)>(ObjectClass)(keys);
+                    void* menum=kclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(kclass,"GetEnumerator",0):nullptr;
+                    ex=nullptr;
+                    void* en=menum?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(menum,keys,nullptr,&ex):nullptr;
+                    note("PROBE keys.GetEnumerator()=%p ex=%p",en,ex);
+                    if(en){
+                        // Enumerator is a value type; its instance methods take an unboxed `this` pointer.
+                        void* ec=fn<void*(*)(void*)>(ObjectClass)(en);
+                        void* mnext=ec?fn<void*(*)(void*,const char*,int)>(MethodFromName)(ec,"MoveNext",0):nullptr;
+                        void* mcurr=ec?fn<void*(*)(void*,const char*,int)>(MethodFromName)(ec,"get_Current",0):nullptr;
+                        void* ethis=fn<void*(*)(void*)>(ObjectUnbox)(en);
+                        note("PROBE enum class=%p MoveNext=%p get_Current=%p this=%p",ec,mnext,mcurr,ethis);
+                        if(mnext&&mcurr&&ethis){
+                            for(int i=0;i<64;++i){
+                                ex=nullptr;
+                                void* bnext=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mnext,ethis,nullptr,&ex);
+                                int alive=bnext?*(int*)fn<void*(*)(void*)>(ObjectUnbox)(bnext):0;
+                                if(!alive){note("PROBE walk end at i=%d",i);break;}
+                                ex=nullptr;
+                                void* key=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mcurr,ethis,nullptr,&ex);
+                                // MonoString layout: 0=vtable, 8=sync, 16=length(int32), 20=UTF-16 chars.
+                                if(key){
+                                    int klen=*(int*)((char*)key+16);
+                                    const unsigned short* ku=(const unsigned short*)((char*)key+20);
+                                    char buf[256];int w=0;
+                                    for(int j=0;j<klen&&j<int(sizeof(buf))-1;++j){unsigned short c=ku[j];buf[w++]=(c<0x80)?char(c):'?';}
+                                    buf[w]='\0';
+                                    note("PROBE event key[%d]=\"%s\"",i,buf);
+                                } else { note("PROBE key[%d]=null",i); }}
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Context: a few neighbouring assemblies that back the Control Center voice tile's JavaScript bridge.
     static const char* const neighbours[]={
         "/system_ex/common_ex/lib/Sce.Vsh.PartyCommon.dll",
