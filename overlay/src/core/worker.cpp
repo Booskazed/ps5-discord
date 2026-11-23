@@ -1664,7 +1664,7 @@ void tile_observe(void* inst,const char* label){
 // Read-only structural dump of a managed object (lab): every instance field with its value, recursing into reference
 // fields. Arrays are only measured (length), never indexed, and nothing is invoked: reference fields hold either null or
 // a valid object, so ObjectClass on them is safe; no pointer is followed that the metadata does not mark as a reference.
-void tile_dump(void* obj,const char* path_,int depth,int& budget){
+[[maybe_unused]] void tile_dump(void* obj,const char* path_,int depth,int& budget){
     if(!obj||budget<=0)return;
     --budget;
     void* k=fn<void*(*)(void*)>(ObjectClass)(obj);
@@ -1701,6 +1701,49 @@ void tile_dump(void* obj,const char* path_,int depth,int& budget){
                 else note("TILE dump %s = %p (%s, depth limit)",np,child,ftype?ftype:"?");
                 break;}
             default:break;}}}
+}
+// Lists what GCCallBackList.GCHandleDict (Dictionary<object,object>, 88 entries seen) holds, through its own managed
+// getters (get_Keys / get_Values, GetEnumerator, MoveNext, get_Current: read-only, nothing registered or removed), and
+// returns the live ReactNative VoiceChatModule when an entry IS one or is a delegate whose Target is one.
+void* tile_enum_callbacks(void* dict,void* rnk){
+    void* found=nullptr;
+    void* dc=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
+    static const char* const getters[]={"get_Keys","get_Values"};
+    for(const char* g:getters){
+        void* mg=dc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dc,g,0):nullptr;
+        void* ex=nullptr;
+        void* coll=mg?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mg,dict,nullptr,&ex):nullptr;
+        note("TILE cb %s coll=%p ex=%p",g,coll,ex);
+        void* cc=coll?fn<void*(*)(void*)>(ObjectClass)(coll):nullptr;
+        void* menum=cc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(cc,"GetEnumerator",0):nullptr;
+        ex=nullptr;
+        void* en=menum?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(menum,coll,nullptr,&ex):nullptr;
+        void* ec=en?fn<void*(*)(void*)>(ObjectClass)(en):nullptr;
+        void* mnext=ec?fn<void*(*)(void*,const char*,int)>(MethodFromName)(ec,"MoveNext",0):nullptr;
+        void* mcurr=ec?fn<void*(*)(void*,const char*,int)>(MethodFromName)(ec,"get_Current",0):nullptr;
+        void* ethis=en?fn<void*(*)(void*)>(ObjectUnbox)(en):nullptr;
+        if(!(mnext&&mcurr&&ethis)){note("TILE cb %s: enumerator unavailable",g);continue;}
+        for(int i=0;i<128;++i){
+            ex=nullptr;
+            void* bn=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mnext,ethis,nullptr,&ex);
+            if(!bn||!*(int*)fn<void*(*)(void*)>(ObjectUnbox)(bn))break;
+            ex=nullptr;
+            void* e=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mcurr,ethis,nullptr,&ex);
+            if(!e)continue;
+            void* ek=fn<void*(*)(void*)>(ObjectClass)(e);
+            const char* en_=ek?fn<const char*(*)(void*)>(ClassNameGet)(ek):nullptr;
+            void* mt=nullptr;
+            for(void* w=ek;w&&!mt;w=fn<void*(*)(void*)>(ClassParent)(w))
+                mt=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"get_Target",0);
+            void* tgt=nullptr;
+            if(mt){ex=nullptr;tgt=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mt,e,nullptr,&ex);}
+            void* tk=tgt?fn<void*(*)(void*)>(ObjectClass)(tgt):nullptr;
+            const char* tn=tk?fn<const char*(*)(void*)>(ClassNameGet)(tk):nullptr;
+            note("TILE cb %s[%d] %s=%p target=%s=%p",g,i,en_?en_:"?",e,tn?tn:"-",tgt);
+            if(rnk&&ek==rnk&&!found)found=e;
+            if(rnk&&tk==rnk&&!found)found=tgt;}
+    }
+    return found;
 }
 // Mode::TileDiscord (lab): forges a Newtonsoft JObject from a JSON string (read from tile.json on disk, or a
 // safe default) and dispatches it through VoiceChatModule's own voiceChatModuleEventHandlerDic, as if the
@@ -1793,9 +1836,13 @@ State run_tile_discord(){
                 fn<void(*)(void*,void*,void*)>(MonoFieldStaticGet)(vt,f,&val);
                 note("TILE RN m_cblist value=%p",val);
                 if(val){
-                    void* ck=fn<void*(*)(void*)>(ObjectClass)(val);
-                    probe_fields(ck,"GCCallBackList");probe_methods(ck,"GCCallBackList");
-                    int budget=160;tile_dump(val,"RN.m_cblist",4,budget);}
+                    // GCHandleDict is the instance field at +16 (Dictionary<object,object>).
+                    void* inst_rn=tile_enum_callbacks(*(void**)((char*)val+16),rnk);
+                    note("TILE RN module instance=%p",inst_rn);
+                    if(inst_rn){
+                        note("TILE RN _emittable=%d",int(*((unsigned char*)inst_rn+48)));
+                        static const char* const gcn[]={"daemon","accessibility","channel","member","rangedMember","voice","screenShare","sharePlay","partySessionList","partySession","partyHistory"};
+                        for(int gi=0;gi<11;++gi)note("TILE RN gcContext.%s=%llx",gcn[gi],(unsigned long long)*(std::uint64_t*)((char*)inst_rn+56+8*gi));}}
                 break;}
         }
     }
