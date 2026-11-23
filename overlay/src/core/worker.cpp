@@ -1476,6 +1476,26 @@ State run_scene_probe(){
             void* k=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img_voice,e.ns,e.name);
             note("PROBE class %s.%s=%p",e.ns,e.name,k);
             if(k){probe_fields(k,e.name);probe_methods(k,e.name);describe_properties(k,e.name);}}}
+    // Probe v5: resolve the three mystery types (VoiceChatModuleEventHandler, SceVoiceChat{Daemon,Channel}EventHandler)
+    // by walking their holder methods' parameter MonoType and calling ClassFromType on it, which cuts through the
+    // IpcTypes namespace / nested-class name problem that made ClassFromName return 0 in v2-v4. Then dump each
+    // resolved class via probe_fields / probe_methods so its Invoke signature appears in the log. Still metadata-only.
+    if(img_voice){
+        void* vcm=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img_voice,"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule");
+        struct Pick{const char* method;int count;int param;const char* label;};
+        static const Pick picks[]={
+            {"RegisterVoiceChatModuleEventHandler",2,1,"VoiceChatModuleEventHandler"},
+            {"sceVoiceChatRegisterDaemonEventHandler",2,0,"SceVoiceChatDaemonEventHandler"},
+            {"sceVoiceChatRegisterChannelEventHandler",2,0,"SceVoiceChatChannelEventHandler"}};
+        for(const auto& p:picks){
+            void* m=vcm?fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm,p.method,p.count):nullptr;
+            void* sig=m?fn<void*(*)(void*)>(MethodSignature)(m):nullptr;
+            void* pt=nullptr;
+            if(sig){void* it=nullptr;for(int k=0;k<=p.param;++k){pt=fn<void*(*)(void*,void**)>(SignatureParams)(sig,&it);if(!pt)break;}}
+            void* kls=pt?fn<void*(*)(void*)>(ClassFromType)(pt):nullptr;
+            note("PROBE resolve %s via %s(param %d)=%p",p.label,p.method,p.param,kls);
+            if(kls){probe_fields(kls,p.label);probe_methods(kls,p.label);}}
+    }
     // Context: a few neighbouring assemblies that back the Control Center voice tile's JavaScript bridge.
     static const char* const neighbours[]={
         "/system_ex/common_ex/lib/Sce.Vsh.PartyCommon.dll",
