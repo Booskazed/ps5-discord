@@ -108,6 +108,19 @@ static int run(){
         std::uint64_t address_value=0;
         if(optional(i)){
             // The mic and user-service lab functions live in their own modules, not in SystemService.
+            if(i==KernelLoadStartModule||i==KernelDlsym){
+                // PartyProbe lab: libkernel's own loader entry points, whichever flavour ShellUI has loaded.
+                std::uint32_t plain=0;(void)kernel_dynlib_handle(r.pid,"libkernel.sprx",&plain);
+                const std::uint32_t candidates[3]={kernel,plain,web};
+                for(std::uint32_t handle:candidates){
+                    if(!handle)continue;
+                    address_value=kernel_dynlib_dlsym(r.pid,handle,symbols[i]);
+                    if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,handle,nid);}
+                    if(address(address_value)){note("resolved %s via module %u",symbols[i],unsigned(handle));break;}
+                }
+                if(!address(address_value)){note("optional %s missing",symbols[i]);address_value=0;}
+                r.functions[i]=address_value;continue;
+            }
             const std::uint32_t home=(i==AudioInOpen||i==AudioInInput||i==AudioInClose)?audioin:
                                      (i==UserGetForegroundUser)?userservice:system;
             if(home){address_value=kernel_dynlib_dlsym(r.pid,home,symbols[i]);
@@ -140,7 +153,15 @@ static int run(){
     r.token=(now_ms()<<17)^std::uint64_t(getpid());
     // AudioRelay keeps running for as long as the app's relay connection
     // stays up (minutes); everything else is a short, bounded one-shot.
-    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:75000);
+    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:r.mode==Mode::PartyProbe?600000:75000);
+    if(r.mode==Mode::PartyProbe){
+        // Read-only census (lab): which party/voice libraries ShellUI already has loaded. Logged, never fatal.
+        static const char* const party_modules[]={"libSceProprietaryVoiceChatHelper.native.sprx","libSceVoiceChat.sprx",
+            "libSceNpParty.sprx","libSceIpmi.sprx","libSceNpManager.sprx","libSceVoice.sprx","libSceVoiceQoS.sprx"};
+        for(const char* name:party_modules){
+            std::uint32_t handle=0;const int rc=kernel_dynlib_handle(r.pid,name,&handle);
+            note("census %s rc=%d handle=%u",name,rc,unsigned(handle));}
+    }
     if(!write_file(parent_dir,"request.bin",r)){note("request write failed");return 1;}
     if(one_shot_only){
         Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;
@@ -153,6 +174,7 @@ static int run(){
     // The audio worker runs on its own inside ShellUI (its own lock, heartbeat and 24 h window): this loader is
     // done, so it frees parent.lock and a later launch (the core sends the worker again if the heartbeat goes stale) works.
     if(r.mode==Mode::AudioRelay){note("LOADER: audio worker injected, loader exits");return 0;}
+    if(r.mode==Mode::PartyProbe){note("LOADER: party probe injected, loader exits (see worker.log)");return 0;}
     int previous=999;
 #if OVERLAY_MODE==5
     // Service: no fixed end. A heartbeat every second keeps the worker; on SIGTERM (or a

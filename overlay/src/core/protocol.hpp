@@ -31,6 +31,8 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // (libSceAudioIn) and the foreground user id (libSceUserService), to measure whether a
     // ShellUI-hosted mic survives a game taking AV focus after the console killed the app.
     AudioInOpen,AudioInInput,AudioInClose,UserGetForegroundUser,
+    // Optional lab (Mode::PartyProbe, libkernel): load a system library inside ShellUI and find its exports.
+    KernelLoadStartModule,KernelDlsym,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -45,7 +47,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "mono_class_get_methods","mono_method_get_name",
     "sceAudioOutInit","sceAudioOutOpen","sceAudioOutOutput","sceAudioOutClose",
     "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus",
-    "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser"};
+    "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser",
+    "sceKernelLoadStartModule","sceKernelDlsym"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
 // AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose
@@ -97,7 +100,8 @@ inline bool address(std::uint64_t p){return p>=0x10000&&p<0x800000000000ULL;}
 inline bool valid(const Request& r,int pid,std::uint64_t build,std::uint64_t epoch,std::uint64_t now){
     // AudioRelay runs for as long as the app stays connected (minutes), so its
     // deadline window is wider than every other mode's.
-    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:120000;
+    // PartyProbe (lab) may hold a voice-chat registration for a few minutes so someone can look at the tile.
+    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:r.mode==Mode::PartyProbe?650000:120000;
     if(r.signature!=magic||r.protocol!=version||r.size!=sizeof r||r.pid!=pid||r.build!=build||r.epoch!=epoch||!r.epoch||!r.token||
        !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>max_window)return false;
     for(unsigned i=0;i<FunctionCount;i++)if(!address(r.functions[i])&&!(optional(i)&&!r.functions[i]))return false;

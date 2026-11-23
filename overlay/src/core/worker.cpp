@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdarg>
+#include <cstdlib>
 #include <fcntl.h>
 #include <sys/file.h>
 #include <arpa/inet.h>
@@ -1190,48 +1191,116 @@ State run_audio_relay(){
     const State result=writes>0?State::Passed:State::Failed;
     publish(result);return result;
 }
-// Mode::PartyProbe only: read-only (no hooking, no AudioOut). The PS5's
-// own Party/mute tile in Game Base/Control Center survives a game taking
-// focus, for any third-party title's own voice chat, not just PSN's --
-// if that is a local, generic registration (not something tied to PSN
-// network infra this console cannot reach), finding which assembly
-// implements it is the first step toward using it for voice playback too.
-// "Game Base" is the console's own name for that hub (Parties, Messages,
-// Activities, Friends), per the user 2026-11-23.
-bool probe_party_assemblies(){
-    static constexpr const char* candidates[]={
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.GameBase.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.GameBase.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Party.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.Party.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.Np.Party.dll",
-        "/system_ex/common_ex/lib/Sce.Np.Party.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.ControlCenter.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ControlCenter.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.QuickMenu.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Communication.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Notification.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Toast.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.SystemUI.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Friend.dll",
-        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Friends.dll",
-    };
-    bool any=false;
-    for(const char* path:candidates){
-        void* img=image(path);
-        note("PARTYPROBE %s -> %s",path,img?"FOUND":"missing");
-        any|=img!=nullptr;
+// Mode::PartyProbe (lab, no Mono, no hooking, no audio): the game side of the PS5's party voice service.
+// Read offline from the console's own libSceProprietaryVoiceChatHelper.native.sprx (13.60, 69864 bytes), which
+// is a thin IPMI client of the service "ScePartyIpcService". It has four exports, at these offsets of its text:
+//   0x170 sceProprietaryVoiceChatHelperInitialize(const Param*)  Param = {u32 poolBytes (a non-zero multiple of
+//         0x4000), u8 reserved[32] (must be zero)}; connects to the service, registers this process (method 0x510000)
+//   0x430 sceProprietaryVoiceChatHelperTerminate()                (method 0x510001 on the way out)
+//   0x440 (no public name) Set(int 0/1)                           IPMI method 0x510002, one 4-byte input
+//   0x4b0 (no public name) Get(int* out)                          IPMI method 0x510003, one 4-byte output (0 or 1)
+// Errors of the helper itself are 0x816d05xx (01 not initialised, 02 already, 03 bad argument, 05 no memory,
+// 07 refused by an early check); anything else comes from the service. The meaning of Set/Get is the question
+// this probe answers; the steps (one word each, a missing file means "init get term") are read from
+// party-steps.txt next to worker.log:  init | initNNNN (pool in hex) | get | set0 | set1 | sleepN | term.
+// Whatever is registered is terminated at the end (and on the marker file stop-party), never left behind.
+using LoadStartCall=int(*)(const char*,std::size_t,const void*,unsigned,const void*,int*);
+using DlsymCall=int(*)(int,const char*,void**);
+using HelperInitCall=int(*)(const void*);
+using HelperTermCall=int(*)();
+using HelperSetCall=int(*)(int);
+using HelperGetCall=int(*)(int*);
+State run_party_probe(){
+    publish(State::Observing);
+    note("PARTY start pid=%d",int(getpid()));
+    const auto load=fn<LoadStartCall>(KernelLoadStartModule);
+    const auto find=fn<DlsymCall>(KernelDlsym);
+    if(!load||!find){note("PARTY refused: sceKernelLoadStartModule/sceKernelDlsym were not resolved");publish(State::Failed);return State::Failed;}
+    int res=0;
+    const int lib_handle=load("/system/common/lib/libSceProprietaryVoiceChatHelper.native.sprx",0,nullptr,0,nullptr,&res);
+    note("PARTY load handle=0x%08x res=0x%08x",unsigned(lib_handle),unsigned(res));
+    if(lib_handle<0){publish(State::Failed);return State::Failed;}
+    void* init_at=nullptr;void* term_at=nullptr;
+    const int rc_init=find(lib_handle,"sceProprietaryVoiceChatHelperInitialize",&init_at);
+    const int rc_term=find(lib_handle,"sceProprietaryVoiceChatHelperTerminate",&term_at);
+    note("PARTY dlsym init rc=0x%08x at=%p term rc=0x%08x at=%p",unsigned(rc_init),init_at,unsigned(rc_term),term_at);
+    if(rc_init||rc_term||!init_at||!term_at){publish(State::Failed);return State::Failed;}
+    const auto init_addr=reinterpret_cast<std::uintptr_t>(init_at);
+    const auto term_addr=reinterpret_cast<std::uintptr_t>(term_at);
+    if(term_addr!=init_addr-0x170+0x430){note("PARTY refused: Terminate is not at the offset measured on 13.60");publish(State::Failed);return State::Failed;}
+    const std::uintptr_t base=init_addr-0x170;
+    // Set and Get have no public name here: derive them from the base and check their opening bytes before use.
+    const auto* set_code=reinterpret_cast<const unsigned char*>(base+0x440);
+    const auto* get_code=reinterpret_cast<const unsigned char*>(base+0x4b0);
+    const bool set_ok=set_code[0]==0x48&&set_code[1]==0x83&&set_code[2]==0x3d;               // cmp qword [rip+x],imm8
+    const bool get_ok=get_code[0]==0x55&&get_code[1]==0x48&&get_code[2]==0x89&&get_code[3]==0xe5; // push rbp; mov rbp,rsp
+    note("PARTY exports set=%p(%s) get=%p(%s)",static_cast<const void*>(set_code),set_ok?"ok":"UNEXPECTED BYTES",
+         static_cast<const void*>(get_code),get_ok?"ok":"UNEXPECTED BYTES");
+    char words[512]{};
+    {char fp[256];
+     if(path(fp,sizeof fp,worker_dir,"party-steps.txt")){
+         FILE* f=std::fopen(fp,"rb");
+         if(f){const std::size_t got=std::fread(words,1,sizeof words-1,f);words[got]=0;std::fclose(f);}}}
+    if(!words[0])std::snprintf(words,sizeof words,"init get term");
+    note("PARTY steps: %s",words);
+    auto stop_requested=[&]{
+        char fp[256];if(!path(fp,sizeof fp,worker_dir,"stop-party"))return false;
+        FILE* f=std::fopen(fp,"rb");if(!f)return false;std::fclose(f);return true;};
+    bool registered=false;int steps=0,bad=0;
+    char* cursor=words;
+    for(;;){
+        while(*cursor==' '||*cursor=='\n'||*cursor=='\r'||*cursor=='\t')++cursor;
+        if(!*cursor||steps>=40)break;
+        char* word=cursor;
+        while(*cursor&&*cursor!=' '&&*cursor!='\n'&&*cursor!='\r'&&*cursor!='\t')++cursor;
+        if(*cursor)*cursor++=0;
+        ++steps;
+        if(stop_requested()){note("PARTY stop-party marker: leaving");break;}
+        if(!std::strncmp(word,"init",4)){
+            alignas(8) unsigned char param[36]{};
+            std::uint32_t pool=0x10000;
+            if(word[4])pool=static_cast<std::uint32_t>(std::strtoul(word+4,nullptr,16));
+            std::memcpy(param,&pool,sizeof pool);
+            const int rc=reinterpret_cast<HelperInitCall>(init_addr)(param);
+            note("PARTY step init pool=0x%x rc=0x%08x",unsigned(pool),unsigned(rc));
+            if(rc==0)registered=true;else ++bad;
+        } else if(!std::strcmp(word,"term")){
+            const int rc=reinterpret_cast<HelperTermCall>(term_addr)();
+            note("PARTY step term rc=0x%08x",unsigned(rc));registered=false;
+        } else if(!std::strcmp(word,"get")){
+            int value=-99;
+            const int rc=get_ok?reinterpret_cast<HelperGetCall>(base+0x4b0)(&value):-1;
+            note("PARTY step get rc=0x%08x value=%d",unsigned(rc),value);
+            if(rc!=0)++bad;
+        } else if(!std::strcmp(word,"set0")||!std::strcmp(word,"set1")){
+            const int want=word[3]=='1'?1:0;
+            const int rc=set_ok?reinterpret_cast<HelperSetCall>(base+0x440)(want):-1;
+            note("PARTY step set%d rc=0x%08x",want,unsigned(rc));
+            if(rc!=0)++bad;
+        } else if(!std::strncmp(word,"sleep",5)){
+            const int seconds=std::atoi(word+5);
+            note("PARTY step sleep %d s",seconds);
+            for(int s=0;s<seconds&&s<300&&!stop_requested()&&now_ms()+2000<request.deadline_ms;++s)usleep(1000000);
+        } else {
+            note("PARTY step '%s' unknown, skipped",word);++bad;
+        }
     }
-    return any;
+    if(registered){
+        const int rc=reinterpret_cast<HelperTermCall>(term_addr)();
+        note("PARTY cleanup term rc=0x%08x",unsigned(rc));
+    }
+    note("PARTY done steps=%d problems=%d",steps,bad);
+    const State result=bad==0?State::Passed:State::Failed;
+    publish(result);return result;
 }
 State run(){
     if(request.mode==Mode::AudioTest)return run_audio_test();
     if(request.mode==Mode::AudioRelay)return run_audio_relay();
+    if(request.mode==Mode::PartyProbe)return run_party_probe();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
     do {
-        if(request.mode==Mode::PartyProbe){result=probe_party_assemblies()?State::Resolved:State::Failed;break;}
         if(request.mode==Mode::Input){
             if(!resolve_input_methods())break;
             note("OBSERVING pad and share for at most60seconds; pure pass-through, no button changes");
@@ -1304,7 +1373,11 @@ State run(){
 }
 }
 extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
-    char p[256];if(!path(p,sizeof p,worker_dir,"worker.lock"))return nullptr;
+    // The party probe (a lab tool) has its own lock: the audio worker holds worker.lock for hours, and a second
+    // worker that does not get its lock returns without a word.
+    Request peek;
+    const bool probe=read_file(worker_dir,"request.bin",peek)&&peek.mode==Mode::PartyProbe;
+    char p[256];if(!path(p,sizeof p,worker_dir,probe?"probe.lock":"worker.lock"))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
     if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}
     if(!read_file(worker_dir,"request.bin",request)||!valid(request,getpid(),OVERLAY_BUILD,request.epoch,now_ms())){
