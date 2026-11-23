@@ -912,6 +912,11 @@ int connect_tap(const char key[64]){
 #ifdef SO_NOSIGPIPE
     {const int one=1;setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof one);} // never let a dead peer SIGPIPE SceShellUI
 #endif
+    // Without TCP_NODELAY, Nagle holds each 512-byte mic grain until the core's delayed ACK (~100 ms) lets it go whenever the
+    // core has nothing to send back (nobody talking): the mic reached the core in 100 ms bursts, which its 80 ms lag guard
+    // cut to 40% and replayed at double speed ("silence, then the sentence sped up"; measured 2026-11-23, 143872 samples
+    // dropped in one 5 s window while the worker was reading the mic at exactly real time).
+    {const int one=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one);}
     sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(tap_port);a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     if(connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a)!=0){close(fd);return -1;}
     // The key, then "TAP2" in the same write: a v2 client is never replaced by an older worker's reconnects.
