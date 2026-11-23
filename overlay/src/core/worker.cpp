@@ -882,7 +882,12 @@ State run_audio_test(){
 // lab measures; the key is never logged, only whether and from where it was read.
 bool read_core_key(char out[64]){
     static constexpr const char* paths[]={
-        "/data/homebrew/PPSA99073/control.key", // the edition's own folder only: the CI refuses any binary that names the stock one
+        // ShellUI's /data is not the one the app and the core see (measured 2026-11-23: ENOENT on
+        // /data/homebrew/PPSA99073/control.key), but its /user/data is the real partition (the
+        // overlay's own log and chat files live there). The edition's own folder only: the CI
+        // refuses any binary that names the stock one.
+        "/user/data/homebrew/PPSA99073/control.key",
+        "/data/homebrew/PPSA99073/control.key",
         "/app0/control.key",
     };
     for(const char* p:paths){
