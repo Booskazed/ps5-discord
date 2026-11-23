@@ -13,6 +13,7 @@
 #define VAU_RTP_PT 0x78 // Opus payload type in RTP
 #define VAU_PORT 9042
 #define VAU_USB_PORT 9045 // Authenticated USB PCM role; replies "OK" after accepting its key.
+#define VAU_TAP_PORT 9044 // LAB: key-authenticated playback-only copy for the SceShellUI worker.
 #define VAU_ID 32 // user id buffer, snowflake plus NUL
 #define VAU_FIFO 6 // decoded frames kept per speaker (~120 ms)
 #define VAU_MAX_PKT 1500

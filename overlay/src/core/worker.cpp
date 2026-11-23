@@ -877,7 +877,117 @@ State run_audio_test(){
 // PCM piped from the app over a loopback socket (platform/ps5/audio_relay.hpp),
 // not a generated tone. Runs for as long as that connection stays up (the
 // app closing it, or stop.bin, end it cleanly), bounded by a safety ceiling.
+// The core's key (src/core_key.h): 64 hex characters the core writes next to the app
+// (/app0 on the app side). Whether SceShellUI sees that real path is one of the things this
+// lab measures; the key is never logged, only whether and from where it was read.
+bool read_core_key(char out[64]){
+    static constexpr const char* paths[]={
+        "/data/homebrew/PPSA99073/control.key",
+        "/data/homebrew/PPSA99072/control.key",
+        "/app0/control.key",
+    };
+    for(const char* p:paths){
+        FILE* f=std::fopen(p,"rb");
+        if(!f){note("AUDIODIRECT key %s open errno=%d",p,errno);continue;}
+        char buf[65]{};const std::size_t got=std::fread(buf,1,64,f);
+        const int extra=std::fgetc(f);std::fclose(f);
+        note("AUDIODIRECT key %s read %zu bytes trailing=%s",p,got,extra==EOF?"none":"some");
+        if(got==64){std::memcpy(out,buf,64);return true;}
+    }
+    return false;
+}
+// Connects to the core's tap listener (src/voice_audio.c VAU_TAP_PORT) and sends the key.
+int connect_tap(const char key[64]){
+    constexpr std::uint16_t tap_port=9044;
+    const int fd=socket(AF_INET,SOCK_STREAM,0);if(fd<0)return -1;
+#ifdef SO_NOSIGPIPE
+    {const int one=1;setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof one);} // never let a dead peer SIGPIPE SceShellUI
+#endif
+    sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(tap_port);a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    if(connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a)!=0){close(fd);return -1;}
+    if(send(fd,key,64,0)!=64){close(fd);return -1;}
+    const int flags=fcntl(fd,F_GETFL,0);fcntl(fd,F_SETFL,flags|O_NONBLOCK);
+    return fd;
+}
+// Mode::AudioRelay, preferred path: the voice PCM comes straight from the core's tap
+// listener, so nothing depends on the app, which the console suspends when a real game
+// launches (measured 2026-11-23: the app-fed relay died at that instant). The output is
+// this worker's own sceAudioOut inside SceShellUI, which keeps playing under a game's AV
+// focus. Reconnects by itself (core restart, key change) once a second.
+State run_audio_direct(char key[64]){
+    publish(State::Observing);
+    const auto init=fn<AudioOutInitCall>(AudioOutInit);
+    const auto open=fn<AudioOutOpenCall>(AudioOutOpen);
+    const auto output=fn<AudioOutOutputCall>(AudioOutOutput);
+    const auto close_out=fn<AudioOutCloseCall>(AudioOutClose);
+    const int init_rc=init();
+    note("AUDIODIRECT init rc=0x%08x",unsigned(init_rc));
+    if(init_rc!=0&&init_rc!=static_cast<int>(0x8026000e)){publish(State::Failed);return State::Failed;}
+    const int handle=open(0xff,0,0,256,48000,1);
+    note("AUDIODIRECT open rc=0x%08x",unsigned(handle));
+    if(handle<0){publish(State::Failed);return State::Failed;}
+    int fd=-1;std::uint64_t next_try=0,last_data=0,connects=0;
+    std::uint8_t pending[8192];std::size_t pending_len=0;
+    alignas(64) std::int16_t grain[256*2];
+    int writes=0,errors=0;std::uint64_t recv_bytes=0;
+    const std::uint64_t began=now_ms();
+    const std::uint64_t until=began+3550000; // under request.deadline_ms (parent.cpp)
+    auto play_grain=[&]{
+        const int rc=output(handle,grain);++writes;
+        if(rc<0){++errors;if(errors<=5||errors%100==0)note("AUDIODIRECT write #%d rc=0x%08x",writes,unsigned(rc));}
+        if(writes%200==0){
+            note("AUDIODIRECT writes=%d errors=%d recv_bytes=%llu connects=%llu",writes,errors,
+                 static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(connects));
+            publish(State::Observing);}
+    };
+    while(now_ms()<until){
+        const std::uint64_t now=now_ms();
+        if(fd<0){
+            if(now>=next_try){
+                next_try=now+1000;
+                char current[64];
+                if(read_core_key(current))std::memcpy(key,current,64); // the key is per boot: re-read it
+                fd=connect_tap(key);
+                note("AUDIODIRECT tap connect %s (attempt %llu)",fd>=0?"ok":"failed",static_cast<unsigned long long>(++connects));
+                pending_len=0;
+            }
+            if(fd<0){usleep(20000);continue;}
+        }
+        std::uint8_t buf[4096];
+        const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
+        if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
+            note("AUDIODIRECT tap closed rc=%zd errno=%d",got,errno);close(fd);fd=-1;next_try=now+500;continue;}
+        if(got>0){
+            recv_bytes+=std::uint64_t(got);last_data=now;
+            std::size_t at=0;
+            while(at<std::size_t(got)){
+                const std::size_t take=std::min(std::size_t(got)-at,sizeof pending-pending_len);
+                std::memcpy(pending+pending_len,buf+at,take);pending_len+=take;at+=take;
+                while(pending_len>=sizeof grain){
+                    std::memcpy(grain,pending,sizeof grain);
+                    std::memmove(pending,pending+sizeof grain,pending_len-sizeof grain);pending_len-=sizeof grain;
+                    play_grain();
+                }
+            }
+        } else {
+            // Idle: the last partial grain of a burst of speech is padded with silence and played
+            // rather than left to be glued onto the start of the next one.
+            if(pending_len>0&&now-last_data>40){
+                std::memset(grain,0,sizeof grain);std::memcpy(grain,pending,pending_len);pending_len=0;play_grain();}
+            else usleep(2000);
+        }
+    }
+    if(fd>=0)close(fd);
+    output(handle,nullptr);close_out(handle);
+    note("AUDIODIRECT done writes=%d errors=%d recv_bytes=%llu elapsed_ms=%llu",writes,errors,
+         static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(now_ms()-began));
+    const State result=writes>0?State::Passed:State::Failed;
+    publish(result);return result;
+}
 State run_audio_relay(){
+    {char key[64];
+     if(read_core_key(key))return run_audio_direct(key);
+     note("AUDIODIRECT no readable core key: falling back to the app-fed relay (port 9043)");}
     publish(State::Observing);
     // Fixed and known to both ends at compile time (app/src/platform/ps5/
     // audio_relay.hpp hardcodes the same value): no file handoff, which is

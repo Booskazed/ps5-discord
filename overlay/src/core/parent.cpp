@@ -133,7 +133,7 @@ static int run(){
     r.token=(now_ms()<<17)^std::uint64_t(getpid());
     // AudioRelay keeps running for as long as the app's relay connection
     // stays up (minutes); everything else is a short, bounded one-shot.
-    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?600000:75000);
+    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?3600000:75000);
     if(!write_file(parent_dir,"request.bin",r)){note("request write failed");return 1;}
     if(one_shot_only){
         Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;

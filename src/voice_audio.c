@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -286,6 +287,21 @@ static int64_t st_at;
 static int mic_head, mic_count, mic_carry = -1, mic_skip;
 static uint8_t out_buf[OUT_CAP * OUT_FRAME_BYTES];
 static size_t out_len;
+
+// LAB (branch lab/audio-out-probe only): a second, playback-only consumer of the same mixed
+// frames, for code hosted inside SceShellUI (overlay AudioRelay worker). The app's audio
+// socket dies the moment the console suspends the app for a real game, and ShellUI-hosted
+// sceAudioOut is the one output measured to survive the game taking AV focus; this lets that
+// worker pull the PCM straight from the core, which the app lifecycle does not touch.
+// Loopback only and key-authenticated like the other roles; the client sends the 64-byte
+// key and then only reads (stereo S16 48 kHz, 3840 B per 20 ms frame, best effort).
+static int tap_listen_fd = -1, tap_fd = -1, tap_pending_fd = -1;
+static char tap_pending_key[CORE_KEY_LEN];
+static size_t tap_pending_len;
+static int64_t tap_pending_ms;
+static uint8_t tap_buf[OUT_CAP * OUT_FRAME_BYTES];
+static size_t tap_len;
+static unsigned st_tap_bytes;
 
 // The external device (vau_ext_*). Its thread must never wait on the engine, which
 // holds mu through Opus and DAVE, so the two meet only in these rings under ext_mu.
@@ -571,6 +587,102 @@ static void out_push(const int16_t *stereo)
     out_len += OUT_FRAME_BYTES;
 }
 
+static void tap_close(int *fd)
+{
+    if (*fd >= 0)
+        close(*fd);
+    *fd = -1;
+}
+
+// Admits one tap client at a time (a new one replaces the old) and notices its departure.
+// poll() before accept(): a bare accept() on a descriptor this console may not keep
+// non-blocking must never be able to stall the engine thread.
+static void tap_service(void)
+{
+    if (tap_listen_fd >= 0 && tap_pending_fd < 0) {
+        struct pollfd lp = {.fd = tap_listen_fd, .events = POLLIN};
+        if (poll(&lp, 1, 0) > 0 && (lp.revents & POLLIN)) {
+            struct sockaddr_in a;
+            socklen_t l = sizeof a;
+            int fd = accept(tap_listen_fd, (struct sockaddr *)&a, &l);
+            if (fd >= 0) {
+                if (!vau_loopback(a.sin_addr.s_addr) || fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) != 0)
+                    close(fd);
+                else {
+                    tap_pending_fd = fd;
+                    tap_pending_len = 0;
+                    tap_pending_ms = now_ms();
+                }
+            }
+        }
+    }
+    if (tap_pending_fd >= 0) {
+        ssize_t r = recv(tap_pending_fd, tap_pending_key + tap_pending_len, sizeof tap_pending_key - tap_pending_len,
+                         MSG_DONTWAIT);
+        if (r > 0)
+            tap_pending_len += (size_t)r;
+        else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            tap_close(&tap_pending_fd);
+        if (tap_pending_fd >= 0 && tap_pending_len < sizeof tap_pending_key && now_ms() - tap_pending_ms > 2000) {
+            LOG("voice audio: tap refused a connection that sent no key");
+            tap_close(&tap_pending_fd);
+        }
+        if (tap_pending_fd >= 0 && tap_pending_len == sizeof tap_pending_key) {
+            if (!core_key_ok(tap_pending_key, tap_pending_len)) {
+                LOG("voice audio: tap refused a connection with the wrong key");
+                tap_close(&tap_pending_fd);
+            } else {
+                tap_close(&tap_fd);
+                tap_fd = tap_pending_fd;
+                tap_pending_fd = -1;
+                tap_len = 0;
+                int one = 1;
+                setsockopt(tap_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                LOG("voice audio: tap PCM active");
+            }
+        }
+    }
+    if (tap_fd >= 0) { // the client never sends after its key: anything but "nothing yet" is a goodbye
+        char b[64];
+        ssize_t r = recv(tap_fd, b, sizeof b, MSG_DONTWAIT);
+        if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+            LOG("voice audio: tap disconnected");
+            tap_close(&tap_fd);
+            tap_len = 0;
+        }
+    }
+}
+
+static void tap_push(const int16_t *stereo)
+{
+    if (tap_fd < 0)
+        return;
+    if (tap_len + OUT_FRAME_BYTES > sizeof tap_buf) { // behind: the oldest frame goes
+        memmove(tap_buf, tap_buf + OUT_FRAME_BYTES, tap_len - OUT_FRAME_BYTES);
+        tap_len -= OUT_FRAME_BYTES;
+    }
+    memcpy(tap_buf + tap_len, stereo, OUT_FRAME_BYTES);
+    tap_len += OUT_FRAME_BYTES;
+}
+
+static void tap_flush(void)
+{
+    while (tap_fd >= 0 && tap_len) {
+        ssize_t w = send(tap_fd, tap_buf, tap_len, MSG_DONTWAIT);
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        if (w <= 0) {
+            LOG("voice audio: tap send failed (%d)", errno);
+            tap_close(&tap_fd);
+            tap_len = 0;
+            return;
+        }
+        st_tap_bytes += (unsigned)w;
+        memmove(tap_buf, tap_buf + w, tap_len - (size_t)w);
+        tap_len -= (size_t)w;
+    }
+}
+
 // Sends one Opus frame as a UDP packet. Nothing goes out while DAVE is up but not ready.
 static void send_opus(const uint8_t *opus, size_t n)
 {
@@ -676,6 +788,9 @@ static void stats(int64_t now)
         LOG("voice audio: 5 s rx %u (no peer %u, no key %u, open failed %u) decoded %u mixed %u to app %u B, "
             "mic %u B, sent %u (seal failed %u)", st_rx, st_nopeer, st_nokey, st_open_fail, st_decoded, st_mixed,
             st_out_bytes, st_mic_bytes, st_sent, st_seal_fail);
+    if (st_at && tap_fd >= 0)
+        LOG("voice audio: 5 s tap %u B", st_tap_bytes);
+    st_tap_bytes = 0;
     st_rx = st_nopeer = st_nokey = st_open_fail = st_decoded = st_mixed = st_out_bytes = st_mic_bytes = st_sent = 0;
     st_seal_fail = 0;
     st_at = now;
@@ -791,12 +906,15 @@ static void play(void)
         pthread_mutex_unlock(&ext_mu);
         st_out_bytes += sizeof out;
         st_mixed++;
-    } else if (any && audio_clients.current >= 0) {
+    } else if (any && (audio_clients.current >= 0 || tap_fd >= 0)) {
         vau_mix_out(acc, out);
-        out_push(out);
+        if (audio_clients.current >= 0)
+            out_push(out);
+        tap_push(out);
         st_mixed++;
     }
     out_flush();
+    tap_flush();
 }
 
 static void keepalive(int64_t now)
@@ -842,6 +960,7 @@ static void tick(void)
 {
     accept_client();
     check_pending();
+    tap_service();
     pcm_clients_discard_parked(&audio_clients);
     app_client = audio_clients.parked >= 0 || (audio_clients.current >= 0 && !audio_clients.usb);
     read_mic();
@@ -902,6 +1021,8 @@ void vau_init(void)
         LOG("voice audio: Opus encoder failed, no audio");
     listen_fd = listen_loopback(VAU_PORT);
     usb_listen_fd = listen_loopback(VAU_USB_PORT);
+    tap_listen_fd = listen_loopback(VAU_TAP_PORT);
+    LOG("voice audio: tap PCM listener %s on 127.0.0.1:%d", tap_listen_fd >= 0 ? "ready" : "unavailable", VAU_TAP_PORT);
     if (usb_listen_fd < 0)
         LOG("voice audio: USB PCM listener unavailable on 127.0.0.1:%d", VAU_USB_PORT);
     if (listen_fd < 0)
