@@ -1427,7 +1427,18 @@ void probe_methods(void* klass,const char* cls){
         int is_inst=sig?fn<int(*)(void*)>(SignatureInstance)(sig):-1;
         void* ret=sig?fn<void*(*)(void*)>(SignatureReturn)(sig):nullptr;
         const char* rt=ret?fn<const char*(*)(void*)>(TypeName)(ret):nullptr;
-        note("PROBE method %s.%s params=%d instance=%d returns=%s",cls,n?n:"?",params,is_inst,rt?rt:"?");}
+        // v4: also log parameter type names so the metadata names classes that live in other assemblies
+        // (mono_signature_get_params returns one MonoType per call and advances iter, NULL ends it).
+        char pbuf[480];pbuf[0]='\0';int plen=0;
+        if(sig){
+            void* piter=nullptr;
+            for(int j=0;j<16;++j){
+                void* pt=fn<void*(*)(void*,void**)>(SignatureParams)(sig,&piter);if(!pt)break;
+                const char* pn=fn<const char*(*)(void*)>(TypeName)(pt);
+                int w=std::snprintf(pbuf+plen,sizeof(pbuf)-plen,"%s%s",plen?",":"",pn?pn:"?");
+                if(w<0||plen+w>=int(sizeof(pbuf))){plen=int(sizeof(pbuf))-1;pbuf[plen]='\0';break;}
+                plen+=w;}}
+        note("PROBE method %s.%s(%s) params=%d instance=%d returns=%s",cls,n?n:"?",pbuf,params,is_inst,rt?rt:"?");}
 }
 State run_scene_probe(){
     publish(State::Observing);
