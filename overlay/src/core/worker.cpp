@@ -1661,6 +1661,47 @@ void tile_observe(void* inst,const char* label){
         tile_graph(tgt,p,4,budget);}
     note("TILE obs %s end",label);
 }
+// Read-only structural dump of a managed object (lab): every instance field with its value, recursing into reference
+// fields. Arrays are only measured (length), never indexed, and nothing is invoked: reference fields hold either null or
+// a valid object, so ObjectClass on them is safe; no pointer is followed that the metadata does not mark as a reference.
+void tile_dump(void* obj,const char* path_,int depth,int& budget){
+    if(!obj||budget<=0)return;
+    --budget;
+    void* k=fn<void*(*)(void*)>(ObjectClass)(obj);
+    const char* cn=k?fn<const char*(*)(void*)>(ClassNameGet)(k):nullptr;
+    if(cn&&!std::strcmp(cn,"String")){
+        int slen=*(int*)((char*)obj+16);const unsigned short* su=(const unsigned short*)((char*)obj+20);
+        char buf[72];int w=0;for(int j=0;j<slen&&j<int(sizeof buf)-1;++j)buf[w++]=(su[j]<0x80)?char(su[j]):'?';buf[w]='\0';
+        note("TILE dump %s = string \"%s\"",path_,buf);return;}
+    note("TILE dump %s : %s",path_,cn?cn:"?");
+    if(!k)return;
+    for(void* walk=k;walk;walk=fn<void*(*)(void*)>(ClassParent)(walk)){
+        void* iter=nullptr;
+        for(int i=0;i<64;++i){
+            void* f=fn<void*(*)(void*,void**)>(ClassFields)(walk,&iter);if(!f)break;
+            void* ft=fn<void*(*)(void*)>(FieldType)(f);
+            const char* fname=fn<const char*(*)(void*)>(FieldName)(f);
+            const char* ftype=ft?fn<const char*(*)(void*)>(TypeName)(ft):nullptr;
+            unsigned off=fn<unsigned(*)(void*)>(FieldOffset)(f);
+            int kind=ft?fn<int(*)(void*)>(TypeKind)(ft):-1;
+            if(off<16||off>4096)continue;                          // static / literal fields report small offsets
+            const char* nm=fname?fname:"?";
+            switch(kind){
+            case 2:case 4:case 5:note("TILE dump %s.%s = %d (%s)",path_,nm,int(*((unsigned char*)obj+off)),ftype?ftype:"?");break;
+            case 6:case 7:note("TILE dump %s.%s = %d (%s)",path_,nm,int(*(unsigned short*)((char*)obj+off)),ftype?ftype:"?");break;
+            case 8:case 9:note("TILE dump %s.%s = %d (%s)",path_,nm,*(int*)((char*)obj+off),ftype?ftype:"?");break;
+            case 10:case 11:case 24:note("TILE dump %s.%s = 0x%llx (%s)",path_,nm,(unsigned long long)*(std::uint64_t*)((char*)obj+off),ftype?ftype:"?");break;
+            case 29:{void* arr=*(void**)((char*)obj+off);
+                note("TILE dump %s.%s = array %p len=%lld (%s)",path_,nm,arr,arr?(long long)*(std::uint64_t*)((char*)arr+24):-1LL,ftype?ftype:"?");break;}
+            case 18:case 21:case 28:{void* child=*(void**)((char*)obj+off);
+                if(!child){note("TILE dump %s.%s = null (%s)",path_,nm,ftype?ftype:"?");break;}
+                if(ftype&&(std::strstr(ftype,"KeyValuePair")||!std::strncmp(ftype,"System.Nullable",15))){note("TILE dump %s.%s = (skipped %s)",path_,nm,ftype);break;}
+                char np[192];std::snprintf(np,sizeof np,"%s.%s",path_,nm);
+                if(depth>0)tile_dump(child,np,depth-1,budget);
+                else note("TILE dump %s = %p (%s, depth limit)",np,child,ftype?ftype:"?");
+                break;}
+            default:break;}}}
+}
 // Mode::TileDiscord (lab): forges a Newtonsoft JObject from a JSON string (read from tile.json on disk, or a
 // safe default) and dispatches it through VoiceChatModule's own voiceChatModuleEventHandlerDic, as if the
 // native voice-chat daemon had raised the event itself. The event name is read from tile-event.txt (default
@@ -1730,6 +1771,33 @@ State run_tile_discord(){
             if(k)probe_fields(k,en);}
         // NOTE: finding the live RN VoiceChatModule instance by sweeping GC handle ids (567969f) CRASHED ShellUI on 2026-11-23.
         // Never scan handle ids or memory blindly on this Mono; derive the instance from a known root object instead.
+        // Known root: VoiceChatModule.m_cblist is a STATIC GCCallBackList (offset 0 = static; instance fields start at 16).
+        // It keeps what the module registered with the native voice-chat library. Read the static through the class vtable
+        // (class already initialised: the module exists), then dump the list's structure, read-only, to see how it reaches
+        // the module instance (delegate targets / contexts). Instance fields would be at >= 16 and are refused here.
+        void* rnk=rn?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,"ReactNative.Modules.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
+        if(rnk){
+            void* it=nullptr;
+            for(int i=0;i<256;++i){
+                void* f=fn<void*(*)(void*,void**)>(ClassFields)(rnk,&it);if(!f)break;
+                const char* fname=fn<const char*(*)(void*)>(FieldName)(f);
+                if(!fname||std::strcmp(fname,"m_cblist"))continue;
+                unsigned off=fn<unsigned(*)(void*)>(FieldOffset)(f);
+                note("TILE RN m_cblist field=%p offset=%u",f,off);
+                if(off>=16){note("TILE RN m_cblist looks like an instance field: not read");break;}
+                if(!request.functions[MonoClassVtable]||!request.functions[MonoFieldStaticGet]){note("TILE RN static read unavailable (Mono exports missing)");break;}
+                void* vt=fn<void*(*)(void*,void*)>(MonoClassVtable)(domain,rnk);
+                note("TILE RN class vtable=%p",vt);
+                if(!vt)break;
+                void* val=nullptr;
+                fn<void(*)(void*,void*,void*)>(MonoFieldStaticGet)(vt,f,&val);
+                note("TILE RN m_cblist value=%p",val);
+                if(val){
+                    void* ck=fn<void*(*)(void*)>(ObjectClass)(val);
+                    probe_fields(ck,"GCCallBackList");probe_methods(ck,"GCCallBackList");
+                    int budget=160;tile_dump(val,"RN.m_cblist",4,budget);}
+                break;}
+        }
     }
     void* img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.VoiceChat.dll");
     void* vcm=img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img,"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"):nullptr;

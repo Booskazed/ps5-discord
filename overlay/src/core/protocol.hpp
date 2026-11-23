@@ -36,6 +36,9 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // Optional lab (Mode::PartyProbe, libSceIpmi, already loaded in ShellUI): the two exports that create an IPMI client.
     // They have no public name here, so symbols[] holds their NIDs, used as they are.
     IpmiConfigInit,IpmiClientCreate,
+    // Optional lab (Mode::TileDiscord, Mono): read one STATIC field of an already initialised class (VoiceChatModule.m_cblist),
+    // the only way found to reach the live React Native module instance without scanning GC handles or memory.
+    MonoClassVtable,MonoFieldStaticGet,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -52,7 +55,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus",
     "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser",
     "sceKernelLoadStartModule","sceKernelDlsym","sysctl",
-    "O1lQ2+do5r4","0zsTiDhM0nU"};
+    "O1lQ2+do5r4","0zsTiDhM0nU",
+    "mono_class_vtable","mono_field_static_get_value"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
 // AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose

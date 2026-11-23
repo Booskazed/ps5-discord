@@ -116,6 +116,14 @@ static int run(){
                 else note("resolved ipmi %s in module %u",symbols[i],unsigned(ipmi));
                 r.functions[i]=address_value;continue;
             }
+            if(i==MonoClassVtable||i==MonoFieldStaticGet){
+                // Tile lab: standard Mono embedding exports; a miss only disables the static-field read.
+                address_value=kernel_dynlib_dlsym(r.pid,mono,symbols[i]);
+                if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,mono,nid);}
+                if(!address(address_value)){note("optional %s missing",symbols[i]);address_value=0;}
+                else note("resolved %s in Mono",symbols[i]);
+                r.functions[i]=address_value;continue;
+            }
             if(i==KernelLoadStartModule||i==KernelDlsym||i==KernelSysctl){
                 // PartyProbe lab: libkernel's own loader entry points, whichever flavour ShellUI has loaded.
                 std::uint32_t plain=0;(void)kernel_dynlib_handle(r.pid,"libkernel.sprx",&plain);
