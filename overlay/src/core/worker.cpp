@@ -1705,6 +1705,21 @@ State run_tile_discord(){
     if(!domain){note("TILE refused: Mono root domain missing");publish(State::Failed);return State::Failed;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);
     if(!thread){note("TILE refused: Mono thread attach");publish(State::Failed);return State::Failed;}
+    // Metadata only: the Control Center's own voice-chat module lives in the React Native shell assembly, with its own
+    // native event registrations. Log its classes so the next run can raise the tile through the right module.
+    {
+        void* rn=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.ReactNativeShellApp.dll");
+        note("TILE RN image=%p",rn);
+        struct Ent{const char* ns;const char* name;};
+        static const Ent ents[]={
+            {"ReactNative.Modules.ShellUI.VoiceChat","VoiceChatModule"},
+            {"ReactNative.Modules.ShellUI.VoiceChat","VoiceChatManagerModule"},
+            {"ReactNative.Modules.ShellUI.Discord","DiscordAccessorModule"}};
+        for(const auto& e:ents){
+            void* k=rn?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,e.ns,e.name):nullptr;
+            note("TILE RN class %s.%s=%p",e.ns,e.name,k);
+            if(k){probe_fields(k,e.name);probe_methods(k,e.name);describe_properties(k,e.name);}}
+    }
     void* img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.VoiceChat.dll");
     void* vcm=img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img,"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
     void* mget=vcm?fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm,"GetInstance",0):nullptr;
