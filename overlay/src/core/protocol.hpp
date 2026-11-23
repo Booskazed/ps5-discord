@@ -48,8 +48,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
 // inside ShellUI. AudioRelay plays real voice PCM piped from the app
 // (platform/ps5/audio_relay.hpp) instead of AudioTest's generated tone, for
 // as long as that connection stays up (minutes, not seconds).
-enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7};
-inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay;}
+enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7,PartyProbe=8};
+inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay||m==Mode::PartyProbe;}
 inline bool draws(Mode m){return m==Mode::Widget||m==Mode::Service;}
 // Managed Sce.PlayStation.Core.Input.GamePadData layout (value type, 36 bytes).
 struct PadData {

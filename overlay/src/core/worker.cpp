@@ -955,6 +955,40 @@ State run_audio_relay(){
     const State result=writes>0?State::Passed:State::Failed;
     publish(result);return result;
 }
+// Mode::PartyProbe only: read-only (no hooking, no AudioOut). The PS5's
+// own Party/mute tile in Game Base/Control Center survives a game taking
+// focus, for any third-party title's own voice chat, not just PSN's --
+// if that is a local, generic registration (not something tied to PSN
+// network infra this console cannot reach), finding which assembly
+// implements it is the first step toward using it for voice playback too.
+// "Game Base" is the console's own name for that hub (Parties, Messages,
+// Activities, Friends), per the user 2026-11-23.
+bool probe_party_assemblies(){
+    static constexpr const char* candidates[]={
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.GameBase.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.GameBase.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.Np.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Np.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.ControlCenter.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ControlCenter.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.QuickMenu.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Communication.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Notification.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Toast.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.SystemUI.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Friend.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Friends.dll",
+    };
+    bool any=false;
+    for(const char* path:candidates){
+        void* img=image(path);
+        note("PARTYPROBE %s -> %s",path,img?"FOUND":"missing");
+        any|=img!=nullptr;
+    }
+    return any;
+}
 State run(){
     if(request.mode==Mode::AudioTest)return run_audio_test();
     if(request.mode==Mode::AudioRelay)return run_audio_relay();
@@ -962,6 +996,7 @@ State run(){
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
     do {
+        if(request.mode==Mode::PartyProbe){result=probe_party_assemblies()?State::Resolved:State::Failed;break;}
         if(request.mode==Mode::Input){
             if(!resolve_input_methods())break;
             note("OBSERVING pad and share for at most60seconds; pure pass-through, no button changes");

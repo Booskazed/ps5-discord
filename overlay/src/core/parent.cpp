@@ -22,8 +22,8 @@
 #ifndef OVERLAY_MODE
 #define OVERLAY_MODE 0
 #endif
-#if OVERLAY_MODE<0||OVERLAY_MODE>7
-#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest, 7 audiorelay"
+#if OVERLAY_MODE<0||OVERLAY_MODE>8
+#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest, 7 audiorelay, 8 partyprobe"
 #endif
 extern "C" {extern const unsigned char overlay_worker_blob[];extern const unsigned int overlay_worker_blob_size;
 volatile sig_atomic_t overlay_abort_requested=0;
@@ -31,7 +31,7 @@ int sceKernelGetAppInfo(pid_t,void*);}
 using namespace overlay;
 // elfldr deploys every payload as payload.elf, so each mode keeps its own USB
 // xlog to keep runs attributable (workspace payload discipline).
-static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest","audiorelay"};
+static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest","audiorelay","partyprobe"};
 static FILE* logfile=nullptr,*usblog=nullptr;
 static void note(const char* fmt,...){
     char line[512];va_list ap;va_start(ap,fmt);std::vsnprintf(line,sizeof line,fmt,ap);va_end(ap);
@@ -79,11 +79,11 @@ static int run(){
     note("RESTART done; expect home screen to reload");
     return 0;
 #endif
-    // AudioTest/AudioRelay never touch Mono or install a hook (no
+    // AudioTest/AudioRelay/PartyProbe never install a hook (no
     // prepare_update_hook call at all): unlike every other mode, retrying
     // one on the same ShellUI instance carries none of the risk this
     // one-attempt marker exists to bound, so they are exempt from it.
-    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay;
+    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay&&r.mode!=Mode::PartyProbe;
     Attempt prior;
     if(one_shot_only&&read_file(parent_dir,"attempt.bin",prior)&&prior.signature==magic&&prior.pid==r.pid&&prior.epoch==r.epoch){
         note("REFUSED: one attempt already recorded for this ShellUI instance; inspect evidence, do not delete marker to retry");return 1;}
