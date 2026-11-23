@@ -108,7 +108,15 @@ static int run(){
         std::uint64_t address_value=0;
         if(optional(i)){
             // The mic and user-service lab functions live in their own modules, not in SystemService.
-            if(i==KernelLoadStartModule||i==KernelDlsym){
+            if(i==IpmiConfigInit||i==IpmiClientCreate){
+                // PartyProbe lab: libSceIpmi is already loaded in ShellUI; these exports are only known by NID.
+                std::uint32_t ipmi=0;
+                if(!kernel_dynlib_handle(r.pid,"libSceIpmi.sprx",&ipmi)&&ipmi)address_value=kernel_dynlib_resolve(r.pid,ipmi,symbols[i]);
+                if(!address(address_value)){note("optional ipmi %s missing",symbols[i]);address_value=0;}
+                else note("resolved ipmi %s in module %u",symbols[i],unsigned(ipmi));
+                r.functions[i]=address_value;continue;
+            }
+            if(i==KernelLoadStartModule||i==KernelDlsym||i==KernelSysctl){
                 // PartyProbe lab: libkernel's own loader entry points, whichever flavour ShellUI has loaded.
                 std::uint32_t plain=0;(void)kernel_dynlib_handle(r.pid,"libkernel.sprx",&plain);
                 const std::uint32_t candidates[3]={kernel,plain,web};

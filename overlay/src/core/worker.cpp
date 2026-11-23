@@ -1191,106 +1191,185 @@ State run_audio_relay(){
     const State result=writes>0?State::Passed:State::Failed;
     publish(result);return result;
 }
-// Mode::PartyProbe (lab, no Mono, no hooking, no audio): the game side of the PS5's party voice service.
-// Read offline from the console's own libSceProprietaryVoiceChatHelper.native.sprx (13.60, 69864 bytes), which
-// is a thin IPMI client of the service "ScePartyIpcService". It has four exports, at these offsets of its text:
-//   0x170 sceProprietaryVoiceChatHelperInitialize(const Param*)  Param = {u32 poolBytes (a non-zero multiple of
-//         0x4000), u8 reserved[32] (must be zero)}; connects to the service, registers this process (method 0x510000)
-//   0x430 sceProprietaryVoiceChatHelperTerminate()                (method 0x510001 on the way out)
-//   0x440 (no public name) Set(int 0/1)                           IPMI method 0x510002, one 4-byte input
-//   0x4b0 (no public name) Get(int* out)                          IPMI method 0x510003, one 4-byte output (0 or 1)
-// Errors of the helper itself are 0x816d05xx (01 not initialised, 02 already, 03 bad argument, 05 no memory,
-// 07 refused by an early check); anything else comes from the service. The meaning of Set/Get is the question
-// this probe answers; the steps (one word each, a missing file means "init get term") are read from
-// party-steps.txt next to worker.log:  init | initNNNN (pool in hex) | get | set0 | set1 | sleepN | term.
-// Whatever is registered is terminated at the end (and on the marker file stop-party), never left behind.
+// Mode::PartyProbe (lab, no Mono, no hooking, no audio): a client of the PS5's party voice service, written from what
+// the console's own libSceProprietaryVoiceChatHelper.native.sprx (13.60) and the party daemon (NPXS40109) do.
+// The helper itself is not usable from ShellUI (its file does not load there, and it refuses unless a sysctl says the
+// process is a title), so this talks to the service the way the helper does, through libSceIpmi, already loaded:
+//   cfg = default config (O1lQ2+do5r4), then the name "ScePartyIpcService", +0x1c = 1, +0x20 = 1, +0x28 = +0x30 = 0x4000;
+//   client = an object built in place in a 0x1000-byte buffer (0zsTiDhM0nU(&client,&cfg,0,buffer)); its vtable:
+//   [0] destroy, [2] connect, [3] disconnect (0x80020010 while busy), [11] invoke-sync, [17] abort.
+//   connect(&9,4,&result): session type 9 is the proprietary voice chat helper's.
+//   invoke-sync(method,in*,nIn,&result,out*,nOut): 0x510000 register(int id), 0x510001 unregister, 0x510002 set(0|1) =
+//   "my own voice chat is active", 0x510003 get(out int) = 0 or 1 (rc 0x816d0506 until a set(1); the daemon's own
+//   errors are 0x816da5xx).
+// The steps (one word each) come from party-steps.txt next to worker.log and are re-read once a second: a changed file
+// runs again, a word starting with # is ignored, and a file named stop-party ends the probe. No file: the safe default.
+//   ipmi-open  ipmi-register[=id]  ipmi-set0  ipmi-set1  ipmi-get  ipmi-unregister  ipmi-close
+//   sleepN  sysctl:a.b.c.d  open:/path  load:/path   (the last three only look, or load a library on request)
+// Whatever is open or registered is unregistered and closed at the end of every run, never left behind.
+struct IpmiBuf{const void* ptr;std::size_t size;};
 using LoadStartCall=int(*)(const char*,std::size_t,const void*,unsigned,const void*,int*);
-using DlsymCall=int(*)(int,const char*,void**);
-using HelperInitCall=int(*)(const void*);
-using HelperTermCall=int(*)();
-using HelperSetCall=int(*)(int);
-using HelperGetCall=int(*)(int*);
+using SysctlCall=int(*)(const int*,unsigned,void*,std::size_t*,const void*,std::size_t);
+using IpmiConfigInitCall=void(*)(void*);
+using IpmiCreateCall=int(*)(void**,const void*,void*,void*);
+using IpmiConnectCall=int(*)(void*,const void*,std::size_t,int*);
+using IpmiCall=int(*)(void*);
+using IpmiInvokeCall=int(*)(void*,unsigned,const IpmiBuf*,unsigned,int*,const IpmiBuf*,unsigned);
+constexpr int ipmi_busy=static_cast<int>(0x80020010);
+alignas(64) unsigned char party_client_memory[0x1000];
+alignas(64) unsigned char party_config[0x200];
 State run_party_probe(){
     publish(State::Observing);
-    note("PARTY start pid=%d",int(getpid()));
-    const auto load=fn<LoadStartCall>(KernelLoadStartModule);
-    const auto find=fn<DlsymCall>(KernelDlsym);
-    if(!load||!find){note("PARTY refused: sceKernelLoadStartModule/sceKernelDlsym were not resolved");publish(State::Failed);return State::Failed;}
-    int res=0;
-    const int lib_handle=load("/system/common/lib/libSceProprietaryVoiceChatHelper.native.sprx",0,nullptr,0,nullptr,&res);
-    note("PARTY load handle=0x%08x res=0x%08x",unsigned(lib_handle),unsigned(res));
-    if(lib_handle<0){publish(State::Failed);return State::Failed;}
-    void* init_at=nullptr;void* term_at=nullptr;
-    const int rc_init=find(lib_handle,"sceProprietaryVoiceChatHelperInitialize",&init_at);
-    const int rc_term=find(lib_handle,"sceProprietaryVoiceChatHelperTerminate",&term_at);
-    note("PARTY dlsym init rc=0x%08x at=%p term rc=0x%08x at=%p",unsigned(rc_init),init_at,unsigned(rc_term),term_at);
-    if(rc_init||rc_term||!init_at||!term_at){publish(State::Failed);return State::Failed;}
-    const auto init_addr=reinterpret_cast<std::uintptr_t>(init_at);
-    const auto term_addr=reinterpret_cast<std::uintptr_t>(term_at);
-    if(term_addr!=init_addr-0x170+0x430){note("PARTY refused: Terminate is not at the offset measured on 13.60");publish(State::Failed);return State::Failed;}
-    const std::uintptr_t base=init_addr-0x170;
-    // Set and Get have no public name here: derive them from the base and check their opening bytes before use.
-    const auto* set_code=reinterpret_cast<const unsigned char*>(base+0x440);
-    const auto* get_code=reinterpret_cast<const unsigned char*>(base+0x4b0);
-    const bool set_ok=set_code[0]==0x48&&set_code[1]==0x83&&set_code[2]==0x3d;               // cmp qword [rip+x],imm8
-    const bool get_ok=get_code[0]==0x55&&get_code[1]==0x48&&get_code[2]==0x89&&get_code[3]==0xe5; // push rbp; mov rbp,rsp
-    note("PARTY exports set=%p(%s) get=%p(%s)",static_cast<const void*>(set_code),set_ok?"ok":"UNEXPECTED BYTES",
-         static_cast<const void*>(get_code),get_ok?"ok":"UNEXPECTED BYTES");
-    char words[512]{};
-    {char fp[256];
-     if(path(fp,sizeof fp,worker_dir,"party-steps.txt")){
-         FILE* f=std::fopen(fp,"rb");
-         if(f){const std::size_t got=std::fread(words,1,sizeof words-1,f);words[got]=0;std::fclose(f);}}}
-    if(!words[0])std::snprintf(words,sizeof words,"init get term");
-    note("PARTY steps: %s",words);
+    note("PARTY start pid=%d shell_app=0x%x",int(getpid()),unsigned(request.shell_app));
+    const auto config_init=fn<IpmiConfigInitCall>(IpmiConfigInit);
+    const auto create=fn<IpmiCreateCall>(IpmiClientCreate);
+    if(!config_init||!create){note("PARTY refused: the libSceIpmi client functions were not resolved");publish(State::Failed);return State::Failed;}
+    void* client=nullptr;bool registered=false;int problems=0,runs=0;
     auto stop_requested=[&]{
         char fp[256];if(!path(fp,sizeof fp,worker_dir,"stop-party"))return false;
         FILE* f=std::fopen(fp,"rb");if(!f)return false;std::fclose(f);return true;};
-    bool registered=false;int steps=0,bad=0;
-    char* cursor=words;
-    for(;;){
-        while(*cursor==' '||*cursor=='\n'||*cursor=='\r'||*cursor=='\t')++cursor;
-        if(!*cursor||steps>=40)break;
-        char* word=cursor;
-        while(*cursor&&*cursor!=' '&&*cursor!='\n'&&*cursor!='\r'&&*cursor!='\t')++cursor;
-        if(*cursor)*cursor++=0;
-        ++steps;
-        if(stop_requested()){note("PARTY stop-party marker: leaving");break;}
-        if(!std::strncmp(word,"init",4)){
-            alignas(8) unsigned char param[36]{};
-            std::uint32_t pool=0x10000;
-            if(word[4])pool=static_cast<std::uint32_t>(std::strtoul(word+4,nullptr,16));
-            std::memcpy(param,&pool,sizeof pool);
-            const int rc=reinterpret_cast<HelperInitCall>(init_addr)(param);
-            note("PARTY step init pool=0x%x rc=0x%08x",unsigned(pool),unsigned(rc));
-            if(rc==0)registered=true;else ++bad;
-        } else if(!std::strcmp(word,"term")){
-            const int rc=reinterpret_cast<HelperTermCall>(term_addr)();
-            note("PARTY step term rc=0x%08x",unsigned(rc));registered=false;
-        } else if(!std::strcmp(word,"get")){
-            int value=-99;
-            const int rc=get_ok?reinterpret_cast<HelperGetCall>(base+0x4b0)(&value):-1;
-            note("PARTY step get rc=0x%08x value=%d",unsigned(rc),value);
-            if(rc!=0)++bad;
-        } else if(!std::strcmp(word,"set0")||!std::strcmp(word,"set1")){
-            const int want=word[3]=='1'?1:0;
-            const int rc=set_ok?reinterpret_cast<HelperSetCall>(base+0x440)(want):-1;
-            note("PARTY step set%d rc=0x%08x",want,unsigned(rc));
-            if(rc!=0)++bad;
-        } else if(!std::strncmp(word,"sleep",5)){
-            const int seconds=std::atoi(word+5);
-            note("PARTY step sleep %d s",seconds);
-            for(int s=0;s<seconds&&s<300&&!stop_requested()&&now_ms()+2000<request.deadline_ms;++s)usleep(1000000);
-        } else {
-            note("PARTY step '%s' unknown, skipped",word);++bad;
+    // A vtable entry of the open client, or null when anything about it looks wrong.
+    auto slot=[&](unsigned index)->void*{
+        if(!client)return nullptr;
+        void** vt=*static_cast<void***>(client);
+        if(!vt||!address(reinterpret_cast<std::uintptr_t>(vt)))return nullptr;
+        void* f=vt[index];
+        return address(reinterpret_cast<std::uintptr_t>(f))?f:nullptr;};
+    auto invoke=[&](unsigned method,const IpmiBuf* in,unsigned in_count,const IpmiBuf* out,unsigned out_count,int& result)->int{
+        void* f=slot(11);
+        result=-1;
+        if(!f)return -1;
+        return reinterpret_cast<IpmiInvokeCall>(f)(client,method,in,in_count,&result,out,out_count);};
+    // The helper's own teardown: disconnect until it stops being busy, a forced abort if it never does, then destroy.
+    auto close_client=[&]{
+        if(!client)return;
+        if(void* disconnect=slot(3)){
+            int rc=0;
+            for(int i=0;i<11;++i){rc=reinterpret_cast<IpmiCall>(disconnect)(client);if(rc!=ipmi_busy)break;usleep(2000);}
+            note("PARTY close disconnect rc=0x%08x",unsigned(rc));
+            if(rc==ipmi_busy){if(void* abort_call=slot(17)){const int arc=reinterpret_cast<IpmiCall>(abort_call)(client);note("PARTY close abort rc=0x%08x",unsigned(arc));}}
+        }
+        if(void* destroy=slot(0))(void)reinterpret_cast<IpmiCall>(destroy)(client);
+        note("PARTY close done");
+        client=nullptr;registered=false;};
+    auto run_steps=[&](char* text){
+        char* cursor=text;int steps=0;++runs;
+        for(;;){
+            while(*cursor==' '||*cursor=='\n'||*cursor=='\r'||*cursor=='\t')++cursor;
+            if(!*cursor||steps>=40)break;
+            char* word=cursor;
+            while(*cursor&&*cursor!=' '&&*cursor!='\n'&&*cursor!='\r'&&*cursor!='\t')++cursor;
+            if(*cursor)*cursor++=0;
+            if(word[0]=='#')continue;
+            ++steps;
+            if(stop_requested()){note("PARTY stop-party marker: leaving this run");break;}
+            if(!std::strcmp(word,"ipmi-open")){
+                if(client){note("PARTY ipmi-open: a client is already open");++problems;continue;}
+                std::memset(party_config,0,sizeof party_config);
+                std::memset(party_client_memory,0,sizeof party_client_memory);
+                config_init(party_config);
+                std::memcpy(party_config,"ScePartyIpcService",19);
+                const std::int32_t pair[2]={1,1};
+                std::memcpy(party_config+0x1c,pair,sizeof pair);
+                const std::uint64_t buffer_size=0x4000;
+                std::memcpy(party_config+0x28,&buffer_size,sizeof buffer_size);
+                std::memcpy(party_config+0x30,&buffer_size,sizeof buffer_size);
+                void* created=nullptr;
+                const int rc=create(&created,party_config,nullptr,party_client_memory);
+                note("PARTY ipmi-open create rc=0x%08x client=%p",unsigned(rc),created);
+                if(rc!=0||!created){++problems;continue;}
+                client=created;
+                void* connect_fn=slot(2);
+                if(!connect_fn||!slot(3)||!slot(11)||!slot(0)){note("PARTY ipmi-open: the client's vtable looks wrong, closing it");close_client();++problems;continue;}
+                const int session_type=9;int accepted=-1;
+                const int crc=reinterpret_cast<IpmiConnectCall>(connect_fn)(client,&session_type,sizeof session_type,&accepted);
+                note("PARTY ipmi-open connect rc=0x%08x result=0x%08x",unsigned(crc),unsigned(accepted));
+                if(crc<0||accepted<0){close_client();++problems;continue;}
+            } else if(!std::strncmp(word,"ipmi-register",13)){
+                if(!client){note("PARTY %s: no client open",word);++problems;continue;}
+                int id=request.shell_app;
+                if(const char* eq=std::strchr(word,'='))id=static_cast<int>(std::strtol(eq+1,nullptr,0));
+                const IpmiBuf in{&id,sizeof id};int result=-1;
+                const int rc=invoke(0x510000,&in,1,nullptr,0,result);
+                note("PARTY ipmi-register id=0x%x rc=0x%08x result=0x%08x",unsigned(id),unsigned(rc),unsigned(result));
+                if(rc==0&&result==0)registered=true;else ++problems;
+            } else if(!std::strcmp(word,"ipmi-unregister")){
+                if(!client){note("PARTY ipmi-unregister: no client open");++problems;continue;}
+                int result=-1;
+                const int rc=invoke(0x510001,nullptr,0,nullptr,0,result);
+                note("PARTY ipmi-unregister rc=0x%08x result=0x%08x",unsigned(rc),unsigned(result));
+                if(rc==0&&result==0)registered=false;else ++problems;
+            } else if(!std::strcmp(word,"ipmi-set0")||!std::strcmp(word,"ipmi-set1")){
+                if(!client){note("PARTY %s: no client open",word);++problems;continue;}
+                int value=word[8]=='1'?1:0;
+                const IpmiBuf in{&value,sizeof value};int result=-1;
+                const int rc=invoke(0x510002,&in,1,nullptr,0,result);
+                note("PARTY ipmi-set%d rc=0x%08x result=0x%08x",value,unsigned(rc),unsigned(result));
+                if(rc!=0||result!=0)++problems;
+            } else if(!std::strcmp(word,"ipmi-get")){
+                if(!client){note("PARTY ipmi-get: no client open");++problems;continue;}
+                int value=-99;const IpmiBuf out{&value,sizeof value};int result=-1;
+                const int rc=invoke(0x510003,nullptr,0,&out,1,result);
+                // 0x816d0506 before any set(1) is the daemon's normal answer, not a problem.
+                note("PARTY ipmi-get rc=0x%08x result=0x%08x value=%d",unsigned(rc),unsigned(result),value);
+                if(rc!=0)++problems;
+            } else if(!std::strcmp(word,"ipmi-close")){
+                close_client();
+            } else if(!std::strncmp(word,"sleep",5)){
+                const int seconds=std::atoi(word+5);
+                note("PARTY sleep %d s",seconds);
+                for(int s=0;s<seconds&&s<300&&!stop_requested()&&now_ms()+8000<request.deadline_ms;++s)usleep(1000000);
+            } else if(!std::strncmp(word,"sysctl:",7)){
+                const auto sysctl_call=fn<SysctlCall>(KernelSysctl);
+                if(!sysctl_call){note("PARTY sysctl was not resolved");++problems;continue;}
+                int mib[6]{};unsigned count=0;const char* at=word+7;
+                while(*at&&count<6){char* stop=nullptr;mib[count++]=static_cast<int>(std::strtol(at,&stop,10));if(stop==at)break;at=(*stop=='.')?stop+1:stop;}
+                unsigned char data[32]{};std::size_t length=sizeof data;
+                const int rc=sysctl_call(mib,count,data,&length,nullptr,0);
+                std::uint32_t d[4]{};std::memcpy(d,data,sizeof d);
+                note("PARTY sysctl %s rc=%d len=%zu d0=0x%08x d1=0x%08x d2=0x%08x d3=0x%08x",word+7,rc,length,unsigned(d[0]),unsigned(d[1]),unsigned(d[2]),unsigned(d[3]));
+            } else if(!std::strncmp(word,"open:",5)){
+                const int fd=open(word+5,O_RDONLY);const int err=errno;
+                note("PARTY open %s -> %d errno=%d",word+5,fd,fd<0?err:0);
+                if(fd>=0)close(fd);
+            } else if(!std::strncmp(word,"load:",5)){
+                const auto load=fn<LoadStartCall>(KernelLoadStartModule);
+                if(!load){note("PARTY load was not resolved");++problems;continue;}
+                int res=0;const int handle=load(word+5,0,nullptr,0,nullptr,&res);
+                note("PARTY load %s -> 0x%08x res=0x%08x",word+5,unsigned(handle),unsigned(res));
+            } else {
+                note("PARTY step '%s' unknown, skipped",word);++problems;
+            }
+        }
+        if(registered&&client){
+            int result=-1;
+            const int rc=invoke(0x510001,nullptr,0,nullptr,0,result);
+            note("PARTY cleanup unregister rc=0x%08x result=0x%08x",unsigned(rc),unsigned(result));
+        }
+        close_client();};
+    char words[512]{},last[512]{};
+    auto read_steps=[&](char* out)->bool{
+        out[0]=0;
+        char fp[256];if(!path(fp,sizeof fp,worker_dir,"party-steps.txt"))return false;
+        FILE* f=std::fopen(fp,"rb");if(!f)return false;
+        const std::size_t got=std::fread(out,1,511,f);out[got]=0;std::fclose(f);return got>0;};
+    if(!read_steps(words))std::snprintf(words,sizeof words,"ipmi-open ipmi-register ipmi-get ipmi-unregister ipmi-close");
+    std::memcpy(last,words,sizeof last);
+    note("PARTY steps: %s",words);
+    run_steps(words);
+    const std::uint64_t until=request.deadline_ms>6000?request.deadline_ms-6000:0;
+    while(now_ms()<until&&!stop_requested()){
+        usleep(1000000);
+        char next[512]{};
+        if(read_steps(next)&&std::strcmp(next,last)!=0){
+            std::memcpy(last,next,sizeof last);
+            note("PARTY steps changed: %s",next);
+            run_steps(next);
         }
     }
-    if(registered){
-        const int rc=reinterpret_cast<HelperTermCall>(term_addr)();
-        note("PARTY cleanup term rc=0x%08x",unsigned(rc));
-    }
-    note("PARTY done steps=%d problems=%d",steps,bad);
-    const State result=bad==0?State::Passed:State::Failed;
+    close_client();
+    note("PARTY done runs=%d problems=%d",runs,problems);
+    const State result=problems==0?State::Passed:State::Failed;
     publish(result);return result;
 }
 State run(){

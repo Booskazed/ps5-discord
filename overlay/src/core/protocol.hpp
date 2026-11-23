@@ -32,7 +32,10 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // ShellUI-hosted mic survives a game taking AV focus after the console killed the app.
     AudioInOpen,AudioInInput,AudioInClose,UserGetForegroundUser,
     // Optional lab (Mode::PartyProbe, libkernel): load a system library inside ShellUI and find its exports.
-    KernelLoadStartModule,KernelDlsym,
+    KernelLoadStartModule,KernelDlsym,KernelSysctl,
+    // Optional lab (Mode::PartyProbe, libSceIpmi, already loaded in ShellUI): the two exports that create an IPMI client.
+    // They have no public name here, so symbols[] holds their NIDs, used as they are.
+    IpmiConfigInit,IpmiClientCreate,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -48,7 +51,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "sceAudioOutInit","sceAudioOutOpen","sceAudioOutOutput","sceAudioOutClose",
     "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus",
     "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser",
-    "sceKernelLoadStartModule","sceKernelDlsym"};
+    "sceKernelLoadStartModule","sceKernelDlsym","sysctl",
+    "O1lQ2+do5r4","0zsTiDhM0nU"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
 // AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose
