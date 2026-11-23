@@ -296,13 +296,14 @@ static size_t out_len;
 // Loopback only and key-authenticated like the other roles; the client sends the 64-byte
 // key and then only reads (stereo S16 48 kHz, 3840 B per 20 ms frame, best effort).
 static int tap_listen_fd = -1, tap_fd = -1, tap_pending_fd = -1;
-static char tap_pending_key[CORE_KEY_LEN];
+static char tap_pending_key[CORE_KEY_LEN + 4]; // the key, then (v2 clients) "TAP2"
 static size_t tap_pending_len;
 static int64_t tap_pending_ms;
 static uint8_t tap_buf[OUT_CAP * OUT_FRAME_BYTES];
 static size_t tap_len;
 static unsigned st_tap_bytes;
 static unsigned st_tap_mic_bytes;
+static int tap_v2; // the current tap client said "TAP2": a v1 client (older worker) never replaces it
 static int64_t app_mic_ms; // when the app's own socket last delivered mic bytes (tap mic yields to it)
 
 // The external device (vau_ext_*). Its thread must never wait on the engine, which
@@ -627,40 +628,54 @@ static void tap_service(void)
             tap_pending_len += (size_t)r;
         else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
             tap_close(&tap_pending_fd);
-        if (tap_pending_fd >= 0 && tap_pending_len < sizeof tap_pending_key && now_ms() - tap_pending_ms > 2000) {
+        if (tap_pending_fd >= 0 && tap_pending_len < CORE_KEY_LEN && now_ms() - tap_pending_ms > 2000) {
             LOG("voice audio: tap refused a connection that sent no key");
             tap_close(&tap_pending_fd);
         }
-        if (tap_pending_fd >= 0 && tap_pending_len == sizeof tap_pending_key) {
-            if (!core_key_ok(tap_pending_key, tap_pending_len)) {
+        // The key is 64 bytes; a v2 client sends "TAP2" right behind it in the same write, so give those
+        // 4 bytes 50 ms to show up before taking the client for a v1 one.
+        if (tap_pending_fd >= 0 && tap_pending_len >= CORE_KEY_LEN &&
+            (tap_pending_len == sizeof tap_pending_key || now_ms() - tap_pending_ms > 50)) {
+            int v2 = tap_pending_len == sizeof tap_pending_key &&
+                     memcmp(tap_pending_key + CORE_KEY_LEN, "TAP2", 4) == 0;
+            if (!core_key_ok(tap_pending_key, CORE_KEY_LEN)) {
                 LOG("voice audio: tap refused a connection with the wrong key");
+                tap_close(&tap_pending_fd);
+            } else if (tap_fd >= 0 && tap_v2 && !v2) {
+                // An older worker that keeps reconnecting every second made two clients take the socket
+                // from each other (measured 2026-11-23): a v2 client is never replaced by a v1 one.
                 tap_close(&tap_pending_fd);
             } else {
                 tap_close(&tap_fd);
                 tap_fd = tap_pending_fd;
                 tap_pending_fd = -1;
                 tap_len = 0;
+                tap_v2 = v2;
+                mic_carry = -1; // no half sample left from the previous client's stream
                 int one = 1;
                 setsockopt(tap_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
-                LOG("voice audio: tap PCM active");
+                LOG("voice audio: tap PCM active (%s)", v2 ? "v2" : "v1");
             }
         }
-    }
-    if (tap_fd >= 0) {
+    }    if (tap_fd >= 0) {
         // After its key the client may send its microphone (mono S16 LE 48 kHz), captured inside
         // SceShellUI where it survives the console killing the app for a game. It counts only while
         // the app is not delivering a mic itself, so the two sources never mix.
-        uint8_t b[2048];
-        ssize_t r = recv(tap_fd, b, sizeof b, MSG_DONTWAIT);
-        if (r > 0) {
-            if (audio_clients.current < 0 || now_ms() - app_mic_ms > 300) {
-                mic_push(b, (size_t)r);
-                st_tap_mic_bytes += (unsigned)r;
-            }
-        } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-            LOG("voice audio: tap disconnected");
-            tap_close(&tap_fd);
-            tap_len = 0;
+        uint8_t b[4096];
+        for (int i = 0; i < 4 && tap_fd >= 0; i++) { // a 48 kHz mono mic is ~1.9 KB per 20 ms tick
+            ssize_t r = recv(tap_fd, b, sizeof b, MSG_DONTWAIT);
+            if (r > 0) {
+                if (audio_clients.current < 0 || now_ms() - app_mic_ms > 300) {
+                    mic_push(b, (size_t)r);
+                    st_tap_mic_bytes += (unsigned)r;
+                }
+            } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                LOG("voice audio: tap disconnected");
+                tap_close(&tap_fd);
+                tap_len = 0;
+                tap_v2 = 0;
+            } else
+                break;
         }
     }
 }
@@ -687,6 +702,7 @@ static void tap_flush(void)
             LOG("voice audio: tap send failed (%d)", errno);
             tap_close(&tap_fd);
             tap_len = 0;
+            tap_v2 = 0;
             return;
         }
         st_tap_bytes += (unsigned)w;

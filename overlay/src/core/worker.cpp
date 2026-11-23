@@ -913,7 +913,9 @@ int connect_tap(const char key[64]){
 #endif
     sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(tap_port);a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
     if(connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a)!=0){close(fd);return -1;}
-    if(send(fd,key,64,0)!=64){close(fd);return -1;}
+    // The key, then "TAP2" in the same write: a v2 client is never replaced by an older worker's reconnects.
+    char hello[68];std::memcpy(hello,key,64);std::memcpy(hello+64,"TAP2",4);
+    if(send(fd,hello,sizeof hello,0)!=ssize_t(sizeof hello)){close(fd);return -1;}
     const int flags=fcntl(fd,F_GETFL,0);fcntl(fd,F_SETFL,flags|O_NONBLOCK);
     return fd;
 }
@@ -963,7 +965,7 @@ State run_audio_direct(char key[64]){
     }
     alignas(64) std::int16_t mic_grain[256];
     int fd=-1;std::uint64_t next_try=0,last_data=0,connects=0;
-    std::uint8_t pending[8192];std::size_t pending_len=0;
+    static std::uint8_t pending[32768];std::size_t pending_len=0; // ~170 ms of stereo, off the thread stack
     alignas(64) std::int16_t grain[256*2];
     int writes=0,errors=0;std::uint64_t recv_bytes=0;
     const std::uint64_t began=now_ms();
@@ -976,9 +978,53 @@ State run_audio_direct(char key[64]){
                  static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(connects));
             publish(State::Observing);}
     };
+    // One grain of playback and one grain of mic per pass, never a burst of either: AudioOut and AudioIn each
+    // block for one 5.33 ms grain, and the old "play everything that arrived" loop spent ~20 ms in playback per
+    // core frame, so the mic was read at ~30% of real time and reached the core crackling and cut
+    // (measured 2026-11-23: 28 KB/s of the 96 KB/s a 48 kHz S16 mono mic makes).
+    std::uint64_t last_stop_check=0;
     while(now_ms()<until){
         const std::uint64_t now=now_ms();
-        if(mic>=0){ // blocks for one 5 ms grain: this loop's clock while the probe runs
+        if(now-last_stop_check>1000){ // an empty marker file `stop-audio` ends this worker (it holds the lock until then)
+            last_stop_check=now;
+            char sp[256];FILE* sf=path(sp,sizeof sp,worker_dir,"stop-audio")?std::fopen(sp,"rb"):nullptr;
+            if(sf){std::fclose(sf);note("AUDIODIRECT stop-audio marker found: ending");break;}
+        }
+        if(fd<0&&now>=next_try){
+            next_try=now+1000;
+            char current[64];
+            if(read_core_key(current))std::memcpy(key,current,64); // the key is per boot: re-read it
+            fd=connect_tap(key);
+            note("AUDIODIRECT tap connect %s (attempt %llu)",fd>=0?"ok":"failed",static_cast<unsigned long long>(++connects));
+            pending_len=0;
+        }
+        if(fd>=0){
+            std::uint8_t buf[4096];
+            const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
+            if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
+                note("AUDIODIRECT tap closed rc=%zd errno=%d",got,errno);close(fd);fd=-1;next_try=now+500;
+            } else if(got>0){
+                recv_bytes+=std::uint64_t(got);last_data=now;
+                if(pending_len+std::size_t(got)>sizeof pending){ // behind: the oldest whole grains go, frames stay aligned
+                    std::size_t drop=pending_len+std::size_t(got)-sizeof pending;
+                    drop=(drop+sizeof grain-1)/sizeof grain*sizeof grain;
+                    if(drop>pending_len)drop=pending_len;
+                    std::memmove(pending,pending+drop,pending_len-drop);pending_len-=drop;
+                }
+                std::memcpy(pending+pending_len,buf,std::size_t(got));pending_len+=std::size_t(got);
+            }
+        }
+        bool busy=false;
+        if(pending_len>=sizeof grain){
+            std::memcpy(grain,pending,sizeof grain);
+            std::memmove(pending,pending+sizeof grain,pending_len-sizeof grain);pending_len-=sizeof grain;
+            play_grain();busy=true;
+        } else if(pending_len>0&&now-last_data>40){
+            // Idle: the last partial grain of a burst of speech is padded with silence and played
+            // rather than left to be glued onto the start of the next one.
+            std::memset(grain,0,sizeof grain);std::memcpy(grain,pending,pending_len);pending_len=0;play_grain();busy=true;
+        }
+        if(mic>=0){ // blocks for one 5.33 ms grain (usually already waiting after the playback call)
             const int rc=fn<AudioInInputCall>(AudioInInput)(mic,mic_grain);++mic_reads;
             if(rc<0){
                 ++mic_errors;
@@ -987,6 +1033,7 @@ State run_audio_direct(char key[64]){
                 }
                 usleep(5000);
             } else {
+                busy=true;
                 for(int i=0;i<256;i++){const int a=mic_grain[i]<0?-int(mic_grain[i]):int(mic_grain[i]);
                     if(a>mic_peak)mic_peak=a;mic_sq+=double(mic_grain[i])*double(mic_grain[i]);}
                 mic_n+=256;
@@ -1004,40 +1051,7 @@ State run_audio_direct(char key[64]){
                      static_cast<unsigned long long>(mic_errors),mic_peak,int(rms),static_cast<unsigned long long>(mic_sent));
                 mic_peak=0;mic_sq=0;mic_n=0;}
         }
-        if(fd<0){
-            if(now>=next_try){
-                next_try=now+1000;
-                char current[64];
-                if(read_core_key(current))std::memcpy(key,current,64); // the key is per boot: re-read it
-                fd=connect_tap(key);
-                note("AUDIODIRECT tap connect %s (attempt %llu)",fd>=0?"ok":"failed",static_cast<unsigned long long>(++connects));
-                pending_len=0;
-            }
-            if(fd<0){usleep(20000);continue;}
-        }
-        std::uint8_t buf[4096];
-        const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
-        if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
-            note("AUDIODIRECT tap closed rc=%zd errno=%d",got,errno);close(fd);fd=-1;next_try=now+500;continue;}
-        if(got>0){
-            recv_bytes+=std::uint64_t(got);last_data=now;
-            std::size_t at=0;
-            while(at<std::size_t(got)){
-                const std::size_t take=std::min(std::size_t(got)-at,sizeof pending-pending_len);
-                std::memcpy(pending+pending_len,buf+at,take);pending_len+=take;at+=take;
-                while(pending_len>=sizeof grain){
-                    std::memcpy(grain,pending,sizeof grain);
-                    std::memmove(pending,pending+sizeof grain,pending_len-sizeof grain);pending_len-=sizeof grain;
-                    play_grain();
-                }
-            }
-        } else {
-            // Idle: the last partial grain of a burst of speech is padded with silence and played
-            // rather than left to be glued onto the start of the next one.
-            if(pending_len>0&&now-last_data>40){
-                std::memset(grain,0,sizeof grain);std::memcpy(grain,pending,pending_len);pending_len=0;play_grain();}
-            else usleep(2000);
-        }
+        if(!busy)usleep(fd>=0?2000:20000); // nothing to play or capture right now; do not spin
     }
     if(fd>=0)close(fd);
     if(mic>=0)fn<AudioInCloseCall>(AudioInClose)(mic);
