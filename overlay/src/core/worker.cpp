@@ -983,8 +983,10 @@ State run_audio_direct(char key[64]){
     // core frame, so the mic was read at ~30% of real time and reached the core crackling and cut
     // (measured 2026-11-23: 28 KB/s of the 96 KB/s a 48 kHz S16 mono mic makes).
     std::uint64_t last_stop_check=0;
+    std::uint64_t pass_max=0,slow_passes=0,send_eagain=0,dropped_bytes=0; // timing evidence, logged with the mic level
     while(now_ms()<until){
         const std::uint64_t now=now_ms();
+        const std::uint64_t pass_began=now;
         if(now-last_stop_check>1000){ // an empty marker file `stop-audio` ends this worker (it holds the lock until then)
             last_stop_check=now;
             char sp[256];FILE* sf=path(sp,sizeof sp,worker_dir,"stop-audio")?std::fopen(sp,"rb"):nullptr;
@@ -1009,6 +1011,7 @@ State run_audio_direct(char key[64]){
                     std::size_t drop=pending_len+std::size_t(got)-sizeof pending;
                     drop=(drop+sizeof grain-1)/sizeof grain*sizeof grain;
                     if(drop>pending_len)drop=pending_len;
+                    dropped_bytes+=drop;
                     std::memmove(pending,pending+drop,pending_len-drop);pending_len-=drop;
                 }
                 std::memcpy(pending+pending_len,buf,std::size_t(got));pending_len+=std::size_t(got);
@@ -1043,14 +1046,19 @@ State run_audio_direct(char key[64]){
                     const ssize_t sent=send(fd,mic_grain,sizeof mic_grain,MSG_DONTWAIT);
                     if(sent>0&&sent<ssize_t(sizeof mic_grain))note("AUDIOIN partial send %zd",sent);
                     else if(sent>0)mic_sent+=std::uint64_t(sent);
+                    else if(sent<0&&(errno==EAGAIN||errno==EWOULDBLOCK))++send_eagain;
                 }
             }
             if(mic_reads%200==0){
                 const double rms=mic_n?std::sqrt(mic_sq/double(mic_n)):0.0;
-                note("AUDIOIN reads=%llu errors=%llu peak=%d rms=%d sent=%llu",static_cast<unsigned long long>(mic_reads),
-                     static_cast<unsigned long long>(mic_errors),mic_peak,int(rms),static_cast<unsigned long long>(mic_sent));
-                mic_peak=0;mic_sq=0;mic_n=0;}
+                note("AUDIOIN reads=%llu errors=%llu peak=%d rms=%d sent=%llu passmax=%llums slow=%llu eagain=%llu dropped=%llu pending=%zu",
+                     static_cast<unsigned long long>(mic_reads),static_cast<unsigned long long>(mic_errors),mic_peak,int(rms),
+                     static_cast<unsigned long long>(mic_sent),static_cast<unsigned long long>(pass_max),
+                     static_cast<unsigned long long>(slow_passes),static_cast<unsigned long long>(send_eagain),
+                     static_cast<unsigned long long>(dropped_bytes),pending_len);
+                mic_peak=0;mic_sq=0;mic_n=0;pass_max=0;}
         }
+        {const std::uint64_t took=now_ms()-pass_began;if(took>pass_max)pass_max=took;if(took>15)++slow_passes;}
         if(!busy)usleep(fd>=0?2000:20000); // nothing to play or capture right now; do not spin
     }
     if(fd>=0)close(fd);

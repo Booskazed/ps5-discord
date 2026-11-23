@@ -303,6 +303,8 @@ static uint8_t tap_buf[OUT_CAP * OUT_FRAME_BYTES];
 static size_t tap_len;
 static unsigned st_tap_bytes;
 static unsigned st_tap_mic_bytes;
+static int64_t tick_last_ms;
+static unsigned st_tick_max, st_tick_late, st_lag_drops, st_double_ticks; // LAB engine timing, per 5 s
 static int tap_v2; // the current tap client said "TAP2": a v1 client (older worker) never replaces it
 static int64_t app_mic_ms; // when the app's own socket last delivered mic bytes (tap mic yields to it)
 
@@ -791,7 +793,10 @@ static void tx(void)
         int drop = mic_count - 2 * VAU_FRAME;
         mic_head = (mic_head + drop) % MIC_CAP;
         mic_count -= drop;
+        st_lag_drops += (unsigned)drop;
     }
+    if (mic_count >= 2 * VAU_FRAME)
+        st_double_ticks++;
     for (int k = 0; k < 2 && mic_count >= VAU_FRAME; k++) {
         for (int i = 0; i < VAU_FRAME; i++)
             f[i] = mic[(mic_head + i) % MIC_CAP];
@@ -818,7 +823,11 @@ static void stats(int64_t now)
             st_out_bytes, st_mic_bytes, st_sent, st_seal_fail);
     if (st_at && tap_fd >= 0)
         LOG("voice audio: 5 s tap %u B out, mic %u B in", st_tap_bytes, st_tap_mic_bytes);
+    if (st_at)
+        LOG("voice audio: 5 s engine: tick max %u ms, late(>40) %u, mic lag drops %u samples, ticks with 2+ frames %u",
+            st_tick_max, st_tick_late, st_lag_drops, st_double_ticks);
     st_tap_bytes = st_tap_mic_bytes = 0;
+    st_tick_max = st_tick_late = st_lag_drops = st_double_ticks = 0;
     st_rx = st_nopeer = st_nokey = st_open_fail = st_decoded = st_mixed = st_out_bytes = st_mic_bytes = st_sent = 0;
     st_seal_fail = 0;
     st_at = now;
@@ -986,6 +995,16 @@ static void read_ext_mic(void)
 
 static void tick(void)
 {
+    // LAB: how late the 20 ms engine ticks run while a game takes the CPU (stats() reports it).
+    int64_t tick_now = now_ms();
+    if (tick_last_ms) {
+        int64_t gap = tick_now - tick_last_ms;
+        if (gap > st_tick_max)
+            st_tick_max = (unsigned)gap;
+        if (gap > 40)
+            st_tick_late++;
+    }
+    tick_last_ms = tick_now;
     accept_client();
     check_pending();
     tap_service();
