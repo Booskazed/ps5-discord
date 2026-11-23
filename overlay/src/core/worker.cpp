@@ -882,8 +882,7 @@ State run_audio_test(){
 // lab measures; the key is never logged, only whether and from where it was read.
 bool read_core_key(char out[64]){
     static constexpr const char* paths[]={
-        "/data/homebrew/PPSA99073/control.key",
-        "/data/homebrew/PPSA99072/control.key",
+        "/data/homebrew/PPSA99073/control.key", // the edition's own folder only: the CI refuses any binary that names the stock one
         "/app0/control.key",
     };
     for(const char* p:paths){
