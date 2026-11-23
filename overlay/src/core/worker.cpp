@@ -1204,7 +1204,7 @@ State run_audio_relay(){
 //   errors are 0x816da5xx).
 // The steps (one word each) come from party-steps.txt next to worker.log and are re-read once a second: a changed file
 // runs again, a word starting with # is ignored, and a file named stop-party ends the probe. No file: the safe default.
-//   ipmi-open  ipmi-register[=id]  ipmi-set0  ipmi-set1  ipmi-get  ipmi-unregister  ipmi-close
+//   ipmi-open  ipmi-register[=id|game|shell]  ipmi-set0  ipmi-set1  ipmi-get  ipmi-watchN  ipmi-unregister  ipmi-close  bigapp
 //   sleepN  sysctl:a.b.c.d  open:/path  load:/path   (the last three only look, or load a library on request)
 // Whatever is open or registered is unregistered and closed at the end of every run, never left behind.
 struct IpmiBuf{const void* ptr;std::size_t size;};
@@ -1228,6 +1228,8 @@ State run_party_probe(){
     auto stop_requested=[&]{
         char fp[256];if(!path(fp,sizeof fp,worker_dir,"stop-party"))return false;
         FILE* f=std::fopen(fp,"rb");if(!f)return false;std::fclose(f);return true;};
+    // The running game's app id (the id its own helper would register), -1 when there is none or it cannot be asked.
+    auto big_app=[&]()->int{return request.functions[RunningBigApp]?fn<int(*)()>(RunningBigApp)():-1;};
     // A vtable entry of the open client, or null when anything about it looks wrong.
     auto slot=[&](unsigned index)->void*{
         if(!client)return nullptr;
@@ -1288,7 +1290,10 @@ State run_party_probe(){
             } else if(!std::strncmp(word,"ipmi-register",13)){
                 if(!client){note("PARTY %s: no client open",word);++problems;continue;}
                 int id=request.shell_app;
-                if(const char* eq=std::strchr(word,'='))id=static_cast<int>(std::strtol(eq+1,nullptr,0));
+                if(const char* eq=std::strchr(word,'=')){
+                    if(!std::strcmp(eq+1,"game"))id=big_app();
+                    else if(!std::strcmp(eq+1,"shell"))id=request.shell_app;
+                    else id=static_cast<int>(std::strtol(eq+1,nullptr,0));}
                 const IpmiBuf in{&id,sizeof id};int result=-1;
                 const int rc=invoke(0x510000,&in,1,nullptr,0,result);
                 note("PARTY ipmi-register id=0x%x rc=0x%08x result=0x%08x",unsigned(id),unsigned(rc),unsigned(result));
@@ -1313,6 +1318,22 @@ State run_party_probe(){
                 // 0x816d0506 before any set(1) is the daemon's normal answer, not a problem.
                 note("PARTY ipmi-get rc=0x%08x result=0x%08x value=%d",unsigned(rc),unsigned(result),value);
                 if(rc!=0)++problems;
+            } else if(!std::strncmp(word,"ipmi-watch",10)){
+                // One get per second for N seconds (at most 180), logging only the changes and a line every 15 s.
+                if(!client){note("PARTY ipmi-watch: no client open");++problems;continue;}
+                const int seconds=std::atoi(word+10);
+                int last_rc=-1000,last_result=-1000,last_value=-1000;
+                note("PARTY watch for %d s, big_app=0x%x",seconds,unsigned(big_app()));
+                for(int s=0;s<seconds&&s<180&&!stop_requested()&&now_ms()+8000<request.deadline_ms;++s){
+                    int value=-99;const IpmiBuf out{&value,sizeof value};int result=-1;
+                    const int rc=invoke(0x510003,nullptr,0,&out,1,result);
+                    if(rc!=last_rc||result!=last_result||value!=last_value||s%15==0){
+                        note("PARTY watch t=%ds rc=0x%08x result=0x%08x value=%d big_app=0x%x",s,unsigned(rc),unsigned(result),value,unsigned(big_app()));
+                        last_rc=rc;last_result=result;last_value=value;}
+                    usleep(1000000);
+                }
+            } else if(!std::strcmp(word,"bigapp")){
+                note("PARTY bigapp id=0x%x",unsigned(big_app()));
             } else if(!std::strcmp(word,"ipmi-close")){
                 close_client();
             } else if(!std::strncmp(word,"sleep",5)){
