@@ -1705,7 +1705,7 @@ void tile_observe(void* inst,const char* label){
 // Lists what GCCallBackList.GCHandleDict (Dictionary<object,object>, 88 entries seen) holds, through its own managed
 // getters (get_Keys / get_Values, GetEnumerator, MoveNext, get_Current: read-only, nothing registered or removed), and
 // returns the live ReactNative VoiceChatModule when an entry IS one or is a delegate whose Target is one.
-void* tile_enum_callbacks(void* dict,void* rnk){
+void* tile_enum_callbacks(void* dict,void* rnk,void** list=nullptr,int* count=nullptr,int cap=0){
     void* found=nullptr;
     void* dc=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
     static const char* const getters[]={"get_Keys","get_Values"};
@@ -1739,9 +1739,11 @@ void* tile_enum_callbacks(void* dict,void* rnk){
             if(mt){ex=nullptr;tgt=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mt,e,nullptr,&ex);}
             void* tk=tgt?fn<void*(*)(void*)>(ObjectClass)(tgt):nullptr;
             const char* tn=tk?fn<const char*(*)(void*)>(ClassNameGet)(tk):nullptr;
-            if(tn||ek==rnk)note("TILE cb %s[%d] %s=%p target=%s=%p",g,i,en_?en_:"?",e,tn?tn:"-",tgt);
-            if(rnk&&ek==rnk&&!found)found=e;
-            if(rnk&&tk==rnk&&!found)found=tgt;}
+            void* cand=(rnk&&ek==rnk)?e:((rnk&&tk==rnk)?tgt:nullptr);
+            if(cand){
+                if(!found)found=cand;
+                if(list&&count){bool seen=false;for(int s=0;s<*count;++s)if(list[s]==cand)seen=true;
+                    if(!seen&&*count<cap)list[(*count)++]=cand;}}}
     }
     return found;
 }
@@ -1770,19 +1772,36 @@ void tile_rn_event(void* inst,void* rnk,const char* json,const char* evt_name,bo
     const char* p=std::strstr(evt_name,"voiceChat");
     if(!p||!rnk||!inst)return;
     char kind[32]{};{const char* a=p+9;const char* e=std::strstr(a,"Event");std::size_t n=e?std::size_t(e-a):std::strlen(a);if(n>=sizeof kind)n=sizeof kind-1;std::memcpy(kind,a,n);}
+    // Layout A ({char* json} at offset 0) converted to null in run 9: the string field was read as null. The buffer is
+    // zero-filled (a wrong guess reads NULL or our own valid text, never stray memory), and each candidate layout is ONE
+    // pure Convert call (no emission, nothing sent to JavaScript). The first layout that yields an object is the one
+    // used for the emission (marker file only).
     alignas(16) static char buf[8192];
-    std::size_t n=std::strlen(json);if(n>8000)n=8000;
-    std::memset(buf,0,sizeof buf);
-    std::memcpy(buf+16,json,n);
-    *(void**)buf=buf+16;
-    void* argp=buf;void* args[1]={&argp};
+    std::size_t n=std::strlen(json);if(n>1500)n=1500;
     char mn[96];std::snprintf(mn,sizeof mn,"Convert%sEventDataToJObject",kind);
     void* m=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,mn,1);
-    void* ex=nullptr;
-    void* jo=m?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m,inst,args,&ex):nullptr;
-    note("TILE RN %s -> %p ex=%p (method %p)",mn,jo,ex,m);
-    if(jo)tile_log_tostring(jo,"converted");
-    if(ex)tile_log_tostring(ex,"convert exception");
+    void* ex=nullptr;void* jo=nullptr;void* argp=buf;void* args[1]={&argp};
+    for(int layout=1;layout<=7&&!jo&&m;++layout){
+        std::memset(buf,0,sizeof buf);
+        char* u8=buf+256;char* u16=buf+2048;
+        std::memcpy(u8,json,n);
+        for(std::size_t i=0;i<n;++i){u16[2*i]=json[i];u16[2*i+1]=0;}
+        switch(layout){
+        case 1:*(void**)(buf+8)=u8;break;                                  // pointer at offset 8
+        case 2:*(void**)(buf+16)=u8;break;                                 // pointer at offset 16
+        case 3:*(void**)buf=u16;break;                                     // UTF-16 text at offset 0
+        case 4:*(void**)(buf+8)=u16;break;                                 // UTF-16 text at offset 8
+        case 5:*(void**)buf=buf+128;*(void**)(buf+128)=u8;break;           // pointer to a struct holding the pointer
+        case 6:std::memset(buf,0,256);std::memcpy(buf,json,n<255?n:255);break; // the buffer itself is the text (short)
+        default:break;}
+        if(layout==7){std::memset(buf,0,sizeof buf);for(std::size_t i=0;i<n&&i<1000;++i){buf[2*i]=json[i];}}  // the buffer is UTF-16 text
+        ex=nullptr;argp=buf;
+        jo=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m,inst,args,&ex);
+        void* exk=ex?fn<void*(*)(void*)>(ObjectClass)(ex):nullptr;
+        const char* exn=exk?fn<const char*(*)(void*)>(ClassNameGet)(exk):nullptr;
+        note("TILE RN layout %d: %s -> %p ex=%s",layout,mn,jo,exn?exn:"none");
+        if(jo){note("TILE RN layout %d WORKS",layout);tile_log_tostring(jo,"converted");}}
+    if(!jo)note("TILE RN no layout produced an object");
     if(!emit){note("TILE RN emit skipped (no tile-emit marker)");return;}
     if(!jo){note("TILE RN emit refused: conversion gave no object");return;}
     std::snprintf(mn,sizeof mn,"_OnVoiceChat%sEvent",kind);
@@ -1884,15 +1903,21 @@ State run_tile_discord(){
                 note("TILE RN m_cblist value=%p",val);
                 if(val){
                     // GCHandleDict is the instance field at +16 (Dictionary<object,object>).
-                    void* inst_rn=tile_enum_callbacks(*(void**)((char*)val+16),rnk);
-                    note("TILE RN module instance=%p",inst_rn);
-                    if(inst_rn){
-                        note("TILE RN _emittable=%d",int(*((unsigned char*)inst_rn+48)));
-                        static const char* const gcn[]={"daemon","accessibility","channel","member","rangedMember","voice","screenShare","sharePlay","partySessionList","partySession","partyHistory"};
-                        for(int gi=0;gi<11;++gi)note("TILE RN gcContext.%s=%llx",gcn[gi],(unsigned long long)*(std::uint64_t*)((char*)inst_rn+56+8*gi));
-                        bool emit=false;
-                        {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit")){FILE* mf=std::fopen(pth,"rb");if(mf){emit=true;std::fclose(mf);}}}
-                        tile_rn_event(inst_rn,rnk,json_cstr,evt_name,emit);}}
+                    // The list keeps EVERY module instance the Control Center ever created (8 seen, one per reload); the live
+                    // one is not known yet. Log each instance's state; emission (marker tile-emit holding an index) targets
+                    // exactly one of them and never runs more than once per worker run.
+                    void* insts[16];int ninst=0;
+                    void* inst_rn=tile_enum_callbacks(*(void**)((char*)val+16),rnk,insts,&ninst,16);
+                    note("TILE RN module instances=%d first=%p",ninst,inst_rn);
+                    for(int ii=0;ii<ninst;++ii){
+                        int nz=0;for(int gi=0;gi<11;++gi)if(*(std::uint64_t*)((char*)insts[ii]+56+8*gi))++nz;
+                        note("TILE RN inst[%d]=%p _emittable=%d contexts_set=%d channelCtx=%llx",ii,insts[ii],
+                             int(*((unsigned char*)insts[ii]+48)),nz,(unsigned long long)*(std::uint64_t*)((char*)insts[ii]+72));}
+                    int emit_index=-1;
+                    {char pth[256];if(path(pth,sizeof pth,worker_dir,"tile-emit")){FILE* mf=std::fopen(pth,"rb");
+                        if(mf){char d[8]{};std::size_t got=std::fread(d,1,7,mf);std::fclose(mf);emit_index=(got&&d[0]>='0'&&d[0]<='9')?d[0]-'0':ninst-1;}}}
+                    if(emit_index>=ninst)emit_index=ninst-1;
+                    if(inst_rn)tile_rn_event(emit_index>=0?insts[emit_index]:inst_rn,rnk,json_cstr,evt_name,emit_index>=0);}
                 break;}
         }
     }
