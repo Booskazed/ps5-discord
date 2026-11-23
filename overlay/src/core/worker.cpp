@@ -1582,10 +1582,6 @@ State run_scene_probe(){
 // Tile observation helpers (lab, read-only): log the object graph reachable from the delegate targets that sit in
 // VoiceChatModule's handler dictionary and, when a PartyStatusMonitor shows up, its live state. Only managed field
 // reads on reference-typed fields plus a few getters; nothing is written, no handler is called.
-const char* tile_cls_name(void* obj){
-    void* c=obj?fn<void*(*)(void*)>(ObjectClass)(obj):nullptr;
-    return c?fn<const char*(*)(void*)>(ClassNameGet)(c):nullptr;
-}
 void tile_log_string_set(void* coll,const char* label){
     if(!coll){note("TILE set %s = null",label);return;}
     void* c=fn<void*(*)(void*)>(ObjectClass)(coll);
