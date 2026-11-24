@@ -1238,21 +1238,22 @@ State run_audio_direct(char key[64]){
         }
         ++mic_open_fails;return -1;
     };
-    // The call's voices go out as chat audio, so the console's "Output to headphones: chat audio" sends
-    // them to the headset while the game stays on the TV: the foreground user's VOICE port (type 2),
-    // else PERSONAL (3), else the system user's MAIN port (0) as before. On MAIN the console took them
-    // for game audio (with "chat audio" they went to the TV). An empty file `audio-port-main` next to
-    // worker.log forces MAIN.
+    // Which output port plays the call. The system user's MAIN port (type 0) keeps playing while a game
+    // or app is in front, but the console takes it for game audio: with "Output to headphones: chat
+    // audio" the voices go to the TV. The foreground user's VOICE port (2) goes to the headset, but on
+    // 13.60 it is silent as soon as an app is in front, the Discord app included (console, 2026-11-24).
+    // So MAIN by default; an empty file next to worker.log picks another to try, MAIN still the fallback:
+    // `audio-port-personal` (PERSONAL, 3: the headset on the controller) or `audio-port-voice` (VOICE).
     int handle=-1;
     {
         int user=-1;
         if(request.functions[UserGetForegroundUser]){
             int u=-1;if(fn<UserForegroundCall>(UserGetForegroundUser)(&u)==0)user=u;}
-        const bool force_main=file_exists("audio-port-main");
+        const int wanted=file_exists("audio-port-main")?0:file_exists("audio-port-personal")?3:file_exists("audio-port-voice")?2:0;
         struct Port{int user,type;const char* name;};
-        const Port ports[3]={{user,2,"voice"},{user,3,"personal"},{0xff,0,"main"}};
+        const Port ports[2]={{user,wanted,wanted==3?"personal":wanted==2?"voice":"main"},{0xff,0,"main"}};
         for(const Port& p:ports){
-            if(p.user<0||(force_main&&p.type!=0))continue;
+            if(p.user<0||(p.type==0&&p.user!=0xff))continue; // MAIN is opened for the system user
             handle=open(p.user,p.type,0,256,48000,1);
             note("AUDIODIRECT open %s user=0x%x rc=0x%08x",p.name,unsigned(p.user),unsigned(handle));
             if(handle>=0)break;}
