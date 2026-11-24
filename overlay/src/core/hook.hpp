@@ -47,12 +47,14 @@ inline std::size_t native_patch_length(const std::uint8_t* code){
     }
     return length<=16?length:0;
 }
-// On firmware 13.60 Mono gives some methods' entry as a thunk rather than their code:
+// Another homebrew's hook already at the target: a 14-byte absolute jump over the prologue,
 //   ff 25 00 00 00 00   jmp qword ptr [rip+0]
-//   <8 bytes>           the absolute address of the method's code
-// Application.Update, on the console: ff2500000000 fb42446202000000 75f0. The decoder refuses
-// it (a jump cannot be copied to a trampoline), and nothing needs copying: callers go through
-// the thunk, so swapping its address hooks them all, and the old address is the original.
+//   <8 bytes>           the absolute address of that hook's handler
+// (the shape Common FPS' home bridge writes, vendor/shellui-loader/prologue.hpp). Seen on the
+// console on Application.Update: ff2500000000 fb42446202000000 75f0, where the plain prologue is
+// 55488bec4883ec604c896de84c8975f0 (the last two bytes kept). The decoder refuses a jump, and
+// nothing needs copying: swapping the address chains our hook in front of theirs, and their
+// handler (the old address) is the original we call. remove_hook puts their address back.
 inline bool jump_thunk(const std::uint8_t code[16],void** to){
     if(code[0]!=0xff||code[1]!=0x25||code[2]||code[3]||code[4]||code[5])return false;
     std::uint64_t at;std::memcpy(&at,code+6,8);
