@@ -141,6 +141,15 @@ static int run(){
     // AudioRelay keeps running for as long as the app's relay connection
     // stays up (minutes); everything else is a short, bounded one-shot.
     r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:75000);
+    // One loader at a time from request.bin to the worker having read it: the service's and the
+    // audio worker's loaders can start together after a system UI restart, and both trace ShellUI
+    // and write the one request.bin. Waits up to 30 s; held until 2 s after the injection.
+    int inject_lock=-1;
+    {char lp[256];path(lp,sizeof lp,parent_dir,"inject.lock");inject_lock=open(lp,O_CREAT|O_RDWR,0600);}
+    for(int waited=0;inject_lock>=0&&flock(inject_lock,LOCK_EX|LOCK_NB);waited++){
+        if(waited>=300){note("REFUSED: another loader kept inject.lock for 30 s");close(inject_lock);return 1;}
+        usleep(100000);}
+    struct InjectLock{int fd;~InjectLock(){if(fd>=0)close(fd);}} inject_guard{inject_lock};
     if(!write_file(parent_dir,"request.bin",r)){note("request write failed");return 1;}
     if(one_shot_only){
         Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;
@@ -150,6 +159,7 @@ static int run(){
         (unsigned long long)r.epoch,result.elf_loaded,result.pthread_create_ok,result.detached,result.auth_restored,result.imports_unresolved,
         result.first_unresolved?result.first_unresolved:"");
     if(!result.elf_loaded||!result.pthread_create_ok||!result.detached||!result.auth_restored||result.imports_unresolved)return 1;
+    usleep(2000000);close(inject_guard.fd);inject_guard.fd=-1; // the worker has read request.bin by now
     // The audio worker runs on its own inside ShellUI (its own lock, heartbeat and 24 h window): this loader is
     // done, so it frees parent.lock and a later launch (the core sends the worker again if the heartbeat goes stale) works.
     if(r.mode==Mode::AudioRelay){note("LOADER: audio worker injected, loader exits");return 0;}
@@ -203,7 +213,15 @@ int main(){
     sceKernelSetProcessName("discord-overlay-restart.elf");
 #endif
     if(mkdir(parent_dir,0700)&&errno!=EEXIST)return 1;
+    // The audio worker's loaders have their own lock: the service's loader keeps parent.lock for as
+    // long as the overlay runs, and the core relaunches the audio worker after every system UI
+    // restart, so with one lock the voice in a game was lost whenever the overlay was on.
+    // inject.lock (run) still keeps two loaders from injecting at the same time.
+#if OVERLAY_MODE==6||OVERLAY_MODE==7
+    char p[256];path(p,sizeof p,parent_dir,"audio-parent.lock");int lock=open(p,O_CREAT|O_RDWR,0600);
+#else
     char p[256];path(p,sizeof p,parent_dir,"parent.lock");int lock=open(p,O_CREAT|O_RDWR,0600);
+#endif
 #if OVERLAY_MODE!=4 // restart works with a service running: its worker dies with ShellUI, its loader then stops
     if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 1;
 #endif

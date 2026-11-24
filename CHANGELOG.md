@@ -97,6 +97,11 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   and `GamePad.GetData`, refused or not, and where a thunk leads. `overlay/tests/safety.cpp` covers
   the thunk, and the `test` workflow now runs the overlay's safety and worker suites. Not yet run on
   the console; colours, button bits, fonts and labels are still unchecked on 13.60.
+- The visual overlay and the audio worker (below) no longer share their locks. The audio worker
+  holds its lock for hours, so the overlay's worker exited without a word; and the overlay's loader
+  holds `parent.lock` while the overlay runs, so the core could not relaunch the audio worker after
+  a system UI restart. The audio worker now takes `audio.lock` and its loader `audio-parent.lock`;
+  `inject.lock` keeps two loaders from injecting into SceShellUI or writing `request.bin` at once.
 - Voice while a game is in front, over a wireless controller (side-by-side `PPSA99073` build only;
   measured on firmware 13.60). The console ends the app when a game starts (`[SceLncService]
   KillApp()` in the kernel log; it does not suspend it) while the core keeps the call, and the sound

@@ -1315,10 +1315,15 @@ State run(){
 }
 }
 extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
-    char p[256];if(!path(p,sizeof p,worker_dir,"worker.lock"))return nullptr;
+    // The request first: it says which lock this worker takes. The audio modes never touch Mono
+    // or a hook and run for hours, so they have their own lock: with one shared lock the community
+    // build's always-running audio worker kept the visual overlay's worker from starting at all.
+    if(!read_file(worker_dir,"request.bin",request)||!valid(request,getpid(),OVERLAY_BUILD,request.epoch,now_ms()))
+        return nullptr;
+    const char* lock_name=request.mode==Mode::AudioTest||request.mode==Mode::AudioRelay?"audio.lock":"worker.lock";
+    char p[256];if(!path(p,sizeof p,worker_dir,lock_name))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
-    if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}
-    if(!read_file(worker_dir,"request.bin",request)||!valid(request,getpid(),OVERLAY_BUILD,request.epoch,now_ms())){
+    if(flock(lock,LOCK_EX|LOCK_NB)){note("REFUSED %s held by another worker in this ShellUI (mode=%u)",lock_name,unsigned(request.mode));
         close(lock);return nullptr;}
     note("START build=%016llx mode=%u",(unsigned long long)request.build,unsigned(request.mode));
     State result=run();
