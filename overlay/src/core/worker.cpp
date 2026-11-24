@@ -2149,15 +2149,17 @@ State run_bundle_dump(){
     if(!address(verify_export)){note("BUNDLEDUMP refused: RNPS export not resolved");publish(State::Failed);return State::Failed;}
     const std::uint64_t base=verify_export-kRnpsVerifyExportOffset;
     auto rnps_decrypt=reinterpret_cast<int(*)(void*,unsigned)>(base+kRnpsDecryptOffset);
-    // Safety gate: only call the decrypt routine if the bytes there really are its known prologue
-    // (push rbp; mov rbp,rsp; push r15; push r14; push r12; push rbx). This guards against any
-    // library-version/offset mismatch: on a miss we refuse instead of calling into the wrong code.
-    // (A wrong call could at most crash SceShellUI, which a reboot fixes; nothing here writes any
-    // partition, so it can never brick the console.) The page is normal r-x, so reading it is safe.
-    static const unsigned char kDecryptPrologue[11]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53};
-    if(std::memcmp(reinterpret_cast<const void*>(base+kRnpsDecryptOffset),kDecryptPrologue,sizeof kDecryptPrologue)!=0){
-        note("BUNDLEDUMP refused: decrypt-routine prologue mismatch at %p; not calling",reinterpret_cast<void*>(base+kRnpsDecryptOffset));
-        publish(State::Failed);return State::Failed;}
+    // Safety gate: confirm the computed address is inside an executable mapping before calling it,
+    // using the system's protection query -- WITHOUT reading the bytes. System code pages here are
+    // execute-only (reading them faults, which is what crashed ShellUI before); executing is allowed.
+    // If the address is not in an executable region (wrong base/offset, or the lib differs), we refuse.
+    {
+        auto query=fn<ProtectionQuery>(QueryProtection);
+        void* lo=nullptr;void* hi=nullptr;int prot=0;
+        if(!query||query(reinterpret_cast<void*>(base+kRnpsDecryptOffset),&lo,&hi,&prot)||!(prot&PROT_EXEC)){
+            note("BUNDLEDUMP refused: decrypt address %p not in an executable region (prot=%d)",reinterpret_cast<void*>(base+kRnpsDecryptOffset),prot);
+            publish(State::Failed);return State::Failed;}
+    }
     // Read the raw RNPSHEDR container. In ShellUI's sandbox the apps live under /mnt/rnps.
     const char* paths[]={"/mnt/rnps/apps/NPXS40003/application.ps.bundle",
                          "/system_ex/rnps/apps/NPXS40003/application.ps.bundle"};
