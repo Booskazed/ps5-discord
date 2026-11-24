@@ -43,7 +43,9 @@ only file shared with the core is `src/capture_proto.h` (MIT).
   core even after Stop, so the app can warn that a console restart may be needed. Original
   scratch bytes are saved on the first write to each range; unrelated bytes are never replayed
   from an old whole-page snapshot. Temporary tracing credentials are journaled and verified too.
-* Recovery (RECOVERY.md of the PoC): only video-read error 0x81950009; poll the output mode until
+* 0x81950002 from ReadVideo (13.60: nothing to read yet; once it ended a Go Live) is read again
+  like an empty read; only when it lasts the whole no-picture window does it recover as below.
+* Recovery (RECOVERY.md of the PoC): video-read error 0x81950009; poll the output mode until
   three equal nonzero readings (100 ms, 5 s), clean teardown, a fresh session, SPS/PPS read
   again, IDR requested. A game launch changes the output twice about 3 s apart (console,
   2026-11-09), so each reopened session that delivers frames may recover again, up to four
