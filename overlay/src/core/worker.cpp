@@ -454,6 +454,9 @@ void log_focus_state(const char* when,bool ui=true){
             if((k==2||k==8||k==9)&&off>=16&&off<0x400){
                 int v=0;std::memcpy(&v,static_cast<char*>(app_object)+off,k==2?1:4);
                 at+=std::snprintf(line+at,sizeof line-at," %s=%d",n,v);}
+            else if((k==0x12||k==0x1c)&&off>=16&&off<0x400){ // a reference (a delegate): null or not
+                void* v=nullptr;std::memcpy(&v,static_cast<char*>(app_object)+off,sizeof v);
+                at+=std::snprintf(line+at,sizeof line-at," %s=%p",n,v);}
             else at+=std::snprintf(line+at,sizeof line-at," %s(kind %d)",n,k);}}
     note("%s",line);
 }
