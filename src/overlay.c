@@ -952,6 +952,58 @@ static void run_command(const char *what)
     LOG("overlay: %s -> %d %s", what, r, why);
 }
 
+// Write the current voice state as JSON for Mode::NativeTileInject (overlay worker reads this).
+// The file lives in OVERLAY_DIR (which the worker sees as worker_dir via /user/data/).
+static void tile_write_state(void)
+{
+    char *text = voice_state_json();
+    cJSON *v = text ? cJSON_Parse(text) : NULL;
+    free(text);
+    const char *st = cJSON_GetStringValue(cJSON_GetObjectItem(v, "state"));
+    const char *channel = cJSON_GetStringValue(cJSON_GetObjectItem(v, "channel"));
+    const char *guild_id = cJSON_GetStringValue(cJSON_GetObjectItem(v, "guild"));
+    if (!st || !channel || !channel[0] || (strcmp(st, "connected") != 0 && strcmp(st, "joining") != 0)) {
+        cJSON_Delete(v);
+        return; // not in a call: no tile state to write
+    }
+    chat_person people[MAX_PEOPLE];
+    char call_name[64] = "";
+    int count = chat_call_people(channel, call_name, sizeof call_name, people, MAX_PEOPLE);
+    chat_place place;
+    int has_place = chat_place_of(channel, &place);
+    cJSON *o = cJSON_CreateObject();
+    cJSON_AddStringToObject(o, "state", st);
+    cJSON_AddStringToObject(o, "channelId", channel);
+    cJSON_AddStringToObject(o, "channelName", call_name[0] ? call_name : "Discord");
+    cJSON_AddStringToObject(o, "guildId", guild_id ? guild_id : "");
+    cJSON_AddStringToObject(o, "guildName", has_place ? place.server : "");
+    cJSON_AddBoolToObject(o, "mute", cJSON_IsTrue(cJSON_GetObjectItem(v, "mute")));
+    cJSON_AddBoolToObject(o, "deaf", cJSON_IsTrue(cJSON_GetObjectItem(v, "deaf")));
+    cJSON *members = cJSON_AddArrayToObject(o, "members");
+    cJSON *speaking = cJSON_GetObjectItem(v, "speaking");
+    for (int i = 0; i < count; i++) {
+        cJSON *m = cJSON_CreateObject();
+        cJSON_AddStringToObject(m, "id", people[i].id);
+        cJSON_AddStringToObject(m, "name", people[i].name);
+        int is_speaking = 0;
+        cJSON *sid;
+        cJSON_ArrayForEach(sid, speaking)
+            if (cJSON_GetStringValue(sid) && strcmp(cJSON_GetStringValue(sid), people[i].id) == 0)
+                is_speaking = 1;
+        cJSON_AddBoolToObject(m, "speaking", is_speaking);
+        cJSON_AddBoolToObject(m, "muted", people[i].muted);
+        cJSON_AddBoolToObject(m, "deaf", people[i].deaf);
+        cJSON_AddItemToArray(members, m);
+    }
+    cJSON_Delete(v);
+    char *json = cJSON_PrintUnformatted(o);
+    cJSON_Delete(o);
+    if (json) {
+        overlay_write_file(OVERLAY_DIR "/tile-state.json", json);
+        free(json);
+    }
+}
+
 static uint64_t mono_ms(void)
 {
     struct timespec t;
@@ -1236,6 +1288,7 @@ static void *feed(void *arg)
                 overlay_reload();
         }
         compose(line, sizeof line, &live_since);
+        tile_write_state();
         {
             static char state_was;
             if (line[2] != state_was) { // where a join's seconds go: the app logs its request, this its arrival

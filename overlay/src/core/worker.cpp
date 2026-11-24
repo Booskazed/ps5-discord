@@ -2137,6 +2137,130 @@ State run_tile_discord(){
     note("TILE done");
     publish(State::Passed);return State::Passed;
 }
+// Mode::NativeTileInject (lab): continuously read voice state from the homebrew core (tile-state.json,
+// written by src/overlay.c) and emit events to the Control Center's JavaScript tile through the Mono→Hermes
+// bridge (EventEmitterUtility.emitDeviceEvent). The tile's React components (ActionCardRealTimeCommunication,
+// PartySessionListProvider) re-render with the injected data. No hook, no IPMI, no PSN: only managed
+// reflection and emitDeviceEvent calls. Coexists with AudioRelay via probe.lock.
+// The event name defaults to "voiceChatChannelEvent" but can be overridden by tile-event.txt.
+State run_native_tile_inject(){
+    publish(State::Observing);
+    note("TILEINJECT start pid=%d build=0x%016llx",int(getpid()),(unsigned long long)OVERLAY_BUILD);
+    domain=fn<void*(*)()>(RootDomain)();
+    if(!domain){note("TILEINJECT refused: Mono root domain missing");publish(State::Failed);return State::Failed;}
+    void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);
+    if(!thread){note("TILEINJECT refused: Mono thread attach");publish(State::Failed);return State::Failed;}
+    // Find the ReactNative VoiceChatModule class and its live instance through the static m_cblist field,
+    // exactly as Mode::TileDiscord does. This gives us ConvertJsonStringToJObject and the ReactContext.
+    void* rn=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.ReactNativeShellApp.dll");
+    note("TILEINJECT RN image=%p",rn);
+    void* rnk=rn?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,"ReactNative.Modules.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
+    note("TILEINJECT RN VoiceChatModule class=%p",rnk);
+    if(!rnk){fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    // Find instance through static m_cblist → GCCallBackList → enumerate delegates → target is VoiceChatModule
+    void* inst_rn=nullptr;
+    {void* it=nullptr;
+     for(int i=0;i<256;++i){
+         void* f=fn<void*(*)(void*,void**)>(ClassFields)(rnk,&it);if(!f)break;
+         const char* fname=fn<const char*(*)(void*)>(FieldName)(f);
+         if(!fname||std::strcmp(fname,"m_cblist"))continue;
+         unsigned off=fn<unsigned(*)(void*)>(FieldOffset)(f);
+         if(off>=16){note("TILEINJECT m_cblist looks like instance field");break;}
+         if(!request.functions[MonoClassVtable]||!request.functions[MonoFieldStaticGet]){note("TILEINJECT Mono vtable/static exports missing");break;}
+         void* vt=fn<void*(*)(void*,void*)>(MonoClassVtable)(domain,rnk);
+         if(!vt){note("TILEINJECT class vtable=null");break;}
+         void* val=nullptr;
+         fn<void(*)(void*,void*,void*)>(MonoFieldStaticGet)(vt,f,&val);
+         note("TILEINJECT m_cblist=%p",val);
+         if(!val)break;
+         inst_rn=tile_enum_callbacks(*(void**)((char*)val+16),rnk);
+         note("TILEINJECT RN module instance=%p",inst_rn);
+         break;}}
+    if(!inst_rn){note("TILEINJECT no VoiceChatModule instance found");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    // Resolve the emission tools: ConvertJsonStringToJObject, ReactContext, EventEmitterUtility.emitDeviceEvent
+    void* m_convert=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"ConvertJsonStringToJObject",1);
+    void* ctx=tile_get_context(inst_rn);
+    void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
+    void* eu=cimg?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(cimg,"ReactNative.Vsh.Common","EventEmitterUtility"):nullptr;
+    void* m_emit=eu?tile_find_method(eu,"emitDeviceEvent",3,"ReactNative.Bridge.ReactContext"):nullptr;
+    note("TILEINJECT convert=%p ctx=%p emitter=%p emit=%p",m_convert,ctx,eu,m_emit);
+    if(!m_convert||!ctx||!m_emit){
+        note("TILEINJECT emission pipeline incomplete, falling back to handler path");
+    }
+    // Also resolve the VoiceChatModule handler dictionary path (fallback / voiceChat events)
+    void* img_vcm=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.VoiceChat.dll");
+    void* vcm_class=img_vcm?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img_vcm,"Sce.Vsh.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
+    void* m_getinst=vcm_class?fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,"GetInstance",0):nullptr;
+    void* ex=nullptr;
+    void* vcm_inst=m_getinst?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_getinst,nullptr,nullptr,&ex):nullptr;
+    note("TILEINJECT VoiceChatModule(Mono) inst=%p",vcm_inst);
+    // Read the event name (configurable, default voiceChatChannelEvent)
+    char evt_name[64]="voiceChatChannelEvent";
+    {char pth[256];
+     if(path(pth,sizeof pth,worker_dir,"tile-event.txt")){
+         FILE* f=std::fopen(pth,"rb");
+         if(f){long n=long(std::fread(evt_name,1,sizeof(evt_name)-1,f));
+             if(n<0)n=0;evt_name[n]='\0';
+             while(n>0&&(evt_name[n-1]=='\n'||evt_name[n-1]=='\r'||evt_name[n-1]==' '))evt_name[--n]='\0';
+             std::fclose(f);}}}
+    note("TILEINJECT event_name=%s",evt_name);
+    // Main loop: read tile-state.json, convert, emit, sleep
+    char last_json[4096]={};
+    int emit_count=0;
+    const std::uint64_t deadline=request.deadline_ms>6000?request.deadline_ms-6000:now_ms()+86400000ULL;
+    while(now_ms()<deadline){
+        std::uint64_t stop=0;
+        if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+        publish(State::Observing);
+        // Read tile-state.json (written by the core's feed loop in src/overlay.c)
+        char json_buf[4096]={};int json_len=0;
+        {char pth[256];
+         if(path(pth,sizeof pth,worker_dir,"tile-state.json")){
+             FILE* f=std::fopen(pth,"rb");
+             if(f){long n=long(std::fread(json_buf,1,sizeof(json_buf)-1,f));
+                 if(n<0)n=0;json_buf[n]='\0';json_len=int(n);
+                 std::fclose(f);}}}
+        if(json_len>2&&std::strcmp(json_buf,last_json)!=0){
+            note("TILEINJECT new state (%d bytes), emitting event %s",json_len,evt_name);
+            std::memcpy(last_json,json_buf,sizeof last_json);
+            // Convert JSON string to JObject
+            void* js=fn<void*(*)(void*,const char*)>(StringNew)(domain,json_buf);
+            void* cargs[1]={js};ex=nullptr;
+            void* jobj=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,cargs,&ex):nullptr;
+            if(ex){note("TILEINJECT convert exception");ex=nullptr;}
+            if(jobj&&m_emit&&ctx){
+                // Primary path: emitDeviceEvent (direct to JS, works for any event name)
+                void* name_str=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
+                void* eargs[3]={ctx,name_str,jobj};
+                ex=nullptr;
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,eargs,&ex);
+                if(ex)note("TILEINJECT emitDeviceEvent exception");
+                else note("TILEINJECT emitDeviceEvent ok (count=%d)",++emit_count);
+            } else if(jobj&&vcm_inst){
+                // Fallback: VoiceChatModule handler dictionary (only for voiceChat* events)
+                void* dict=*(void**)((char*)vcm_inst+16);
+                void* dclass=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
+                void* mitem=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Item",1):nullptr;
+                void* key=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
+                void* iargs[1]={key};ex=nullptr;
+                void* handler=mitem?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mitem,dict,iargs,&ex):nullptr;
+                if(handler){
+                    void* hclass=fn<void*(*)(void*)>(ObjectClass)(handler);
+                    void* minvoke=hclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(hclass,"Invoke",2):nullptr;
+                    void* key2=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
+                    void* vargs[2]={key2,jobj};ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minvoke,handler,vargs,&ex);
+                    note("TILEINJECT handler.Invoke %s (count=%d)",ex?"exception":"ok",++emit_count);
+                } else note("TILEINJECT no handler for %s in VoiceChatModule dict",evt_name);
+            } else note("TILEINJECT convert failed or no emission path");
+        }
+        usleep(2000000); // 2s between reads
+    }
+    fn<void(*)(void*)>(ThreadDetach)(thread);
+    note("TILEINJECT done emits=%d",emit_count);
+    publish(emit_count>0?State::Passed:State::Failed);
+    return emit_count>0?State::Passed:State::Failed;
+}
 // Mode::BundleDump (lab): dump the Control Center's Hermes bytecode without waiting for the system to
 // load it. The RNPS container is decrypted by a kernel routine (libSceRnpsBundle sub_6f80: it opens
 // /dev/rnps and ioctls the buffer, which the kernel decrypts in place) that needs no certificate
@@ -2208,6 +2332,7 @@ State run(){
     if(request.mode==Mode::SceneProbe)return run_scene_probe();
     if(request.mode==Mode::TileDiscord)return run_tile_discord();
     if(request.mode==Mode::BundleDump)return run_bundle_dump();
+    if(request.mode==Mode::NativeTileInject)return run_native_tile_inject();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
@@ -2287,7 +2412,7 @@ extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
     // The party probe (a lab tool) has its own lock: the audio worker holds worker.lock for hours, and a second
     // worker that does not get its lock returns without a word.
     Request peek;
-    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe||peek.mode==Mode::TileDiscord||peek.mode==Mode::BundleDump);
+    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe||peek.mode==Mode::TileDiscord||peek.mode==Mode::BundleDump||peek.mode==Mode::NativeTileInject);
     char p[256];if(!path(p,sizeof p,worker_dir,probe?"probe.lock":"worker.lock"))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
     if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}

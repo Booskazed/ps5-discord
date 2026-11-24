@@ -31,7 +31,7 @@ int sceKernelGetAppInfo(pid_t,void*);}
 using namespace overlay;
 // elfldr deploys every payload as payload.elf, so each mode keeps its own USB
 // xlog to keep runs attributable (workspace payload discipline).
-static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest","audiorelay","partyprobe","sceneprobe","tilediscord","bundledump"};
+static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest","audiorelay","partyprobe","sceneprobe","tilediscord","bundledump","nativetileinject"};
 static FILE* logfile=nullptr,*usblog=nullptr;
 static void note(const char* fmt,...){
     char line[512];va_list ap;va_start(ap,fmt);std::vsnprintf(line,sizeof line,fmt,ap);va_end(ap);
@@ -83,7 +83,7 @@ static int run(){
     // prepare_update_hook call at all): unlike every other mode, retrying
     // one on the same ShellUI instance carries none of the risk this
     // one-attempt marker exists to bound, so they are exempt from it.
-    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay&&r.mode!=Mode::PartyProbe&&r.mode!=Mode::SceneProbe&&r.mode!=Mode::TileDiscord&&r.mode!=Mode::BundleDump;
+    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay&&r.mode!=Mode::PartyProbe&&r.mode!=Mode::SceneProbe&&r.mode!=Mode::TileDiscord&&r.mode!=Mode::BundleDump&&r.mode!=Mode::NativeTileInject;
     Attempt prior;
     if(one_shot_only&&read_file(parent_dir,"attempt.bin",prior)&&prior.signature==magic&&prior.pid==r.pid&&prior.epoch==r.epoch){
         note("REFUSED: one attempt already recorded for this ShellUI instance; inspect evidence, do not delete marker to retry");return 1;}
@@ -203,6 +203,7 @@ static int run(){
     if(r.mode==Mode::SceneProbe){note("LOADER: scene probe injected, loader exits (see worker.log)");return 0;}
     if(r.mode==Mode::TileDiscord){note("LOADER: tile-discord injected, loader exits (see worker.log)");return 0;}
     if(r.mode==Mode::BundleDump){note("LOADER: bundle dump injected, loader exits (see worker.log)");return 0;}
+    if(r.mode==Mode::NativeTileInject){note("LOADER: native tile inject started, loader exits (see worker.log)");return 0;}
     int previous=999;
 #if OVERLAY_MODE==5
     // Service: no fixed end. A heartbeat every second keeps the worker; on SIGTERM (or a
