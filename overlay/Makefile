@@ -16,7 +16,7 @@ LAB_FLAGS := $(filter-out -DOVERLAY_BUILD=%,$(FLAGS)) -DOVERLAY_BUILD=0x$(LAB_BU
 VENDOR := vendor/shellui-loader
 OBJECTS := build/pt.o build/loader.o build/injector.o build/remote-call.o build/blob.o
 .PHONY: all test inspect clean preview pill-lab lab-preview
-all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf build/overlay-partyprobe.elf build/overlay-sceneprobe.elf build/overlay-tilediscord.elf build/overlay-bundledump.elf inspect
+all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf build/overlay-partyprobe.elf build/overlay-sceneprobe.elf build/overlay-tilediscord.elf build/overlay-bundledump.elf build/overlay-nativetileinject.elf inspect
 # The build id is baked into both halves (worker and loader): any change to it rebuilds both,
 # or the loader's request carries an id the embedded worker refuses.
 build/overlay-worker.elf: $(HASH_SOURCES) Makefile
@@ -106,6 +106,13 @@ build/parent-bundledump.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOUR
 	@mkdir -p build
 	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=11 -c $< -o $@
 build/overlay-bundledump.elf: build/parent-bundledump.o $(OBJECTS)
+	$(CXX_PS5) $(FLAGS) $^ -o $@
+# Lab only (never packaged): continuously emits the homebrew Discord core's voice state as device events
+# to the Control Center's JavaScript tile through the Mono->Hermes bridge. No hook, no IPMI, no PSN.
+build/parent-nativetileinject.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES) Makefile
+	@mkdir -p build
+	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=12 -c $< -o $@
+build/overlay-nativetileinject.elf: build/parent-nativetileinject.o $(OBJECTS)
 	$(CXX_PS5) $(FLAGS) $^ -o $@
 # Standalone lab: explicit opt-in, never linked into the app package or normal blobs.
 pill-lab: build/pill-lab.elf

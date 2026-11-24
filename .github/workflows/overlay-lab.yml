@@ -32,6 +32,7 @@ jobs:
       - name: Check the lab ELF was built
         run: |
           test -s overlay/build/overlay-bundledump.elf || { echo "::error::overlay-bundledump.elf was not built"; exit 1; }
+          test -s overlay/build/overlay-nativetileinject.elf || { echo "::error::overlay-nativetileinject.elf was not built"; exit 1; }
           ls -l overlay/build/overlay-*.elf
       - name: Upload the overlay lab ELFs
         uses: actions/upload-artifact@v4
@@ -42,5 +43,6 @@ jobs:
             overlay/build/overlay-partyprobe.elf
             overlay/build/overlay-sceneprobe.elf
             overlay/build/overlay-tilediscord.elf
+            overlay/build/overlay-nativetileinject.elf
           if-no-files-found: warn
           retention-days: 14
