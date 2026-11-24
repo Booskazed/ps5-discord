@@ -326,6 +326,88 @@ void describe_fields(void* klass,const char* cls,const char* const* words){
         const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||!name_has(n,words))continue;
         note("FIELD %s.%s : %s",cls,n,type_name_of(fn<void*(*)(void*)>(FieldType)(f)));}
 }
+// The type of a method's parameter (index) or, with index -1, of its return value.
+void* signature_type(Method* m,int index){
+    void* sig=m?fn<void*(*)(void*)>(MethodSignature)(m):nullptr;if(!sig)return nullptr;
+    if(index<0)return fn<void*(*)(void*)>(SignatureReturn)(sig);
+    void* iter=nullptr;void* type=nullptr;
+    for(int k=0;k<=index;k++){type=fn<void*(*)(void*,void**)>(SignatureParams)(sig,&iter);if(!type)return nullptr;}
+    return type;
+}
+// ClassVtable and FieldStaticGetValue are optional in the request (0 when ShellUI's Mono lacks them).
+bool can_read_statics(){return request.functions[ClassVtable]&&request.functions[FieldStaticGetValue];}
+// An enum's names and values (its literal fields, read with mono_field_static_get_value), or a
+// struct's or class's instance fields. Reads only.
+void describe_type_values(void* type,const char* label){
+    const int kind=type?fn<int(*)(void*)>(TypeKind)(type):-1;
+    void* k=type?fn<void*(*)(void*)>(ClassFromType)(type):nullptr;
+    note("TYPEDESC %s = %s kind=%d",label,type_name_of(type),kind);
+    if(!k)return;
+    bool is_enum=false;void* iter=nullptr;
+    for(int i=0;i<200;i++){void* f=fn<void*(*)(void*,void**)>(ClassFields)(k,&iter);if(!f)break;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(n&&!std::strcmp(n,"value__"))is_enum=true;}
+    void* vt=is_enum&&can_read_statics()?fn<void*(*)(void*,void*)>(ClassVtable)(domain,k):nullptr;
+    iter=nullptr;
+    for(int i=0;i<200;i++){
+        void* f=fn<void*(*)(void*,void**)>(ClassFields)(k,&iter);if(!f)break;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||!std::strcmp(n,"value__"))continue;
+        if(is_enum&&vt){std::int64_t v=0;fn<void(*)(void*,void*,void*)>(FieldStaticGetValue)(vt,f,&v);
+            note("TYPEDESC   %s.%s = %lld",label,n,(long long)v);}
+        else note("TYPEDESC   %s.%s : %s @%u",label,n,type_name_of(fn<void*(*)(void*)>(FieldType)(f)),
+                  fn<unsigned(*)(void*)>(FieldOffset)(f));}
+}
+// ShellUI's focus state, from LayerManager's and ShellAppManager's static fields (memory reads,
+// nothing invoked): logged at Service start, at HOLD and RELEASE, and by the focus test.
+void* class_layer_manager=nullptr;
+void* class_shell_app_manager=nullptr;
+bool static_int(void* klass,const char* name,int* out){
+    if(!klass||!out||!can_read_statics())return false;void* iter=nullptr;
+    for(int i=0;i<300;i++){
+        void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)return false;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||std::strcmp(n,name))continue;
+        void* vt=fn<void*(*)(void*,void*)>(ClassVtable)(domain,klass);if(!vt)return false;
+        int v=0;fn<void(*)(void*,void*,void*)>(FieldStaticGetValue)(vt,f,&v);*out=v;return true;}
+    return false;
+}
+void log_focus_state(const char* when){
+    if(!class_layer_manager)return;
+    int app=-1,controller=-1,layer=-1,last_layer=-1,shell_layer=-1,shell_layer_app=-1;
+    static_int(class_layer_manager,"s_lastFocusedApplicationId",&app);
+    static_int(class_layer_manager,"s_lastControllerFocusedApplicationId",&controller);
+    static_int(class_layer_manager,"s_curFocusLayer",&layer);
+    static_int(class_layer_manager,"s_lastFocusLayer",&last_layer);
+    static_int(class_shell_app_manager,"s_focusLayer",&shell_layer);
+    static_int(class_shell_app_manager,"s_focusLayerAppId",&shell_layer_app);
+    note("FOCUSSTATE %s app=%x controller=%x layer=%d last_layer=%d shell_layer=%d shell_layer_app=%x",
+        when,app,controller,layer,last_layer,shell_layer,shell_layer_app);
+}
+void describe_focus_types(){
+    void* app_img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll");
+    void* lnc_img=image("/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll");
+    void* pui=image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+    class_layer_manager=app_img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager"):nullptr;
+    class_shell_app_manager=app_img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(app_img,"Sce.Vsh.ShellUI.AppSystem","ShellAppManager"):nullptr;
+    Method* force_app=method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","ForceAppFocus",3);
+    Method* get_layer=method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","GetFocusLayer",0);
+    Method* get_full=method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","GetFullScreenFocusLayer",0);
+    Method* focus_data=method(app_img,"Sce.Vsh.ShellUI.AppSystem","ProcessFocusController","GetAppFocusData",0);
+    note("FOCUSTYPES force=%p layer=%p full=%p data=%p lnc=%p",force_app,get_layer,get_full,focus_data,lnc_img);
+    describe_type_values(signature_type(force_app,1),"LncUtilWrapper.Flag");
+    describe_type_values(signature_type(force_app,2),"LayerManager.AppFocusLogData");
+    describe_type_values(signature_type(get_layer,-1),"LayerManager.FocusLayer");
+    describe_type_values(signature_type(get_full,-1),"LayerManager.LayerScene");
+    describe_type_values(signature_type(focus_data,-1),"ProcessFocusController.AppFocusData");
+    // PUI: how a scene becomes the focused one (LayerManager.OnFocusActiveSceneChanged follows it).
+    static const char* const scene_words[]={"Focus","focus","Active","Modal","Impose","Input","Pad",nullptr};
+    void* scene_base=pui?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(pui,"Sce.PlayStation.PUI","SceneBase"):nullptr;
+    note("CLASS Sce.PlayStation.PUI.SceneBase class=%p",scene_base);
+    describe_methods(class_application,"Application",scene_words);
+    describe_methods(scene_base,"SceneBase",scene_words);
+    describe_methods(class_scene,"Scene",scene_words);
+    describe_properties(class_application,"Application");
+    describe_properties(scene_base,"SceneBase");
+    log_focus_state("start");
+}
 void describe_focus(){
     static const char* const focus_words[]={"Focus","focus","Impose","Block","Controller","HID",nullptr};
     struct Probe{const char* path;const char* ns;const char* name;const char* const* words;};
@@ -345,6 +427,7 @@ void describe_focus(){
         describe_methods(klass,p.name,p.words);
         describe_fields(klass,p.name,p.words);
         if(!p.words)describe_properties(klass,p.name);}
+    describe_focus_types();
 }
 void describe_types(){
     describe_property(class_panel,"Panel","BackgroundColor");
@@ -446,6 +529,7 @@ void hold_game(){
     int impose=request.functions[SetImposeStatus]?fn<int(*)(int)>(SetImposeStatus)(1):-1;
     int focus=request.shell_app>0?fn<int(*)(int)>(SetControllerFocus)(request.shell_app):-1;
     note("HOLD game=%x shell=%x impose=%x focus=%x",app,unsigned(request.shell_app),impose,focus);
+    log_focus_state("hold");
     game_app.store(app);last_input_ms.store(now_ms());holding.store(true);
 }
 void release_game(const char* why){
@@ -454,6 +538,7 @@ void release_game(const char* why){
     int focus=app>0?fn<int(*)(int)>(SetControllerFocus)(app):-1;
     int impose=request.functions[SetImposeStatus]?fn<int(*)(int)>(SetImposeStatus)(0):-1;
     note("RELEASE (%s) game=%x focus=%x impose=%x",why,app,focus,impose);
+    log_focus_state("release");
 }
 bool engine_set_capture(void*,bool on){
     if(on)repeat_reset.store(true,std::memory_order_release);
@@ -662,6 +747,25 @@ int remove_widgets(){
     note("WIDGET scene removed and handles freed");
     return 1;
 }
+// Focus test without a controller: focus-test.bin (8 bytes, a new value for each run, written over
+// FTP). With the panel closed it holds the game as opening the panel does, and logs ShellUI's focus
+// state before, after 1 s held, and 1 s after the release. Checked every 2 s on the UI thread.
+std::uint64_t focus_test_seen=0,focus_test_at=0;bool focus_test_primed=false;int focus_test_phase=0;
+void focus_test_tick(std::uint64_t tick){
+    if(focus_test_phase==0){
+        if(tick%120)return;
+        std::uint64_t v=0;const bool have=read_file(worker_dir,"focus-test.bin",v);
+        if(!focus_test_primed){focus_test_primed=true;focus_test_seen=have?v:0;return;} // an old file never runs
+        if(!have||v==focus_test_seen||capture.load()||holding.load())return;
+        focus_test_seen=v;note("FOCUSTEST %llu begin",(unsigned long long)v);log_focus_state("test-before");
+        hold_game();focus_test_phase=1;focus_test_at=now_ms();return;}
+    const std::uint64_t now=now_ms();
+    if(focus_test_phase==1&&now-focus_test_at>=1000){log_focus_state("test-held");focus_test_phase=2;focus_test_at=now;}
+    else if(focus_test_phase==2&&now-focus_test_at>=1000){
+        if(!capture.load())release_game("focus test"); // the panel opened meanwhile: it keeps the hold
+        focus_test_phase=3;focus_test_at=now;}
+    else if(focus_test_phase==3&&now-focus_test_at>=1000){log_focus_state("test-after");note("FOCUSTEST end");focus_test_phase=0;}
+}
 void update_hook(Object* instance){
     Update prior=original.load(std::memory_order_acquire);if(prior)prior(instance);
     if(!enabled.load(std::memory_order_acquire))return;
@@ -691,6 +795,7 @@ void update_hook(Object* instance){
             if(try_create()&&widgets_created.load()>0)refresh_text();}
         return;}
     if((tick%text_period_ticks)==0)refresh_text();
+    focus_test_tick(tick);
     oui::Builder builder=ui_builder();
     oui::app::on_tick(tick,builder);
     if(gesture_requested.exchange(false,std::memory_order_acq_rel)){

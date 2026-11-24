@@ -8,7 +8,7 @@
 #include <unistd.h>
 namespace overlay {
 constexpr std::uint64_t magic=0x31434f504c564f44ULL;
-constexpr unsigned version=11;
+constexpr unsigned version=12;
 constexpr const char* parent_dir="/data/discord-overlay-poc";
 constexpr const char* worker_dir="/user/data/discord-overlay-poc";
 enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,AssemblyImage,ClassFromName,
@@ -31,6 +31,9 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // (libSceAudioIn) and the foreground user id (libSceUserService), to measure whether a
     // ShellUI-hosted mic survives a game taking AV focus after the console killed the app.
     AudioInOpen,AudioInInput,AudioInClose,UserGetForegroundUser,
+    // Optional, log-only (libmonosgen): static fields and enum values, ShellUI's focus state
+    // (worker describe_focus_types, log_focus_state). 0 when missing: only those logs go.
+    ClassVtable,FieldStaticGetValue,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -45,7 +48,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "mono_class_get_methods","mono_method_get_name",
     "sceAudioOutInit","sceAudioOutOpen","sceAudioOutOutput","sceAudioOutClose",
     "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus",
-    "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser"};
+    "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser",
+    "mono_class_vtable","mono_field_static_get_value"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
 // AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose

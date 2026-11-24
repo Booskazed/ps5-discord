@@ -109,7 +109,8 @@ static int run(){
         if(optional(i)){
             // The mic and user-service lab functions live in their own modules, not in SystemService.
             const std::uint32_t home=(i==AudioInOpen||i==AudioInInput||i==AudioInClose)?audioin:
-                                     (i==UserGetForegroundUser)?userservice:system;
+                                     (i==UserGetForegroundUser)?userservice:
+                                     (i==ClassVtable||i==FieldStaticGetValue)?mono:system;
             if(home){address_value=kernel_dynlib_dlsym(r.pid,home,symbols[i]);
                 if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,home,nid);}}
             if(!address(address_value)){note("optional %s missing: the overlay cannot hold the game",symbols[i]);address_value=0;}
