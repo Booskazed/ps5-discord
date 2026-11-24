@@ -763,27 +763,31 @@ bool resolve_update_methods(){
     return entry&&now_ms()<request.deadline_ms;
 }
 void hook_step(const char* text){note("HOOKSTEP %s",text);}
+// The 16 bytes a hook found at its target, logged on refusal too: prepare_hook copies them
+// (read permission first on exec-only pages) before it can refuse at the decode step, so a
+// firmware's real prologue lands in worker.log instead of being guessed at. All zero when the
+// refusal came before the copy (alignment or protection). For a jump thunk, also where it leads
+// and that page's protection: a query only, no code is read there.
+void note_hook(const char* what,const Hook& h){
+    const std::uint8_t* b=h.before;
+    note("PROLOGUE %s bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%s",what,
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15],
+        h.thunk?" (jump thunk)":"");
+    if(!h.thunk)return;
+    auto query=fn<ProtectionQuery>(QueryProtection);
+    void* lo=nullptr,*hi=nullptr;int prot=0;
+    int qrc=query?query(h.trampoline,&lo,&hi,&prot):-999;
+    note("HOOKDIAG %s thunk to=%p qrc=%d prot=%d lo=%p hi=%p",what,h.trampoline,qrc,prot,lo,hi);
+}
 bool prepare_update_hook(void* entry){
     auto query=fn<ProtectionQuery>(QueryProtection);
     note("HOOKSTEP prepare begin");
     if(!prepare_hook(update_hook_store,entry,reinterpret_cast<void*>(&update_hook),query,fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap),hook_step)){
-        // prepare_hook copies 16 bytes into .before before it can refuse at the
-        // decode step; log them even on refusal, so a mismatched firmware's
-        // real prologue is visible instead of guessed at.
-        note("PROLOGUE bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-            update_hook_store.before[0],update_hook_store.before[1],update_hook_store.before[2],update_hook_store.before[3],
-            update_hook_store.before[4],update_hook_store.before[5],update_hook_store.before[6],update_hook_store.before[7],
-            update_hook_store.before[8],update_hook_store.before[9],update_hook_store.before[10],update_hook_store.before[11],
-            update_hook_store.before[12],update_hook_store.before[13],update_hook_store.before[14],update_hook_store.before[15]);
+        note_hook("Update",update_hook_store);
         note("REFUSED Update alignment, permissions or relocatable prologue");return false;}
-    auto length=native_patch_length(update_hook_store.before);
-    note("HOOKSTEP prepared len=%zu bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x tramp=%p",
-        (std::size_t)length,
-        update_hook_store.before[0],update_hook_store.before[1],update_hook_store.before[2],update_hook_store.before[3],
-        update_hook_store.before[4],update_hook_store.before[5],update_hook_store.before[6],update_hook_store.before[7],
-        update_hook_store.before[8],update_hook_store.before[9],update_hook_store.before[10],update_hook_store.before[11],
-        update_hook_store.before[12],update_hook_store.before[13],update_hook_store.before[14],update_hook_store.before[15],
-        update_hook_store.trampoline);
+    note_hook("Update",update_hook_store);
+    note("HOOKSTEP prepared %s len=%zu tramp=%p",update_hook_store.thunk?"thunk":"prologue",
+        update_hook_store.thunk?std::size_t(14):native_patch_length(update_hook_store.before),update_hook_store.trampoline);
     original.store(reinterpret_cast<Update>(update_hook_store.trampoline),std::memory_order_release);
     note("HOOKSTEP install begin");
     if(!install_hook(update_hook_store,query)){note("REFUSED hook installation/protection restore");return false;}
@@ -800,7 +804,9 @@ bool install_pad_hook(){
     auto query=fn<ProtectionQuery>(QueryProtection);
     if(!prepare_hook(pad_hook_store,pad_entry,reinterpret_cast<void*>(&pad_hook),query,
                      fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap))){
+        note_hook("GamePad.GetData",pad_hook_store);
         note("REFUSED pad hook preparation");return false;}
+    note_hook("GamePad.GetData",pad_hook_store);
     pad_original.store(reinterpret_cast<PadCall>(pad_hook_store.trampoline),std::memory_order_release);
     if(!install_hook(pad_hook_store,query)){note("REFUSED pad hook installation");return false;}
     return true;

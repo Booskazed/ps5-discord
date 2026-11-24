@@ -86,7 +86,7 @@ int main(){
         assert(!prepare_hook(refused,mapped,reinterpret_cast<void*>(&replacement),query,host_mprotect,host_mmap,host_munmap));
         assert(mapped_prot==original_prot);deny_trampoline=false;
         assert(prepare_hook(active,mapped,reinterpret_cast<void*>(&replacement),query,host_mprotect,host_mmap,host_munmap));
-        assert(mapped_prot==original_prot);check_jump(active.after,reinterpret_cast<void*>(&replacement));
+        assert(!active.thunk&&mapped_prot==original_prot);check_jump(active.after,reinterpret_cast<void*>(&replacement));
         assert(!active.was_installed); // preparation alone must not count as patched
         assert(!install_hook(active,refused_query));assert(mapped_prot==original_prot);
         deny_write=true;assert(!install_hook(active,query));assert(mapped_prot==original_prot);deny_write=false;
@@ -111,5 +111,42 @@ int main(){
         assert(!install_hook(active,query));assert(mapped_prot==original_prot&&!active.installed);
         munmap(active.trampoline,active.page_size);munmap(mapped,mapped_size);
     }
-    std::puts("PASS: protocol identity/deadline guards, exact files, atomic ownership, instruction rejection, 12..16-byte register jumps, RX/exec-only hook/trampoline/restore and refusal cleanup; no console calls");
+    // Firmware 13.60's jump thunk (hook.hpp jump_thunk): the hook swaps the thunk's address and
+    // calls the method at the old one. Nothing else changes and no trampoline is mapped.
+    for(int original_prot:protections){
+        active=Hook{};observed=0;
+        mapped_size=std::size_t(sysconf(_SC_PAGESIZE));mapped=mmap(nullptr,mapped_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);assert(mapped!=MAP_FAILED);
+        auto* code=static_cast<std::uint8_t*>(mapped);std::memset(code,0xcc,64);
+        // The method at +32 increments the caller's integer and returns. The thunk at +0 leads
+        // there, followed by the two bytes seen after Application.Update's thunk on the console.
+        code[32]=0xff;code[33]=0x07;code[34]=0xc3;
+        code[0]=0xff;code[1]=0x25;std::memset(code+2,0,4);
+        auto method=reinterpret_cast<std::uintptr_t>(code+32);std::memcpy(code+6,&method,8);code[14]=0x75;code[15]=0xf0;
+        void* to=nullptr;assert(jump_thunk(code,&to)&&to==code+32);
+        assert(native_patch_length(code)==0); // the decoder alone refuses it, as on the console
+        std::uint8_t other[16];std::memcpy(other,code,16);other[2]=1;assert(!jump_thunk(other,&to)); // [rip+1]: not inline
+        std::memcpy(other,code,16);std::memset(other+6,0,8);assert(!jump_thunk(other,&to));
+        const std::uint64_t kernel=0xffffffff80000000ULL;std::memcpy(other+6,&kernel,8);assert(!jump_thunk(other,&to));
+        reported_prot=original_prot;assert(!host_mprotect(mapped,mapped_size,original_prot));
+        // jmp [rip+0] reads its address as data. A page mapped PROT_EXEC alone is truly unreadable
+        // on a host with protection keys, so calls go through it readable, then back as it was.
+        auto call_through=[&](int* n){
+            assert(!host_mprotect(mapped,mapped_size,PROT_READ|PROT_EXEC));
+            reinterpret_cast<void(*)(int*)>(mapped)(n);
+            assert(!host_mprotect(mapped,mapped_size,original_prot));};
+        assert(prepare_hook(active,mapped,reinterpret_cast<void*>(&replacement),query,host_mprotect,host_mmap,host_munmap));
+        assert(active.thunk&&active.trampoline==code+32&&mapped_prot==original_prot&&!active.was_installed);
+        std::uintptr_t swapped=0;std::memcpy(&swapped,active.after+6,8);
+        assert(swapped==reinterpret_cast<std::uintptr_t>(&replacement));
+        assert(!std::memcmp(active.after,active.before,6)&&!std::memcmp(active.after+14,active.before+14,2));
+        int n=0;call_through(&n);assert(n==1&&observed==0);
+        assert(install_hook(active,query));assert(active.was_installed&&mapped_prot==original_prot);
+        call_through(&n);assert(n==2&&observed==1);
+        assert(remove_hook(active,query));assert(!active.installed&&mapped_prot==original_prot);
+        assert(!host_mprotect(mapped,mapped_size,PROT_READ|PROT_EXEC));assert(!std::memcmp(mapped,active.before,16));
+        assert(!host_mprotect(mapped,mapped_size,original_prot));
+        call_through(&n);assert(n==3&&observed==1);
+        munmap(mapped,mapped_size); // the trampoline is the method itself, in this page: nothing else to unmap
+    }
+    std::puts("PASS: protocol identity/deadline guards, exact files, atomic ownership, instruction rejection, 12..16-byte register jumps, RX/exec-only hook/trampoline/restore and refusal cleanup, 13.60 jump thunks; no console calls");
 }

@@ -85,11 +85,18 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   red since 45c8b78 for that reason).
 - Settings > About > Source shows `github.com/Booskazed/ps5-discord`.
 - In-game overlay: `overlay/src/core/parent.cpp` allows firmware 13.60 next to 13.00 (an explicit list;
-  every other refusal and the Mono signature checks are unchanged). The visual overlay still does
-  not load on 13.60: the hook on `Application.Update` refuses (`REFUSED Update alignment,
-  permissions or relocatable prologue`; the target starts with a 6-byte JIT jump stub), so the app
-  reports an error and "Not loaded". The injection into SceShellUI itself works, and carries the
-  audio worker below.
+  every other refusal and the Mono signature checks are unchanged). The injection into SceShellUI
+  itself works on 13.60, and carries the audio worker below.
+- In-game overlay on 13.60: the hook on `Application.Update` refused (`REFUSED Update alignment,
+  permissions or relocatable prologue`), so the app reported an error and "Not loaded". On 13.60 Mono
+  gives the method's entry as a jump thunk, `jmp [rip+0]` followed by the code's address
+  (`ff2500000000 fb42446202000000 75f0` on the console), which the prologue decoder cannot relocate.
+  `overlay/src/core/hook.hpp` now recognises that thunk and hooks it by swapping its address (the
+  jump itself is untouched; the original is the old address, so no trampoline is needed); every
+  other target goes through the decoder as before. `worker.log` shows the bytes found for `Update`
+  and `GamePad.GetData`, refused or not, and where a thunk leads. `overlay/tests/safety.cpp` covers
+  the thunk. Not yet run on the console; colours, button bits, fonts and labels are still
+  unchecked on 13.60.
 - Voice while a game is in front, over a wireless controller (side-by-side `PPSA99073` build only;
   measured on firmware 13.60). The console ends the app when a game starts (`[SceLncService]
   KillApp()` in the kernel log; it does not suspend it) while the core keeps the call, and the sound

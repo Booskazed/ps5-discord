@@ -23,6 +23,9 @@ struct Hook {
     alignas(16) std::uint8_t before[16]{},after[16]{};
     bool installed=false;
     bool was_installed=false; // sticky: distinguishes "prepared" from "really patched"
+    // The target was a jump thunk (jump_thunk below): the hook swaps its address in place, and
+    // trampoline is the thunk's own destination, the method's code, not a page of ours.
+    bool thunk=false;
 };
 inline bool replace16(void* at,const std::uint8_t expected[16],const std::uint8_t desired[16]){
     if(reinterpret_cast<std::uintptr_t>(at)&15)return false;
@@ -43,6 +46,18 @@ inline std::size_t native_patch_length(const std::uint8_t* code){
         if(!decoded)return 0;length+=decoded;
     }
     return length<=16?length:0;
+}
+// On firmware 13.60 Mono gives some methods' entry as a thunk rather than their code:
+//   ff 25 00 00 00 00   jmp qword ptr [rip+0]
+//   <8 bytes>           the absolute address of the method's code
+// Application.Update, on the console: ff2500000000 fb42446202000000 75f0. The decoder refuses
+// it (a jump cannot be copied to a trampoline), and nothing needs copying: callers go through
+// the thunk, so swapping its address hooks them all, and the old address is the original.
+inline bool jump_thunk(const std::uint8_t code[16],void** to){
+    if(code[0]!=0xff||code[1]!=0x25||code[2]||code[3]||code[4]||code[5])return false;
+    std::uint64_t at;std::memcpy(&at,code+6,8);
+    if(at<0x10000||at>=0x800000000000ULL)return false; // a user-space address, as protocol.hpp checks
+    *to=reinterpret_cast<void*>(at);return true;
 }
 inline bool code_protection(int prot){
     return prot==(PROT_READ|PROT_EXEC)||prot==PROT_EXEC||prot==(PROT_READ|PROT_WRITE|PROT_EXEC);}
@@ -68,6 +83,16 @@ inline bool prepare_hook(Hook& h,void* target,void* replacement,ProtectionQuery 
     std::memcpy(h.before,target,16);
     if(step)step("restore begin");
     if(prot==PROT_EXEC&&mprotect(page,std::size_t(size),prot))return false;
+    void* thunk_to=nullptr;
+    if(jump_thunk(h.before,&thunk_to)){
+        // Only the address changes; the jump and the two bytes after the thunk stay as they are.
+        // No trampoline is mapped: the original is called at the thunk's old address.
+        if(step)step("jump thunk");
+        std::memcpy(h.after,h.before,16);
+        auto to=reinterpret_cast<std::uintptr_t>(replacement);std::memcpy(h.after+6,&to,8);
+        h.target=target;h.trampoline=thunk_to;h.page=page;h.page_size=std::size_t(size);
+        h.mprotect=mprotect;h.original_prot=prot;h.thunk=true;return true;
+    }
     if(step)step("decode begin");
     auto length=native_patch_length(h.before);if(length<12||length>16)return false;
     if(step)step("decode done");
