@@ -428,6 +428,10 @@ int main(void)
     assert(watchdog_state(WATCHDOG_SOFT_MS) == 1 && watchdog_state(WATCHDOG_HARD_MS - 1) == 1 && watchdog_state(WATCHDOG_HARD_MS) == 2);
     // no total duration: a run of any length with progress never trips
     assert(watchdog_state(1) == 0);
+    // a beat newer than the clock read before it (the worker's own process, a millisecond later) is
+    // no idle time; it wrapped to a huge one and killed a healthy Go Live on the console
+    assert(idle_ms(1001, 1000) == 0 && watchdog_state(idle_ms(1001, 1000)) == 0);
+    assert(idle_ms(1000, 1000) == 0 && idle_ms(1000, 1000 + WATCHDOG_HARD_MS) == WATCHDOG_HARD_MS);
     int cases = 0;
 
     // Every profile: the selector/fps flag/bitrate/size/rate budget reach the encoder, the bitrate

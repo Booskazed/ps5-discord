@@ -1611,6 +1611,12 @@ static int watchdog_state(uint64_t idle)
 {
     return idle >= WATCHDOG_HARD_MS ? 2 : idle >= WATCHDOG_SOFT_MS ? 1 : 0;
 }
+// The worker beats about a thousand times a second from its own process. Read the clock before the
+// heartbeat and a beat landing in between, a millisecond later, made now - heartbeat wrap to a huge
+// idle time: the watchdog asked for cleanup and killed the worker in the same millisecond, in the
+// middle of a healthy Go Live (console, 13.60, after 19 minutes: frames at 60 fps 9 s before). The
+// heartbeat is read first now, and one newer than the clock counts as no idle time.
+static uint64_t idle_ms(uint64_t heartbeat, uint64_t now) { return now > heartbeat ? now - heartbeat : 0; }
 
 static sl_broker supervisor;
 struct supervision { pid_t child; int lock_fd; };
@@ -1629,7 +1635,8 @@ static void *supervise(void *arg)
             while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
             worker_failed = 1; break;
         }
-        int watchdog = watchdog_state(now_ms() - atomic_load(&progress->heartbeat_ms));
+        const uint64_t heartbeat = atomic_load(&progress->heartbeat_ms); // before the clock (idle_ms)
+        int watchdog = watchdog_state(idle_ms(heartbeat, now_ms()));
         if (!term_sent && (quit || watchdog >= 1)) {
             log_line("watchdog requesting graceful cleanup");
             kill(child, SIGTERM); term_sent = 1; term_deadline = now_ms() + TERM_GRACE_MS;

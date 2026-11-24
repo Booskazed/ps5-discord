@@ -159,6 +159,10 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   helper now reads again, as for an empty read; only if nothing but 0x81950002 comes for the whole no-picture
   window does it open a fresh session, under the usual limit of four a minute. The opening and start on 13.60
   are unchanged. `capture.log` says when it happens. Covered by the helper tests; not yet seen on the console.
+- Wireless Go Live: the capture watchdog killed a healthy stream (`watchdog requesting graceful cleanup` and
+  `watchdog killing ONLY the owned worker` in the same millisecond, 19 minutes in, 60 fps 9 s before). It read the
+  clock before the worker's heartbeat; a beat landing in between a millisecond later made the idle time wrap to a
+  huge value. The heartbeat is read first now, and a newer one counts as no idle time (`idle_ms`, helper tests).
 - Wireless Go Live diagnostic (`capture/src/diag_native.c`): when the encoder answers `0x81950008`, the
   helper reads (only reads) SceRemotePlay's code, finds where it calls `sceAvcap2Initialize`,
   `sceAvcap2EnableScanInEncode`, `sceAvcap2OpenVideo` and the resource arbitrator, and writes the code
