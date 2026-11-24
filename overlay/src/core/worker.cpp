@@ -436,6 +436,26 @@ void log_focus_state(const char* when,bool ui=true){
     static_int(class_shell_app_manager,"s_focusLayerAppId",&shell_layer_app);
     note("FOCUSSTATE %s app=%x controller=%x layer=%d last_layer=%d shell_layer=%d shell_layer_app=%x pad=%llu locked=%d",
         when,app,controller,layer,last_layer,shell_layer,shell_layer_app,(unsigned long long)pad_polls.load(),locked);
+    // PUI's own input-suspension state (Application's and its base classes' fields named *nput* or
+    // *uspend*): a counter back at its value after ResumeInputEvents shows the home menu has its
+    // buttons again. Plain reads of the Application object (bool/int fields only).
+    void* app_object=ui?application_object():nullptr;
+    if(!app_object)return;
+    char line[600];int at=std::snprintf(line,sizeof line,"APPINPUT %s",when);
+    void* klass=fn<void*(*)(void*)>(ObjectClass)(app_object);
+    for(int depth=0;klass&&depth<6;depth++,klass=fn<void*(*)(void*)>(ClassParent)(klass)){
+        void* iter=nullptr;
+        for(int i=0;i<200&&at>0&&at<int(sizeof line)-80;i++){
+            void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)break;
+            const char* n=fn<const char*(*)(void*)>(FieldName)(f);
+            if(!n||(!std::strstr(n,"nput")&&!std::strstr(n,"uspend")))continue;
+            void* t=fn<void*(*)(void*)>(FieldType)(f);const int k=t?fn<int(*)(void*)>(TypeKind)(t):-1;
+            const unsigned off=fn<unsigned(*)(void*)>(FieldOffset)(f);
+            if((k==2||k==8||k==9)&&off>=16&&off<0x400){
+                int v=0;std::memcpy(&v,static_cast<char*>(app_object)+off,k==2?1:4);
+                at+=std::snprintf(line+at,sizeof line-at," %s=%d",n,v);}
+            else at+=std::snprintf(line+at,sizeof line-at," %s(kind %d)",n,k);}}
+    note("%s",line);
 }
 void describe_focus_types(){
     void* app_img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll");
