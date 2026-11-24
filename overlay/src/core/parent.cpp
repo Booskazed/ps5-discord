@@ -22,8 +22,8 @@
 #ifndef OVERLAY_MODE
 #define OVERLAY_MODE 0
 #endif
-#if OVERLAY_MODE<0||OVERLAY_MODE>11
-#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest, 7 audiorelay, 8 partyprobe, 9 sceneprobe, 10 tilediscord, 11 bundledump"
+#if OVERLAY_MODE<0||OVERLAY_MODE>12
+#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest, 7 audiorelay, 8 partyprobe, 9 sceneprobe, 10 tilediscord, 11 bundledump, 12 nativetileinject"
 #endif
 extern "C" {extern const unsigned char overlay_worker_blob[];extern const unsigned int overlay_worker_blob_size;
 volatile sig_atomic_t overlay_abort_requested=0;
