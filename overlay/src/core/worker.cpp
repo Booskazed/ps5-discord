@@ -293,6 +293,59 @@ void describe_properties(void* klass,const char* cls){
         if(n&&at>0&&at<int(sizeof line)-40)at+=std::snprintf(line+at,sizeof line-at," %s",n);}
     note("%s",line);
 }
+// Log-only reflection, once per Service start: how ShellUI itself moves controller focus on this
+// firmware. On 13.60 sceLncUtilSetControllerFocus answers 0 and yet the game, the home menu or the
+// app behind the open panel still get the buttons; ShellUI's ProcessFocusController / LayerManager
+// keep their own focus state. Each method with static-ness, parameter and return types; fields and
+// properties. Nothing is called. words: only names containing one of them (nullptr: all).
+bool name_has(const char* n,const char* const* words){
+    if(!words)return true;
+    for(auto w=words;*w;w++)if(std::strstr(n,*w))return true;
+    return false;
+}
+const char* type_name_of(void* type){
+    const char* t=type?fn<const char*(*)(void*)>(TypeName)(type):nullptr;return t?t:"?";}
+void describe_methods(void* klass,const char* cls,const char* const* words){
+    void* iter=nullptr;int shown=0;
+    for(int i=0;klass&&i<800&&shown<80;i++){
+        Method* m=fn<Method*(*)(void*,void**)>(ClassMethods)(klass,&iter);if(!m)break;
+        const char* n=fn<const char*(*)(void*)>(MethodName)(m);if(!n||!name_has(n,words))continue;
+        void* sig=fn<void*(*)(void*)>(MethodSignature)(m);if(!sig)continue;
+        char line[700];
+        int at=std::snprintf(line,sizeof line,"METHOD %s.%s%s(",cls,n,fn<int(*)(void*)>(SignatureInstance)(sig)?"":" static");
+        const unsigned count=fn<unsigned(*)(void*)>(SignatureCount)(sig);void* piter=nullptr;
+        for(unsigned k=0;k<count&&k<8&&at>0&&at<int(sizeof line)-120;k++)
+            at+=std::snprintf(line+at,sizeof line-at,"%s%s",k?", ":"",type_name_of(fn<void*(*)(void*,void**)>(SignatureParams)(sig,&piter)));
+        if(at>0&&at<int(sizeof line)-100)std::snprintf(line+at,sizeof line-at,") -> %s",type_name_of(fn<void*(*)(void*)>(SignatureReturn)(sig)));
+        note("%s",line);shown++;}
+}
+void describe_fields(void* klass,const char* cls,const char* const* words){
+    void* iter=nullptr;
+    for(int i=0;klass&&i<200;i++){
+        void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)break;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||!name_has(n,words))continue;
+        note("FIELD %s.%s : %s",cls,n,type_name_of(fn<void*(*)(void*)>(FieldType)(f)));}
+}
+void describe_focus(){
+    static const char* const focus_words[]={"Focus","focus","Impose","Block","Controller","HID",nullptr};
+    struct Probe{const char* path;const char* ns;const char* name;const char* const* words;};
+    static const Probe probes[]={
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","ProcessFocusController",nullptr},
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","FocusController",nullptr},
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","LayerManager",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","ShellAppManager",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll","Sce.Vsh.LncUtil","LncUtilWrapper",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll","Sce.Vsh.LncUtilWrapper","LncUtilWrapper",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll","Sce.Vsh.LncUtil","LncUtil",focus_words}};
+    for(const Probe& p:probes){
+        void* img=image(p.path);
+        void* klass=img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img,p.ns,p.name):nullptr;
+        note("CLASS %s.%s image=%p class=%p",p.ns,p.name,img,klass);
+        if(!klass)continue;
+        describe_methods(klass,p.name,p.words);
+        describe_fields(klass,p.name,p.words);
+        if(!p.words)describe_properties(klass,p.name);}
+}
 void describe_types(){
     describe_property(class_panel,"Panel","BackgroundColor");
     describe_property(class_label,"Label","TextColor");
@@ -301,6 +354,7 @@ void describe_types(){
     describe_properties(class_widget,"Widget");
     describe_properties(class_panel,"Panel");
     describe_properties(class_label,"Label");
+    describe_focus();
 }
 void* engine_add_panel(void*,const oui::Rect* r,const oui::Color* c){
     void* root=scene_root_handle?fn<void*(*)(std::uint32_t)>(GcTarget)(scene_root_handle):nullptr;
