@@ -360,17 +360,73 @@ void describe_type_values(void* type,const char* label){
 // nothing invoked): logged at Service start, at HOLD and RELEASE, and by the focus test.
 void* class_layer_manager=nullptr;
 void* class_shell_app_manager=nullptr;
-bool static_int(void* klass,const char* name,int* out){
+// A static field's value into out (an int or enum: 4 bytes; an object reference: a pointer).
+bool static_read(void* klass,const char* name,void* out){
     if(!klass||!out||!can_read_statics())return false;void* iter=nullptr;
     for(int i=0;i<300;i++){
         void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)return false;
         const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||std::strcmp(n,name))continue;
         void* vt=fn<void*(*)(void*,void*)>(ClassVtable)(domain,klass);if(!vt)return false;
-        int v=0;fn<void(*)(void*,void*,void*)>(FieldStaticGetValue)(vt,f,&v);*out=v;return true;}
+        fn<void(*)(void*,void*,void*)>(FieldStaticGetValue)(vt,f,out);return true;}
     return false;
 }
-void log_focus_state(const char* when){
+bool static_int(void* klass,const char* name,int* out){
+    int v=0;if(!static_read(klass,name,&v))return false;*out=v;return true;}
+// Taking the controller the way ShellUI does (13.60), as sceLncUtilSetControllerFocus alone answers
+// 0 and yet the game, the app or the home menu behind the open panel still get the buttons:
+// - other processes (a game, the Discord app): ShellUI's own ProcessFocusController
+//   (LayerManager.s_processFocusController).SetControllerFocus(ShellUI), which also keeps its HID
+//   focus; given back with LayerManager.ForceUpdateControllerFocus(), ShellUI's own choice again;
+// - ShellUI's own scenes (home menu, Control Center): PUI Application.SuspendInputEvents() and
+//   ResumeInputEvents(); the panel reads GamePad.GetData through the pad hook, not PUI's events.
+// focus-mode.bin (8 bytes) picks them without a rebuild: bit 0 the controller focus, bit 1 the
+// input events; no file: both.
+Method* method_pfc_set_controller=nullptr;
+Method* method_lm_force_controller=nullptr;
+Method* method_app_suspend_input=nullptr;
+Method* method_app_resume_input=nullptr;
+Method* method_app_focus_scene=nullptr;
+Method* method_scene_input_locked=nullptr;
+bool managed_focus_held=false,input_suspended=false;
+std::uint64_t focus_mode(){std::uint64_t m=3;(void)read_file(worker_dir,"focus-mode.bin",m);return m;}
+void* application_object(){return app_handle?fn<void*(*)(std::uint32_t)>(GcTarget)(app_handle):nullptr;}
+bool invoke_logged(const char* what,Method* m,void* instance,void** args){
+    if(!m)return false;
+    void* exception=nullptr;bool ok=false;invoke_ex(m,instance,args,ok,&exception);
+    if(!ok)describe_exception(what,exception);
+    return ok;
+}
+void take_focus_managed(){
+    const std::uint64_t mode=focus_mode();
+    void* pfc=nullptr;
+    if((mode&1)&&request.shell_app>0&&static_read(class_layer_manager,"s_processFocusController",&pfc)&&pfc){
+        int id=request.shell_app;void* args[1]={&id};
+        managed_focus_held=invoke_logged("ProcessFocusController.SetControllerFocus",method_pfc_set_controller,pfc,args);}
+    void* app=application_object();
+    if((mode&2)&&app&&!input_suspended)
+        input_suspended=invoke_logged("Application.SuspendInputEvents",method_app_suspend_input,app,nullptr);
+    note("HOLD managed mode=%llu pfc=%p controller=%d input_suspended=%d",(unsigned long long)mode,pfc,
+        int(managed_focus_held),int(input_suspended));
+}
+void give_focus_managed(){
+    if(input_suspended){
+        void* app=application_object();
+        if(app&&invoke_logged("Application.ResumeInputEvents",method_app_resume_input,app,nullptr))input_suspended=false;}
+    if(managed_focus_held){
+        invoke_logged("LayerManager.ForceUpdateControllerFocus",method_lm_force_controller,nullptr,nullptr);
+        managed_focus_held=false;}
+    note("RELEASE managed input_suspended=%d",int(input_suspended));
+}
+// ui: on ShellUI's UI thread, where the focused scene's InputLocked can be asked too.
+void log_focus_state(const char* when,bool ui=true){
     if(!class_layer_manager)return;
+    int locked=-1;
+    if(ui){
+        void* app=application_object();void* exception=nullptr;bool ok=false;void* scene=nullptr;
+        if(app&&method_app_focus_scene){scene=invoke_ex(method_app_focus_scene,app,nullptr,ok,&exception);if(!ok)scene=nullptr;}
+        if(scene&&method_scene_input_locked){exception=nullptr;
+            void* r=invoke_ex(method_scene_input_locked,scene,nullptr,ok,&exception);
+            if(ok&&r)locked=*static_cast<bool*>(fn<void*(*)(void*)>(ObjectUnbox)(r))?1:0;}}
     int app=-1,controller=-1,layer=-1,last_layer=-1,shell_layer=-1,shell_layer_app=-1;
     static_int(class_layer_manager,"s_lastFocusedApplicationId",&app);
     static_int(class_layer_manager,"s_lastControllerFocusedApplicationId",&controller);
@@ -378,8 +434,8 @@ void log_focus_state(const char* when){
     static_int(class_layer_manager,"s_lastFocusLayer",&last_layer);
     static_int(class_shell_app_manager,"s_focusLayer",&shell_layer);
     static_int(class_shell_app_manager,"s_focusLayerAppId",&shell_layer_app);
-    note("FOCUSSTATE %s app=%x controller=%x layer=%d last_layer=%d shell_layer=%d shell_layer_app=%x",
-        when,app,controller,layer,last_layer,shell_layer,shell_layer_app);
+    note("FOCUSSTATE %s app=%x controller=%x layer=%d last_layer=%d shell_layer=%d shell_layer_app=%x pad=%llu locked=%d",
+        when,app,controller,layer,last_layer,shell_layer,shell_layer_app,(unsigned long long)pad_polls.load(),locked);
 }
 void describe_focus_types(){
     void* app_img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll");
@@ -406,7 +462,19 @@ void describe_focus_types(){
     describe_methods(class_scene,"Scene",scene_words);
     describe_properties(class_application,"Application");
     describe_properties(scene_base,"SceneBase");
-    log_focus_state("start");
+    // The managed focus API (take_focus_managed), each kept only with the signature it was read with.
+    auto checked=[](Method* m,bool instance,unsigned count,int ret)->Method*{return m&&signature(m,instance,count,ret)?m:nullptr;};
+    method_pfc_set_controller=checked(method(app_img,"Sce.Vsh.ShellUI.AppSystem","ProcessFocusController","SetControllerFocus",1),true,1,kind_void);
+    method_lm_force_controller=checked(method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","ForceUpdateControllerFocus",0),false,0,kind_void);
+    auto from=[](void* klass,const char* name,int count)->Method*{
+        return klass?fn<Method*(*)(void*,const char*,int)>(MethodFromName)(klass,name,count):nullptr;};
+    method_app_suspend_input=checked(from(class_application,"SuspendInputEvents",0),true,0,kind_void);
+    method_app_resume_input=checked(from(class_application,"ResumeInputEvents",0),true,0,kind_void);
+    method_app_focus_scene=checked(from(class_application,"get_FocusActiveScene",0),true,0,kind_class);
+    method_scene_input_locked=from(scene_base,"get_InputLocked",0);
+    note("FOCUSAPI pfc_set=%p force=%p suspend=%p resume=%p focus_scene=%p locked=%p",method_pfc_set_controller,
+        method_lm_force_controller,method_app_suspend_input,method_app_resume_input,method_app_focus_scene,method_scene_input_locked);
+    log_focus_state("start",false);
 }
 void describe_focus(){
     static const char* const focus_words[]={"Focus","focus","Impose","Block","Controller","HID",nullptr};
@@ -529,22 +597,33 @@ void hold_game(){
     int impose=request.functions[SetImposeStatus]?fn<int(*)(int)>(SetImposeStatus)(1):-1;
     int focus=request.shell_app>0?fn<int(*)(int)>(SetControllerFocus)(request.shell_app):-1;
     note("HOLD game=%x shell=%x impose=%x focus=%x",app,unsigned(request.shell_app),impose,focus);
+    take_focus_managed();
     log_focus_state("hold");
     game_app.store(app);last_input_ms.store(now_ms());holding.store(true);
 }
-void release_game(const char* why){
+// ui: false only from the worker's own thread at teardown (the UI thread usually released first).
+void release_game(const char* why,bool ui=true){
     if(!holding.exchange(false))return;
     int app=game_app.load();
     int focus=app>0?fn<int(*)(int)>(SetControllerFocus)(app):-1;
     int impose=request.functions[SetImposeStatus]?fn<int(*)(int)>(SetImposeStatus)(0):-1;
     note("RELEASE (%s) game=%x focus=%x impose=%x",why,app,focus,impose);
-    log_focus_state("release");
+    give_focus_managed();
+    log_focus_state("release",ui);
 }
+// Closing the panel with a button still held (the press that closed it) would hand that button to
+// the game or menu the moment the controller goes back: the release waits until no button is
+// held (pad hook's last_buttons), at most 1.5 s. update_hook does it, on the UI thread.
+std::atomic<bool> release_pending{false};
+std::atomic<std::uint64_t> release_pending_since{0};
 bool engine_set_capture(void*,bool on){
     if(on)repeat_reset.store(true,std::memory_order_release);
     if(on&&!capture.load(std::memory_order_relaxed))pending_down.store(0,std::memory_order_relaxed);
     capture.store(on,std::memory_order_release);
-    if(on)hold_game();else release_game("closed");
+    if(on){release_pending.store(false);hold_game();}
+    else if(holding.load()&&last_buttons.load(std::memory_order_relaxed)){
+        release_pending_since.store(now_ms());release_pending.store(true);}
+    else release_game("closed");
     return true;}
 bool engine_send(void*,const char* text){
     if(!text)return false;
@@ -780,6 +859,9 @@ void update_hook(Object* instance){
     // Stop is checked first so no new widgets appear after a stop request, even
     // when creation never succeeded.
     if(teardown.load(std::memory_order_acquire)){
+        // The controller and PUI's input events go back here, on the UI thread, before the
+        // worker's own thread gets to it (its release_game is then a no-op).
+        if(holding.load()){capture.store(false);release_pending.store(false);release_game("teardown");}
         int state=widget_removed.load(std::memory_order_relaxed);
         // 0: poll every callback (queued removal may take frames). -1 with live
         // scene handles: one bounded retry. 1: done.
@@ -790,6 +872,9 @@ void update_hook(Object* instance){
             cleanup_retry_used=true;
             widget_removed.store(remove_widgets(),std::memory_order_release);}
         return;}
+    if(release_pending.load(std::memory_order_acquire)&&
+       (!last_buttons.load(std::memory_order_relaxed)||now_ms()-release_pending_since.load(std::memory_order_relaxed)>1500)){
+        release_pending.store(false);if(!capture.load())release_game("closed");}
     if(widgets_created.load(std::memory_order_acquire)<=0){
         if(tick>=create_delay_ticks&&create_attempts.load(std::memory_order_relaxed)<create_attempt_limit){
             if(try_create()&&widgets_created.load()>0)refresh_text();}
@@ -1454,7 +1539,7 @@ State run(){
     }while(false);
     enabled.store(false,std::memory_order_release);
     input_enabled.store(false,std::memory_order_release);
-    capture.store(false);release_game("teardown"); // never leave the game without its controller
+    capture.store(false);release_game("teardown",false); // never leave the game without its controller
     auto query=fn<ProtectionQuery>(QueryProtection);
     // Every installed hook gets its removal attempted; a failed one must not
     // short-circuit the rest.

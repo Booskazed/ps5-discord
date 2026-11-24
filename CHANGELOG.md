@@ -100,6 +100,16 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   (2026-11-24, 13.60, fresh ShellUI, plain prologue) the overlay loads: both hooks installed, the
   scene added, Update running. Chaining behind another hook is covered by the host test only.
   Colours, button bits, fonts and labels are still unchecked on 13.60.
+- Overlay on 13.60: with the panel open, the game, the Discord app or the home menu behind it still
+  got the buttons (`sceLncUtilSetControllerFocus` and the impose flag answered 0 with no effect). The
+  panel now also takes the controller the way ShellUI does: its `ProcessFocusController`
+  (`LayerManager.s_processFocusController`) `.SetControllerFocus(ShellUI)`, given back with
+  `LayerManager.ForceUpdateControllerFocus()`; and PUI's `Application.SuspendInputEvents()` /
+  `ResumeInputEvents()` for ShellUI's own scenes. `focus-mode.bin` (8 bytes, bit 0 controller focus,
+  bit 1 input events, both by default) selects them without a rebuild. The button that closes the
+  panel no longer reaches what is behind it: the controller goes back once no button is held (at most
+  1.5 s). `worker.log` shows ShellUI's focus state (`FOCUSSTATE`) at each hold and release, and
+  `focus-test.bin` runs a hold without a controller. Not yet checked with a game in front.
 - The visual overlay and the audio worker (below) no longer share their locks. The audio worker
   holds its lock for hours, so the overlay's worker exited without a word; and the overlay's loader
   holds `parent.lock` while the overlay runs, so the core could not relaunch the audio worker after
