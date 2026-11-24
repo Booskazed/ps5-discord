@@ -40,20 +40,11 @@ std::atomic<std::uint64_t> options_hold_ms{600}; // the app's setting (Builder::
 constexpr unsigned create_attempt_limit=3,create_delay_ticks=30,text_period_ticks=12;
 Request request;
 Hook update_hook_store,pad_hook_store,share_hook_store;
-// ---- Mode::BundleDump (lab) globals -----------------------------------------
-// Hook sceRnpsBundleVerifyAndDecrypt and copy a bundle's decrypted Hermes bytecode out. The hook
-// calls the original (which decrypts the RNPSHEDR buffer in place), then reads that buffer. The
-// system is never written; only our own capture buffer and our own file.
-using RnpsDecryptCall=int(*)(void*,unsigned,void*,void*,void*,void*);
-Hook rnps_hook_store;
-std::atomic<RnpsDecryptCall> rnps_original{nullptr};
-constexpr std::uint32_t kNpxsBytecodeOff=0xB30;      // header+0x1c for NPXS40003 (13.60)
-constexpr std::uint32_t kNpxsBytecodeLen=0x639130;   // header+0x20 for NPXS40003 (13.60)
-constexpr std::size_t   kBundleCaptureCap=0x640000;  // >= kNpxsBytecodeLen
-unsigned char* bundle_capture=nullptr;               // mmap'd before the hook is installed
-std::atomic<std::uint32_t> bundle_capture_len{0};
-std::atomic<bool> bundle_captured{false};
-std::atomic<unsigned> bundle_decrypt_calls{0};
+// ---- Mode::BundleDump (lab): run_bundle_dump() reads the bundle file and decrypts it in place by
+// calling the RNPS kernel-decrypt routine directly (libSceRnpsBundle sub_6f80, which opens /dev/rnps
+// and ioctls the buffer). No hook, no user action, no system write; it keeps no globals of its own.
+constexpr std::uint32_t kRnpsDecryptOffset=0x6f80;      // sub_6f80 in libSceRnpsBundle, relative to...
+constexpr std::uint32_t kRnpsVerifyExportOffset=0x1050; // ...sceRnpsBundleVerifyAndDecrypt (eqd58iI3rv8)
 void* domain=nullptr;
 void* resolved_update_entry=nullptr;
 Method* find_scene=nullptr;
@@ -2146,76 +2137,66 @@ State run_tile_discord(){
     note("TILE done");
     publish(State::Passed);return State::Passed;
 }
-// Mode::BundleDump (lab): the hook on sceRnpsBundleVerifyAndDecrypt. It calls the original, then,
-// once, copies the decrypted Hermes bytecode of NPXS40003 (matched by its exact geometry) into the
-// pre-mapped buffer. It writes no system memory; run_bundle_dump() does the file write off this thread.
-int rnps_decrypt_hook(void* buf,unsigned size,void* o1,void* o2,void* ctx,void* a5){
-    RnpsDecryptCall orig=rnps_original.load(std::memory_order_acquire);
-    int rc=orig?orig(buf,size,o1,o2,ctx,a5):-1;
-    bundle_decrypt_calls.fetch_add(1,std::memory_order_relaxed);
-    if(rc==0&&buf&&bundle_capture&&!bundle_captured.load(std::memory_order_acquire)){
-        const unsigned char* b=static_cast<const unsigned char*>(buf);
-        if(std::memcmp(b,"RNPSHEDR",8)==0){
-            std::uint32_t off=0,len=0;
-            std::memcpy(&off,b+0x1c,4);std::memcpy(&len,b+0x20,4);
-            if(off==kNpxsBytecodeOff&&len==kNpxsBytecodeLen&&len<=kBundleCaptureCap&&
-               std::uint64_t(off)+len<=std::uint64_t(size)){
-                std::memcpy(bundle_capture,b+off,len);
-                bundle_capture_len.store(len,std::memory_order_release);
-                bundle_captured.store(true,std::memory_order_release);
-            }
-        }
-    }
-    return rc;
-}
+// Mode::BundleDump (lab): dump the Control Center's Hermes bytecode without waiting for the system to
+// load it. The RNPS container is decrypted by a kernel routine (libSceRnpsBundle sub_6f80: it opens
+// /dev/rnps and ioctls the buffer, which the kernel decrypts in place) that needs no certificate
+// context. So we read application.ps.bundle from disk, call that routine on it, and copy out the
+// plaintext bytecode section. One shot on inject; writes only our own file, never system memory.
 State run_bundle_dump(){
     publish(State::Observing);
-    note("BUNDLEDUMP start pid=%d",int(getpid()));
-    void* target=reinterpret_cast<void*>(request.functions[RnpsVerifyDecrypt]);
-    if(!address(reinterpret_cast<std::uintptr_t>(target))){
-        note("BUNDLEDUMP refused: sceRnpsBundleVerifyAndDecrypt not resolved");publish(State::Failed);return State::Failed;}
-    auto query=fn<ProtectionQuery>(QueryProtection);
+    note("BUNDLEDUMP v2 start pid=%d",int(getpid()));
+    const std::uint64_t verify_export=request.functions[RnpsVerifyDecrypt];
+    if(!address(verify_export)){note("BUNDLEDUMP refused: RNPS export not resolved");publish(State::Failed);return State::Failed;}
+    const std::uint64_t base=verify_export-kRnpsVerifyExportOffset;
+    auto rnps_decrypt=reinterpret_cast<int(*)(void*,unsigned)>(base+kRnpsDecryptOffset);
+    // Safety gate: only call the decrypt routine if the bytes there really are its known prologue
+    // (push rbp; mov rbp,rsp; push r15; push r14; push r12; push rbx). This guards against any
+    // library-version/offset mismatch: on a miss we refuse instead of calling into the wrong code.
+    // (A wrong call could at most crash SceShellUI, which a reboot fixes; nothing here writes any
+    // partition, so it can never brick the console.) The page is normal r-x, so reading it is safe.
+    static const unsigned char kDecryptPrologue[11]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x54,0x53};
+    if(std::memcmp(reinterpret_cast<const void*>(base+kRnpsDecryptOffset),kDecryptPrologue,sizeof kDecryptPrologue)!=0){
+        note("BUNDLEDUMP refused: decrypt-routine prologue mismatch at %p; not calling",reinterpret_cast<void*>(base+kRnpsDecryptOffset));
+        publish(State::Failed);return State::Failed;}
+    // Read the raw RNPSHEDR container. In ShellUI's sandbox the apps live under /mnt/rnps.
+    const char* paths[]={"/mnt/rnps/apps/NPXS40003/application.ps.bundle",
+                         "/system_ex/rnps/apps/NPXS40003/application.ps.bundle"};
+    FILE* f=nullptr;const char* used=nullptr;
+    for(const char* cand:paths){if((f=std::fopen(cand,"rb"))){used=cand;break;}}
+    if(!f){note("BUNDLEDUMP refused: cannot open the bundle file (errno=%d)",errno);publish(State::Failed);return State::Failed;}
+    std::fseek(f,0,SEEK_END);const long fsz=std::ftell(f);std::fseek(f,0,SEEK_SET);
+    if(fsz<=0x1000||fsz>0x800000){std::fclose(f);note("BUNDLEDUMP refused: unexpected bundle size %ld",fsz);publish(State::Failed);return State::Failed;}
     auto do_mmap=fn<MmapCall>(TargetMmap);
-    if(!do_mmap){note("BUNDLEDUMP refused: mmap unavailable");publish(State::Failed);return State::Failed;}
-    bundle_capture=static_cast<unsigned char*>(do_mmap(nullptr,kBundleCaptureCap,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
-    if(!bundle_capture||bundle_capture==reinterpret_cast<void*>(-1)){
-        note("BUNDLEDUMP refused: capture mmap failed");bundle_capture=nullptr;publish(State::Failed);return State::Failed;}
-    note("BUNDLEDUMP target=%p capture=%p",target,static_cast<void*>(bundle_capture));
-    if(!prepare_hook(rnps_hook_store,target,reinterpret_cast<void*>(&rnps_decrypt_hook),query,
-                     fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap),hook_step)){
-        note("PROLOGUE bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
-            rnps_hook_store.before[0],rnps_hook_store.before[1],rnps_hook_store.before[2],rnps_hook_store.before[3],
-            rnps_hook_store.before[4],rnps_hook_store.before[5],rnps_hook_store.before[6],rnps_hook_store.before[7],
-            rnps_hook_store.before[8],rnps_hook_store.before[9],rnps_hook_store.before[10],rnps_hook_store.before[11],
-            rnps_hook_store.before[12],rnps_hook_store.before[13],rnps_hook_store.before[14],rnps_hook_store.before[15]);
-        note("BUNDLEDUMP refused: prepare_hook failed");publish(State::Failed);return State::Failed;}
-    rnps_original.store(reinterpret_cast<RnpsDecryptCall>(rnps_hook_store.trampoline),std::memory_order_release);
-    if(!install_hook(rnps_hook_store,query)){note("BUNDLEDUMP refused: install_hook failed");publish(State::Failed);return State::Failed;}
-    note("BUNDLEDUMP hook installed; open the Control Center to trigger the decrypt");
-    const std::uint64_t deadline=request.deadline_ms>6000?request.deadline_ms-6000:now_ms()+20000;
+    if(!do_mmap){std::fclose(f);note("BUNDLEDUMP refused: mmap unavailable");publish(State::Failed);return State::Failed;}
+    const std::size_t cap=(std::size_t(fsz)+0xffff)&~std::size_t(0xffff);
+    auto* buf=static_cast<unsigned char*>(do_mmap(nullptr,cap,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+    if(!buf||buf==reinterpret_cast<void*>(-1)){std::fclose(f);note("BUNDLEDUMP refused: buffer mmap failed");publish(State::Failed);return State::Failed;}
+    const std::size_t got=std::fread(buf,1,std::size_t(fsz),f);std::fclose(f);
+    if(got!=std::size_t(fsz)||std::memcmp(buf,"RNPSHEDR",8)!=0){
+        note("BUNDLEDUMP refused: read %zu/%ld or not RNPSHEDR on disk",got,fsz);publish(State::Failed);return State::Failed;}
+    note("BUNDLEDUMP read %s (%ld bytes); calling decrypt @%p (base=%p)",used,fsz,
+        reinterpret_cast<void*>(base+kRnpsDecryptOffset),reinterpret_cast<void*>(base));
+    const int rc=rnps_decrypt(buf,static_cast<unsigned>(fsz));
+    std::uint32_t off=0,len=0;std::memcpy(&off,buf+0x1c,4);std::memcpy(&len,buf+0x20,4);
+    static const unsigned char hbc_magic[8]={0xC6,0x1F,0xBC,0x03,0xC1,0x03,0x19,0x1F};
+    const bool in_range=std::uint64_t(off)+len<=std::uint64_t(std::size_t(fsz));
+    const bool magic_ok=in_range&&len>=8&&std::memcmp(buf+off,hbc_magic,8)==0;
+    note("BUNDLEDUMP decrypt rc=%d off=0x%x len=0x%x hbc_magic=%d",rc,unsigned(off),unsigned(len),magic_ok?1:0);
     bool wrote=false;
-    while(now_ms()<deadline){
-        std::uint64_t stop=0;
-        if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
-        if(bundle_captured.load(std::memory_order_acquire)){
-            const std::uint32_t len=bundle_capture_len.load(std::memory_order_acquire);
-            static const unsigned char hbc_magic[8]={0xC6,0x1F,0xBC,0x03,0xC1,0x03,0x19,0x1F};
-            const bool magic_ok=len>=8&&std::memcmp(bundle_capture,hbc_magic,8)==0;
-            char p[256];
-            if(path(p,sizeof p,worker_dir,"npxs40003.hbc")){
-                FILE* f=std::fopen(p,"wb");
-                if(f){const std::size_t w=std::fwrite(bundle_capture,1,len,f);bool ok=(w==len);if(std::fclose(f))ok=false;
-                    note("BUNDLEDUMP wrote %s len=%u hbc_magic=%d ok=%d",p,unsigned(len),magic_ok?1:0,ok?1:0);wrote=ok;}
-                else note("BUNDLEDUMP fopen failed %s errno=%d",p,errno);}
-            break;}
-        publish(State::Observing);usleep(300000);}
-    if(!wrote&&!bundle_captured.load(std::memory_order_acquire))
-        note("BUNDLEDUMP no capture: the Control Center bundle was not decrypted in this window (decrypt calls=%u)",bundle_decrypt_calls.load());
-    bool removed=true;
-    if(rnps_hook_store.installed)removed&=remove_hook(rnps_hook_store,query);
-    note("BUNDLEDUMP done calls=%u captured=%d wrote=%d removed=%d",
-        bundle_decrypt_calls.load(),bundle_captured.load()?1:0,wrote?1:0,removed?1:0);
-    State result=wrote?State::Passed:(removed?State::Failed:State::RemoveFailed);
+    if(magic_ok){
+        char p[256];
+        if(path(p,sizeof p,worker_dir,"npxs40003.hbc")){
+            FILE* o=std::fopen(p,"wb");
+            if(o){const std::size_t w=std::fwrite(buf+off,1,len,o);bool ok=(w==len);if(std::fclose(o))ok=false;wrote=ok;
+                note("BUNDLEDUMP wrote %s len=%u ok=%d",p,unsigned(len),ok?1:0);}
+            else note("BUNDLEDUMP fopen out failed errno=%d",errno);}
+    } else {
+        note("BUNDLEDUMP no plaintext: rc=%d off=0x%x len=0x%x in_range=%d",rc,unsigned(off),unsigned(len),in_range?1:0);
+        if(in_range&&len>=8)
+            note("BUNDLEDUMP head=%02x%02x%02x%02x%02x%02x%02x%02x",
+                buf[off],buf[off+1],buf[off+2],buf[off+3],buf[off+4],buf[off+5],buf[off+6],buf[off+7]);
+    }
+    const State result=wrote?State::Passed:State::Failed;
     publish(result);return result;
 }
 State run(){
