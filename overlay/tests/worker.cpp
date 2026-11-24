@@ -207,8 +207,12 @@ static void bind(){
         reinterpret_cast<std::uintptr_t>(&offset_none),reinterpret_cast<std::uintptr_t>(&iter_none),
         reinterpret_cast<std::uintptr_t>(&name_none),
         reinterpret_cast<std::uintptr_t>(&iter_none),reinterpret_cast<std::uintptr_t>(&name_none),
+        // AudioOutInit..AudioOutClose: only the lab's AudioTest/AudioRelay modes call them, not run here.
+        0,0,0,0,
         reinterpret_cast<std::uintptr_t>(&big_app_fake),reinterpret_cast<std::uintptr_t>(&impose_fake),
-        reinterpret_cast<std::uintptr_t>(&focus_fake)};
+        reinterpret_cast<std::uintptr_t>(&focus_fake),
+        // AudioInOpen..UserGetForegroundUser: optional, AudioRelay only.
+        0,0,0,0};
     static_assert(sizeof values==sizeof request.functions);std::memcpy(request.functions,values,sizeof values);
     request.mode=Mode::Resolve;request.deadline_ms=now_ms()+18000;
 }
