@@ -42,6 +42,10 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // Optional lab (Mode::TileDiscord, Mono): nested type iteration (IpcTypes.SceVoiceChat*Event are nested types, which
     // mono_class_from_name cannot return) and a class's image (to reach corlib's Marshal from a string's class).
     MonoNestedTypes,MonoClassImage,
+    // Optional lab (Mode::BundleDump, libSceRnpsBundle): the RNPS container verify+decrypt export
+    // (NID eqd58iI3rv8 = sceRnpsBundleVerifyAndDecrypt), hooked to copy a bundle's decrypted Hermes
+    // bytecode (the Control Center NPXS40003) to a file. Read-only; the hook never writes system memory.
+    RnpsVerifyDecrypt,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -60,7 +64,7 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "sceKernelLoadStartModule","sceKernelDlsym","sysctl",
     "O1lQ2+do5r4","0zsTiDhM0nU",
     "mono_class_vtable","mono_field_static_get_value",
-    "mono_class_get_nested_types","mono_class_get_image"};
+    "mono_class_get_nested_types","mono_class_get_image","eqd58iI3rv8"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
 // AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose
@@ -68,8 +72,8 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
 // inside ShellUI. AudioRelay plays real voice PCM piped from the app
 // (platform/ps5/audio_relay.hpp) instead of AudioTest's generated tone, for
 // as long as that connection stays up (minutes, not seconds).
-enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7,PartyProbe=8,SceneProbe=9,TileDiscord=10};
-inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay||m==Mode::PartyProbe||m==Mode::SceneProbe||m==Mode::TileDiscord;}
+enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7,PartyProbe=8,SceneProbe=9,TileDiscord=10,BundleDump=11};
+inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay||m==Mode::PartyProbe||m==Mode::SceneProbe||m==Mode::TileDiscord||m==Mode::BundleDump;}
 inline bool draws(Mode m){return m==Mode::Widget||m==Mode::Service;}
 // Managed Sce.PlayStation.Core.Input.GamePadData layout (value type, 36 bytes).
 struct PadData {
@@ -114,7 +118,7 @@ inline bool valid(const Request& r,int pid,std::uint64_t build,std::uint64_t epo
     // deadline window is wider than every other mode's.
     // PartyProbe (lab) may hold a voice-chat registration for a few minutes so someone can look at the tile.
     // SceneProbe (lab) walks the Mono metadata of the Control Center voice tile types; a wide window keeps the worker alive for post-run introspection.
-    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:(r.mode==Mode::PartyProbe||r.mode==Mode::SceneProbe||r.mode==Mode::TileDiscord)?650000:120000;
+    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:(r.mode==Mode::PartyProbe||r.mode==Mode::SceneProbe||r.mode==Mode::TileDiscord||r.mode==Mode::BundleDump)?650000:120000;
     if(r.signature!=magic||r.protocol!=version||r.size!=sizeof r||r.pid!=pid||r.build!=build||r.epoch!=epoch||!r.epoch||!r.token||
        !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>max_window)return false;
     for(unsigned i=0;i<FunctionCount;i++)if(!address(r.functions[i])&&!(optional(i)&&!r.functions[i]))return false;

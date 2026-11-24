@@ -16,7 +16,7 @@ LAB_FLAGS := $(filter-out -DOVERLAY_BUILD=%,$(FLAGS)) -DOVERLAY_BUILD=0x$(LAB_BU
 VENDOR := vendor/shellui-loader
 OBJECTS := build/pt.o build/loader.o build/injector.o build/remote-call.o build/blob.o
 .PHONY: all test inspect clean preview pill-lab lab-preview
-all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf build/overlay-partyprobe.elf build/overlay-sceneprobe.elf build/overlay-tilediscord.elf inspect
+all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf build/overlay-partyprobe.elf build/overlay-sceneprobe.elf build/overlay-tilediscord.elf build/overlay-bundledump.elf inspect
 # The build id is baked into both halves (worker and loader): any change to it rebuilds both,
 # or the loader's request carries an id the embedded worker refuses.
 build/overlay-worker.elf: $(HASH_SOURCES) Makefile
@@ -99,6 +99,13 @@ build/parent-tilediscord.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOU
 	@mkdir -p build
 	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=10 -c $< -o $@
 build/overlay-tilediscord.elf: build/parent-tilediscord.o $(OBJECTS)
+	$(CXX_PS5) $(FLAGS) $^ -o $@
+# Lab only (never packaged): hooks sceRnpsBundleVerifyAndDecrypt and copies the decrypted Hermes
+# bytecode of the Control Center bundle (NPXS40003) to worker_dir/npxs40003.hbc. Read-only.
+build/parent-bundledump.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES) Makefile
+	@mkdir -p build
+	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=11 -c $< -o $@
+build/overlay-bundledump.elf: build/parent-bundledump.o $(OBJECTS)
 	$(CXX_PS5) $(FLAGS) $^ -o $@
 # Standalone lab: explicit opt-in, never linked into the app package or normal blobs.
 pill-lab: build/pill-lab.elf

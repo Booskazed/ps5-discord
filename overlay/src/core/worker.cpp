@@ -40,6 +40,20 @@ std::atomic<std::uint64_t> options_hold_ms{600}; // the app's setting (Builder::
 constexpr unsigned create_attempt_limit=3,create_delay_ticks=30,text_period_ticks=12;
 Request request;
 Hook update_hook_store,pad_hook_store,share_hook_store;
+// ---- Mode::BundleDump (lab) globals -----------------------------------------
+// Hook sceRnpsBundleVerifyAndDecrypt and copy a bundle's decrypted Hermes bytecode out. The hook
+// calls the original (which decrypts the RNPSHEDR buffer in place), then reads that buffer. The
+// system is never written; only our own capture buffer and our own file.
+using RnpsDecryptCall=int(*)(void*,unsigned,void*,void*,void*,void*);
+Hook rnps_hook_store;
+std::atomic<RnpsDecryptCall> rnps_original{nullptr};
+constexpr std::uint32_t kNpxsBytecodeOff=0xB30;      // header+0x1c for NPXS40003 (13.60)
+constexpr std::uint32_t kNpxsBytecodeLen=0x639130;   // header+0x20 for NPXS40003 (13.60)
+constexpr std::size_t   kBundleCaptureCap=0x640000;  // >= kNpxsBytecodeLen
+unsigned char* bundle_capture=nullptr;               // mmap'd before the hook is installed
+std::atomic<std::uint32_t> bundle_capture_len{0};
+std::atomic<bool> bundle_captured{false};
+std::atomic<unsigned> bundle_decrypt_calls{0};
 void* domain=nullptr;
 void* resolved_update_entry=nullptr;
 Method* find_scene=nullptr;
@@ -2132,12 +2146,85 @@ State run_tile_discord(){
     note("TILE done");
     publish(State::Passed);return State::Passed;
 }
+// Mode::BundleDump (lab): the hook on sceRnpsBundleVerifyAndDecrypt. It calls the original, then,
+// once, copies the decrypted Hermes bytecode of NPXS40003 (matched by its exact geometry) into the
+// pre-mapped buffer. It writes no system memory; run_bundle_dump() does the file write off this thread.
+int rnps_decrypt_hook(void* buf,unsigned size,void* o1,void* o2,void* ctx,void* a5){
+    RnpsDecryptCall orig=rnps_original.load(std::memory_order_acquire);
+    int rc=orig?orig(buf,size,o1,o2,ctx,a5):-1;
+    bundle_decrypt_calls.fetch_add(1,std::memory_order_relaxed);
+    if(rc==0&&buf&&bundle_capture&&!bundle_captured.load(std::memory_order_acquire)){
+        const unsigned char* b=static_cast<const unsigned char*>(buf);
+        if(std::memcmp(b,"RNPSHEDR",8)==0){
+            std::uint32_t off=0,len=0;
+            std::memcpy(&off,b+0x1c,4);std::memcpy(&len,b+0x20,4);
+            if(off==kNpxsBytecodeOff&&len==kNpxsBytecodeLen&&len<=kBundleCaptureCap&&
+               std::uint64_t(off)+len<=std::uint64_t(size)){
+                std::memcpy(bundle_capture,b+off,len);
+                bundle_capture_len.store(len,std::memory_order_release);
+                bundle_captured.store(true,std::memory_order_release);
+            }
+        }
+    }
+    return rc;
+}
+State run_bundle_dump(){
+    publish(State::Observing);
+    note("BUNDLEDUMP start pid=%d",int(getpid()));
+    void* target=reinterpret_cast<void*>(request.functions[RnpsVerifyDecrypt]);
+    if(!address(reinterpret_cast<std::uintptr_t>(target))){
+        note("BUNDLEDUMP refused: sceRnpsBundleVerifyAndDecrypt not resolved");publish(State::Failed);return State::Failed;}
+    auto query=fn<ProtectionQuery>(QueryProtection);
+    auto do_mmap=fn<MmapCall>(TargetMmap);
+    if(!do_mmap){note("BUNDLEDUMP refused: mmap unavailable");publish(State::Failed);return State::Failed;}
+    bundle_capture=static_cast<unsigned char*>(do_mmap(nullptr,kBundleCaptureCap,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0));
+    if(!bundle_capture||bundle_capture==reinterpret_cast<void*>(-1)){
+        note("BUNDLEDUMP refused: capture mmap failed");bundle_capture=nullptr;publish(State::Failed);return State::Failed;}
+    note("BUNDLEDUMP target=%p capture=%p",target,static_cast<void*>(bundle_capture));
+    if(!prepare_hook(rnps_hook_store,target,reinterpret_cast<void*>(&rnps_decrypt_hook),query,
+                     fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap),hook_step)){
+        note("PROLOGUE bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x",
+            rnps_hook_store.before[0],rnps_hook_store.before[1],rnps_hook_store.before[2],rnps_hook_store.before[3],
+            rnps_hook_store.before[4],rnps_hook_store.before[5],rnps_hook_store.before[6],rnps_hook_store.before[7],
+            rnps_hook_store.before[8],rnps_hook_store.before[9],rnps_hook_store.before[10],rnps_hook_store.before[11],
+            rnps_hook_store.before[12],rnps_hook_store.before[13],rnps_hook_store.before[14],rnps_hook_store.before[15]);
+        note("BUNDLEDUMP refused: prepare_hook failed");publish(State::Failed);return State::Failed;}
+    rnps_original.store(reinterpret_cast<RnpsDecryptCall>(rnps_hook_store.trampoline),std::memory_order_release);
+    if(!install_hook(rnps_hook_store,query)){note("BUNDLEDUMP refused: install_hook failed");publish(State::Failed);return State::Failed;}
+    note("BUNDLEDUMP hook installed; open the Control Center to trigger the decrypt");
+    const std::uint64_t deadline=request.deadline_ms>6000?request.deadline_ms-6000:now_ms()+20000;
+    bool wrote=false;
+    while(now_ms()<deadline){
+        std::uint64_t stop=0;
+        if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+        if(bundle_captured.load(std::memory_order_acquire)){
+            const std::uint32_t len=bundle_capture_len.load(std::memory_order_acquire);
+            static const unsigned char hbc_magic[8]={0xC6,0x1F,0xBC,0x03,0xC1,0x03,0x19,0x1F};
+            const bool magic_ok=len>=8&&std::memcmp(bundle_capture,hbc_magic,8)==0;
+            char p[256];
+            if(path(p,sizeof p,worker_dir,"npxs40003.hbc")){
+                FILE* f=std::fopen(p,"wb");
+                if(f){const std::size_t w=std::fwrite(bundle_capture,1,len,f);bool ok=(w==len);if(std::fclose(f))ok=false;
+                    note("BUNDLEDUMP wrote %s len=%u hbc_magic=%d ok=%d",p,unsigned(len),magic_ok?1:0,ok?1:0);wrote=ok;}
+                else note("BUNDLEDUMP fopen failed %s errno=%d",p,errno);}
+            break;}
+        publish(State::Observing);usleep(300000);}
+    if(!wrote&&!bundle_captured.load(std::memory_order_acquire))
+        note("BUNDLEDUMP no capture: the Control Center bundle was not decrypted in this window (decrypt calls=%u)",bundle_decrypt_calls.load());
+    bool removed=true;
+    if(rnps_hook_store.installed)removed&=remove_hook(rnps_hook_store,query);
+    note("BUNDLEDUMP done calls=%u captured=%d wrote=%d removed=%d",
+        bundle_decrypt_calls.load(),bundle_captured.load()?1:0,wrote?1:0,removed?1:0);
+    State result=wrote?State::Passed:(removed?State::Failed:State::RemoveFailed);
+    publish(result);return result;
+}
 State run(){
     if(request.mode==Mode::AudioTest)return run_audio_test();
     if(request.mode==Mode::AudioRelay)return run_audio_relay();
     if(request.mode==Mode::PartyProbe)return run_party_probe();
     if(request.mode==Mode::SceneProbe)return run_scene_probe();
     if(request.mode==Mode::TileDiscord)return run_tile_discord();
+    if(request.mode==Mode::BundleDump)return run_bundle_dump();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
@@ -2217,7 +2304,7 @@ extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
     // The party probe (a lab tool) has its own lock: the audio worker holds worker.lock for hours, and a second
     // worker that does not get its lock returns without a word.
     Request peek;
-    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe||peek.mode==Mode::TileDiscord);
+    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe||peek.mode==Mode::TileDiscord||peek.mode==Mode::BundleDump);
     char p[256];if(!path(p,sizeof p,worker_dir,probe?"probe.lock":"worker.lock"))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
     if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}

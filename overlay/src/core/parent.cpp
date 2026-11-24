@@ -22,8 +22,8 @@
 #ifndef OVERLAY_MODE
 #define OVERLAY_MODE 0
 #endif
-#if OVERLAY_MODE<0||OVERLAY_MODE>10
-#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest, 7 audiorelay, 8 partyprobe, 9 sceneprobe, 10 tilediscord"
+#if OVERLAY_MODE<0||OVERLAY_MODE>11
+#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest, 7 audiorelay, 8 partyprobe, 9 sceneprobe, 10 tilediscord, 11 bundledump"
 #endif
 extern "C" {extern const unsigned char overlay_worker_blob[];extern const unsigned int overlay_worker_blob_size;
 volatile sig_atomic_t overlay_abort_requested=0;
@@ -31,7 +31,7 @@ int sceKernelGetAppInfo(pid_t,void*);}
 using namespace overlay;
 // elfldr deploys every payload as payload.elf, so each mode keeps its own USB
 // xlog to keep runs attributable (workspace payload discipline).
-static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest","audiorelay","partyprobe","sceneprobe","tilediscord"};
+static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest","audiorelay","partyprobe","sceneprobe","tilediscord","bundledump"};
 static FILE* logfile=nullptr,*usblog=nullptr;
 static void note(const char* fmt,...){
     char line[512];va_list ap;va_start(ap,fmt);std::vsnprintf(line,sizeof line,fmt,ap);va_end(ap);
@@ -83,7 +83,7 @@ static int run(){
     // prepare_update_hook call at all): unlike every other mode, retrying
     // one on the same ShellUI instance carries none of the risk this
     // one-attempt marker exists to bound, so they are exempt from it.
-    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay&&r.mode!=Mode::PartyProbe&&r.mode!=Mode::SceneProbe&&r.mode!=Mode::TileDiscord;
+    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay&&r.mode!=Mode::PartyProbe&&r.mode!=Mode::SceneProbe&&r.mode!=Mode::TileDiscord&&r.mode!=Mode::BundleDump;
     Attempt prior;
     if(one_shot_only&&read_file(parent_dir,"attempt.bin",prior)&&prior.signature==magic&&prior.pid==r.pid&&prior.epoch==r.epoch){
         note("REFUSED: one attempt already recorded for this ShellUI instance; inspect evidence, do not delete marker to retry");return 1;}
@@ -107,6 +107,15 @@ static int run(){
     for(unsigned i=0;i<FunctionCount;i++){
         std::uint64_t address_value=0;
         if(optional(i)){
+            if(i==RnpsVerifyDecrypt){
+                // Lab (Mode::BundleDump): the RNPS bundle loader's verify+decrypt export, known only by NID.
+                std::uint32_t rnps=0;
+                if(kernel_dynlib_handle(r.pid,"libSceRnpsBundle.sprx",&rnps)||!rnps)(void)kernel_dynlib_handle(r.pid,"libSceRnpsBundle.prx",&rnps);
+                if(rnps)address_value=kernel_dynlib_resolve(r.pid,rnps,symbols[i]);
+                if(!address(address_value)){note("optional rnps %s missing",symbols[i]);address_value=0;}
+                else note("resolved rnps %s in module %u",symbols[i],unsigned(rnps));
+                r.functions[i]=address_value;continue;
+            }
             // The mic and user-service lab functions live in their own modules, not in SystemService.
             if(i==IpmiConfigInit||i==IpmiClientCreate){
                 // PartyProbe lab: libSceIpmi is already loaded in ShellUI; these exports are only known by NID.
@@ -169,7 +178,7 @@ static int run(){
     r.token=(now_ms()<<17)^std::uint64_t(getpid());
     // AudioRelay keeps running for as long as the app's relay connection
     // stays up (minutes); everything else is a short, bounded one-shot.
-    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:(r.mode==Mode::PartyProbe||r.mode==Mode::SceneProbe||r.mode==Mode::TileDiscord)?600000:75000);
+    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:(r.mode==Mode::PartyProbe||r.mode==Mode::SceneProbe||r.mode==Mode::TileDiscord||r.mode==Mode::BundleDump)?600000:75000);
     if(r.mode==Mode::PartyProbe){
         // Read-only census (lab): which party/voice libraries ShellUI already has loaded. Logged, never fatal.
         static const char* const party_modules[]={"libSceProprietaryVoiceChatHelper.native.sprx","libSceVoiceChat.sprx",
@@ -193,6 +202,7 @@ static int run(){
     if(r.mode==Mode::PartyProbe){note("LOADER: party probe injected, loader exits (see worker.log)");return 0;}
     if(r.mode==Mode::SceneProbe){note("LOADER: scene probe injected, loader exits (see worker.log)");return 0;}
     if(r.mode==Mode::TileDiscord){note("LOADER: tile-discord injected, loader exits (see worker.log)");return 0;}
+    if(r.mode==Mode::BundleDump){note("LOADER: bundle dump injected, loader exits (see worker.log)");return 0;}
     int previous=999;
 #if OVERLAY_MODE==5
     // Service: no fixed end. A heartbeat every second keeps the worker; on SIGTERM (or a

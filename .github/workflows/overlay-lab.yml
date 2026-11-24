@@ -1,0 +1,46 @@
+# Lab-only overlay build (fast): builds just the in-game overlay's ELFs for every mode, including
+# the standalone lab tools (partyprobe, sceneprobe, tilediscord, bundledump), and uploads them.
+# No libdave, no FFmpeg, no core, no app package, so it does not rebuild the slow libraries and
+# finishes in a few minutes. Manual only (Actions > overlay-lab > Run workflow), never on a push.
+name: overlay-lab
+
+on:
+  push:
+    branches: [lab/**]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  overlay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm cmake ninja-build perl unzip curl wget python3 git xz-utils ca-certificates
+          for t in ar ranlib; do
+            command -v llvm-$t >/dev/null || sudo ln -s "$(ls /usr/bin/llvm-$t-* | sort -V | tail -1)" /usr/local/bin/llvm-$t
+          done
+      - name: make deps (pinned SDK and sources)
+        run: make deps
+      - name: Build the overlay (every mode, including bundledump)
+        run: make overlay
+      - name: Check the lab ELF was built
+        run: |
+          test -s overlay/build/overlay-bundledump.elf || { echo "::error::overlay-bundledump.elf was not built"; exit 1; }
+          ls -l overlay/build/overlay-*.elf
+      - name: Upload the overlay lab ELFs
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlay-lab-run${{ github.run_number }}
+          path: |
+            overlay/build/overlay-bundledump.elf
+            overlay/build/overlay-partyprobe.elf
+            overlay/build/overlay-sceneprobe.elf
+            overlay/build/overlay-tilediscord.elf
+          if-no-files-found: warn
+          retention-days: 14
