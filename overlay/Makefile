@@ -16,7 +16,7 @@ LAB_FLAGS := $(filter-out -DOVERLAY_BUILD=%,$(FLAGS)) -DOVERLAY_BUILD=0x$(LAB_BU
 VENDOR := vendor/shellui-loader
 OBJECTS := build/pt.o build/loader.o build/injector.o build/remote-call.o build/blob.o
 .PHONY: all test inspect clean preview pill-lab lab-preview
-all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf inspect
+all: build/overlay-resolve.elf build/overlay-observe.elf build/overlay-widget.elf build/overlay-input.elf build/overlay-restart.elf build/overlay-service.elf build/overlay-audiotest.elf build/overlay-audiorelay.elf build/overlay-partyprobe.elf inspect
 # The build id is baked into both halves (worker and loader): any change to it rebuilds both,
 # or the loader's request carries an id the embedded worker refuses.
 build/overlay-worker.elf: $(HASH_SOURCES) Makefile
@@ -69,6 +69,23 @@ build/parent-service.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES
 build/overlay-service.elf: build/parent-service.o $(OBJECTS)
 	$(CXX_PS5) $(FLAGS) $^ -o $@
 	printf '%s' $(BUILD_ID) > build/overlay.build # the core compares it with the running one's
+# Lab only (never packaged by app/tools/build.sh): sceAudioOut from inside
+# SceShellUI, no Mono/hooking at all. Run by hand, sent to elfldr directly.
+build/parent-audiotest.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES) Makefile
+	@mkdir -p build
+	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=6 -c $< -o $@
+build/overlay-audiotest.elf: build/parent-audiotest.o $(OBJECTS)
+	$(CXX_PS5) $(FLAGS) $^ -o $@
+build/parent-audiorelay.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES) Makefile
+	@mkdir -p build
+	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=7 -c $< -o $@
+build/overlay-audiorelay.elf: build/parent-audiorelay.o $(OBJECTS)
+	$(CXX_PS5) $(FLAGS) $^ -o $@
+build/parent-partyprobe.o: src/core/parent.cpp src/core/protocol.hpp $(HASH_SOURCES) Makefile
+	@mkdir -p build
+	$(CXX_PS5) $(FLAGS) -DOVERLAY_MODE=8 -c $< -o $@
+build/overlay-partyprobe.elf: build/parent-partyprobe.o $(OBJECTS)
+	$(CXX_PS5) $(FLAGS) $^ -o $@
 # Standalone lab: explicit opt-in, never linked into the app package or normal blobs.
 pill-lab: build/pill-lab.elf
 	python3 tools/check_elf.py build/pill-lab-worker.elf

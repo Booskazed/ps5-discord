@@ -31,6 +31,13 @@
 #include "platform/ps5/system.hpp"
 #include "ui/fonts.hpp"
 
+#ifdef HUI_AUDIO_PROBE
+namespace hui::ps5
+{
+void probe_audio_out_debug();
+}
+#endif
+
 #include <cstring>
 #include <GL/glcorearb.h>
 
@@ -361,6 +368,9 @@ int main()
     mixer.attach_voice(&voice_audio.playback());
     ps5::AudioOut audio_out;
     audio_out.start(mixer);
+#ifdef HUI_AUDIO_PROBE
+    ps5::probe_audio_out_debug();
+#endif
     audio::SoundBank sounds;
     const auto bank = sounds.load(std::string(kAssets) + "/audio/sfx");
     sys::log("[HUI] sounds files=%d rejected=%d", bank.files, bank.rejected);

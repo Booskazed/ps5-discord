@@ -1,6 +1,7 @@
 // spot5 - Audio sink selection; experimental ABI recovered from PPSA05688.
 // SPDX-License-Identifier: AGPL-3.0-or-later
 #include "audio/output.hpp"
+#include "platform/ps5/sce_module.hpp"
 #include "platform/ps5/system.hpp"
 
 extern "C"
@@ -16,6 +17,21 @@ extern "C"
     int sceKernelGetModuleList2(int *, std::size_t, std::size_t *);
     int sceKernelDlsym(int, const char *, void **);
 }
+
+namespace
+{
+// This process's own dlsym finds nothing for these modules (0x80020003 on
+// every handle, including a known public export used as a sanity check);
+// the core resolves it through the kernel instead (same fallback voice_audio
+// and the mic probe use for libSceAudioIn).
+void *resolve_export(int handle, const char *sym)
+{
+    void *p = nullptr;
+    if (sceKernelDlsym(handle, sym, &p) == 0 && p)
+        return p;
+    return reinterpret_cast<void *>(hui::ps5::core_dlsym_handle(handle, sym));
+}
+} // namespace
 
 const char *AudioOutput::name(AudioBackend backend)
 {
@@ -105,22 +121,17 @@ bool AudioOutput::open_custom()
     bool public_lookup_found = false;
     for (std::size_t i = 0; i < count; ++i)
     {
-        void *initialize = nullptr, *output = nullptr, *finalize = nullptr;
-        const int init_rc = sceKernelDlsym(handles[i], "sceCustomMusicAudioOutInitialize", &initialize);
-        const int output_rc = sceKernelDlsym(handles[i], "sceCustomMusicAudioOutOutput", &output);
-        const int finalize_rc = sceKernelDlsym(handles[i], "sceCustomMusicAudioOutFinalize", &finalize);
+        void *initialize = resolve_export(handles[i], "sceCustomMusicAudioOutInitialize");
+        void *output = resolve_export(handles[i], "sceCustomMusicAudioOutOutput");
+        void *finalize = resolve_export(handles[i], "sceCustomMusicAudioOutFinalize");
         // A known public export distinguishes an unusable module list/lookup
         // path from custom exports that are unavailable in this context.
-        void *public_export = nullptr;
-        const int public_rc = sceKernelDlsym(handles[i], "sceKernelUsleep", &public_export);
-        public_lookup_found |= public_rc == 0 && public_export != nullptr;
-        hui::sys::log("[AUDIO] lookup index=%zu handle=0x%x init=0x%08x/%d output=0x%08x/%d finalize=0x%08x/%d public=0x%08x/%d",
-                      i, static_cast<unsigned>(handles[i]),
-                      static_cast<unsigned>(init_rc), initialize != nullptr,
-                      static_cast<unsigned>(output_rc), output != nullptr,
-                      static_cast<unsigned>(finalize_rc), finalize != nullptr,
-                      static_cast<unsigned>(public_rc), public_export != nullptr);
-        if (init_rc != 0 || !initialize || output_rc != 0 || !output || finalize_rc != 0 || !finalize)
+        void *public_export = resolve_export(handles[i], "sceKernelUsleep");
+        public_lookup_found |= public_export != nullptr;
+        hui::sys::log("[AUDIO] lookup index=%zu handle=0x%x init=%d output=%d finalize=%d public=%d",
+                      i, static_cast<unsigned>(handles[i]), initialize != nullptr, output != nullptr,
+                      finalize != nullptr, public_export != nullptr);
+        if (!initialize || !output || !finalize)
             continue;
         custom_initialize_ = reinterpret_cast<int (*)(int, int, int)>(initialize);
         custom_output_ = reinterpret_cast<int (*)(const void *)>(output);

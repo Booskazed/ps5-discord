@@ -8,7 +8,7 @@
 #include <unistd.h>
 namespace overlay {
 constexpr std::uint64_t magic=0x31434f504c564f44ULL;
-constexpr unsigned version=11;
+constexpr unsigned version=12;
 constexpr const char* parent_dir="/data/discord-overlay-poc";
 constexpr const char* worker_dir="/user/data/discord-overlay-poc";
 enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,AssemblyImage,ClassFromName,
@@ -19,10 +19,21 @@ enum Function:unsigned {RootDomain,ThreadAttach,ThreadDetach,AssemblyOpen,Assemb
     // Reflection, log-only (worker describe_types): what a property's value type is on this firmware.
     SignatureParams,TypeName,ClassFromType,ClassFields,FieldName,FieldType,FieldOffset,ClassProperties,PropertyName,
     ClassMethods,MethodName, // picking an overload by its parameter types
+    // Mode::AudioTest only (lab, libSceAudioOut): does a sound played from
+    // inside SceShellUI itself survive the console's audio/video ownership
+    // switch while a game has focus, unlike the app's own AudioOut?
+    AudioOutInit,AudioOutOpen,AudioOutOutput,AudioOutClose,
     // Optional (0 when ShellUI lacks them; libSceSystemService): the system menu's own way of
     // holding a game while it is over it: the game's app id, the "system UI is over you"
     // status (games that can pause, pause), and controller focus (Request::shell_app).
     RunningBigApp,SetImposeStatus,SetControllerFocus,
+    // Optional lab (0 when ShellUI has not loaded the module): the microphone from inside ShellUI
+    // (libSceAudioIn) and the foreground user id (libSceUserService), to measure whether a
+    // ShellUI-hosted mic survives a game taking AV focus after the console killed the app.
+    AudioInOpen,AudioInInput,AudioInClose,UserGetForegroundUser,
+    // Optional, log-only (libmonosgen): static fields and enum values, ShellUI's focus state
+    // (worker describe_focus_types, log_focus_state). 0 when missing: only those logs go.
+    ClassVtable,FieldStaticGetValue,
     FunctionCount};
 constexpr bool optional(unsigned i){return i>=RunningBigApp;}
 inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mono_thread_attach","mono_thread_detach",
@@ -35,11 +46,19 @@ inline constexpr const char* symbols[FunctionCount]={"mono_get_root_domain","mon
     "mono_signature_get_params","mono_type_get_name","mono_class_from_mono_type","mono_class_get_fields",
     "mono_field_get_name","mono_field_get_type","mono_field_get_offset","mono_class_get_properties","mono_property_get_name",
     "mono_class_get_methods","mono_method_get_name",
-    "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus"};
+    "sceAudioOutInit","sceAudioOutOpen","sceAudioOutOutput","sceAudioOutClose",
+    "sceSystemServiceGetAppIdOfRunningBigApp","sceShellCoreUtilSetImposeStatusFlag","sceLncUtilSetControllerFocus",
+    "sceAudioInOpen","sceAudioInInput","sceAudioInClose","sceUserServiceGetForegroundUser",
+    "mono_class_vtable","mono_field_static_get_value"};
 // Service is Widget without the 60 s window: it runs while the loader keeps
 // keepalive.bin fresh (Keepalive), and tears down within seconds when it stops.
-enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5};
-inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service;}
+// AudioTest and AudioRelay are lab modes (see AudioOutInit..AudioOutClose
+// above): no Mono resolution or hooking at all, just sceAudioOut calls from
+// inside ShellUI. AudioRelay plays real voice PCM piped from the app
+// (platform/ps5/audio_relay.hpp) instead of AudioTest's generated tone, for
+// as long as that connection stays up (minutes, not seconds).
+enum class Mode:std::uint32_t {Resolve=0,Observe=1,Widget=2,Input=3,Service=5,AudioTest=6,AudioRelay=7,PartyProbe=8};
+inline bool known(Mode m){return m==Mode::Resolve||m==Mode::Observe||m==Mode::Widget||m==Mode::Input||m==Mode::Service||m==Mode::AudioTest||m==Mode::AudioRelay||m==Mode::PartyProbe;}
 inline bool draws(Mode m){return m==Mode::Widget||m==Mode::Service;}
 // Managed Sce.PlayStation.Core.Input.GamePadData layout (value type, 36 bytes).
 struct PadData {
@@ -80,8 +99,11 @@ inline std::uint64_t now_ms(){timespec t{};if(clock_gettime(CLOCK_MONOTONIC,&t))
     return std::uint64_t(t.tv_sec)*1000+std::uint64_t(t.tv_nsec)/1000000;}
 inline bool address(std::uint64_t p){return p>=0x10000&&p<0x800000000000ULL;}
 inline bool valid(const Request& r,int pid,std::uint64_t build,std::uint64_t epoch,std::uint64_t now){
+    // AudioRelay runs for as long as the app stays connected (minutes), so its
+    // deadline window is wider than every other mode's.
+    const std::uint64_t max_window=r.mode==Mode::AudioRelay?86450000:120000;
     if(r.signature!=magic||r.protocol!=version||r.size!=sizeof r||r.pid!=pid||r.build!=build||r.epoch!=epoch||!r.epoch||!r.token||
-       !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>120000)return false;
+       !known(r.mode)||r.deadline_ms<=now||r.deadline_ms-now>max_window)return false;
     for(unsigned i=0;i<FunctionCount;i++)if(!address(r.functions[i])&&!(optional(i)&&!r.functions[i]))return false;
     return true;
 }

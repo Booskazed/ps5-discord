@@ -77,6 +77,16 @@ adapter, or Remote Play (legacy) Go Live, where the USB DualSense is your headse
 **You cannot hear the call.** Check deafen and Settings, Voice & audio, Call volume. With no
 Bluetooth headset or Remote Play USB takeover, the call plays while the app is on screen.
 
+**Community build: no sound, or nobody hears you, while a game is in front.** The core starts a
+small audio worker inside the console's UI process 15 to 60 seconds after it starts (it needs
+elfldr on port 9021). Check it over FTP in `/data/discord-overlay-poc/`: `audio-alive` is rewritten
+every 2 seconds (its time should be recent) and the end of `worker.log` shows `AUDIODIRECT tap
+connect ok`. To restart the worker, create an empty file `stop-audio` there, wait two seconds,
+delete it, and the core starts a fresh one within a minute. To turn the feature off, delete
+`assets/overlay-audiorelay.elf` from the app folder and create `stop-audio`: the app plays the call
+again. A file `no-mic` there stops the worker from capturing the microphone. If your friend hears you
+in bursts or sped up, send the `voice audio: 5 s engine` lines of the kernel log (port 3232).
+
 **Joining fails at once.** If you built the core yourself: voice needs libdave (`make
 dave`); without it every join fails with close code 4017. Release builds include it.
 

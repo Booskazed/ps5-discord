@@ -14,3 +14,8 @@ jobs:
           key: deps-${{ hashFiles('tools/deps.sh') }}
       - run: make deps
       - run: make test
+      # The overlay's host suites for the hook and the worker (overlay/tests): no SDK needed, and
+      # the root `make test` does not run them. clang++ as overlay/README.md says (-fno-sanitize=function).
+      - name: Overlay hook and worker tests
+        working-directory: overlay
+        run: make CXX=clang++ CC=clang build/safety-test build/worker-test && ./build/safety-test && ./build/worker-test

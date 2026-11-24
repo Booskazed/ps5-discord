@@ -52,6 +52,16 @@ touchpad coordinates are not forwarded; the touchpad click is supported.
   through the USB adapter, or [Go Live](#go-live)
   with **Remote Play (legacy)**: there the USB controller is your headset. The default
   hardware encoder capture does not take over controller audio.
+- **Community build (`PPSA99073`): voice stays up while a game is in front, with a wireless
+  controller.** The console ends the app when a game starts, but the core keeps the call. A
+  small audio worker that the core starts inside the console's own UI process (the process the
+  overlay uses; it keeps its sound under a game) plays the call and captures your microphone, so
+  a headset plugged into a Bluetooth DualSense works with no USB cable. The worker starts by
+  itself 15 to 60 seconds after the core and needs elfldr on port 9021, as the overlay does.
+  From then on the call sound comes from the worker, also while the app is on screen, and the
+  app's own mic is used for as long as the app delivers one. Mic gain, Call volume, Mute and
+  Deafen apply as usual. Tested on firmware 13.60 only; if something goes wrong see
+  [TROUBLESHOOTING.md](TROUBLESHOOTING.md#voice).
 - **What ends a call:** Leave, Settings, Account, **Sign out** or **Quit Discord**, and
   **Restart now** or **Roll back** in Settings, About. Closing the app with the PS button does
   not end it.

@@ -3,11 +3,17 @@
 #include "hook.hpp"
 #include "../app/overlay_ui.hpp"
 #include "../app/overlay_app.cpp"
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cmath>
 #include <cstdarg>
 #include <fcntl.h>
 #include <sys/file.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
 using namespace overlay;
 #ifndef OVERLAY_BUILD
 #define OVERLAY_BUILD 0ULL
@@ -16,6 +22,14 @@ namespace {
 using Object=void;using Method=void;using Update=void(*)(Object*);
 using PadCall=PadData(*)(int);
 using ShareCall=void(*)(void*);
+using AudioOutInitCall=int(*)();
+using AudioOutOpenCall=int(*)(int,int,int,unsigned int,unsigned int,unsigned int);
+using AudioOutOutputCall=int(*)(int,const void*);
+using AudioOutCloseCall=int(*)(int);
+using AudioInOpenCall=int(*)(int,int,int,unsigned int,unsigned int,unsigned int);
+using AudioInInputCall=int(*)(int,void*);
+using AudioInCloseCall=int(*)(int);
+using UserForegroundCall=int(*)(int*);
 constexpr int kind_void=1,kind_class=0x12,kind_valuetype=0x11;
 constexpr std::uint32_t bit_l3=0x4000,bit_r3=0x8000;
 // Hold Options: the game takes the press first (most open their pause menu), then the
@@ -279,6 +293,233 @@ void describe_properties(void* klass,const char* cls){
         if(n&&at>0&&at<int(sizeof line)-40)at+=std::snprintf(line+at,sizeof line-at," %s",n);}
     note("%s",line);
 }
+// Log-only reflection, once per Service start: how ShellUI itself moves controller focus on this
+// firmware. On 13.60 sceLncUtilSetControllerFocus answers 0 and yet the game, the home menu or the
+// app behind the open panel still get the buttons; ShellUI's ProcessFocusController / LayerManager
+// keep their own focus state. Each method with static-ness, parameter and return types; fields and
+// properties. Nothing is called. words: only names containing one of them (nullptr: all).
+bool name_has(const char* n,const char* const* words){
+    if(!words)return true;
+    for(auto w=words;*w;w++)if(std::strstr(n,*w))return true;
+    return false;
+}
+const char* type_name_of(void* type){
+    const char* t=type?fn<const char*(*)(void*)>(TypeName)(type):nullptr;return t?t:"?";}
+void describe_methods(void* klass,const char* cls,const char* const* words){
+    void* iter=nullptr;int shown=0;
+    for(int i=0;klass&&i<800&&shown<80;i++){
+        Method* m=fn<Method*(*)(void*,void**)>(ClassMethods)(klass,&iter);if(!m)break;
+        const char* n=fn<const char*(*)(void*)>(MethodName)(m);if(!n||!name_has(n,words))continue;
+        void* sig=fn<void*(*)(void*)>(MethodSignature)(m);if(!sig)continue;
+        char line[700];
+        int at=std::snprintf(line,sizeof line,"METHOD %s.%s%s(",cls,n,fn<int(*)(void*)>(SignatureInstance)(sig)?"":" static");
+        const unsigned count=fn<unsigned(*)(void*)>(SignatureCount)(sig);void* piter=nullptr;
+        for(unsigned k=0;k<count&&k<8&&at>0&&at<int(sizeof line)-120;k++)
+            at+=std::snprintf(line+at,sizeof line-at,"%s%s",k?", ":"",type_name_of(fn<void*(*)(void*,void**)>(SignatureParams)(sig,&piter)));
+        if(at>0&&at<int(sizeof line)-100)std::snprintf(line+at,sizeof line-at,") -> %s",type_name_of(fn<void*(*)(void*)>(SignatureReturn)(sig)));
+        note("%s",line);shown++;}
+}
+void describe_fields(void* klass,const char* cls,const char* const* words){
+    void* iter=nullptr;
+    for(int i=0;klass&&i<200;i++){
+        void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)break;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||!name_has(n,words))continue;
+        note("FIELD %s.%s : %s",cls,n,type_name_of(fn<void*(*)(void*)>(FieldType)(f)));}
+}
+// The type of a method's parameter (index) or, with index -1, of its return value.
+void* signature_type(Method* m,int index){
+    void* sig=m?fn<void*(*)(void*)>(MethodSignature)(m):nullptr;if(!sig)return nullptr;
+    if(index<0)return fn<void*(*)(void*)>(SignatureReturn)(sig);
+    void* iter=nullptr;void* type=nullptr;
+    for(int k=0;k<=index;k++){type=fn<void*(*)(void*,void**)>(SignatureParams)(sig,&iter);if(!type)return nullptr;}
+    return type;
+}
+// ClassVtable and FieldStaticGetValue are optional in the request (0 when ShellUI's Mono lacks them).
+bool can_read_statics(){return request.functions[ClassVtable]&&request.functions[FieldStaticGetValue];}
+// An enum's names and values (its literal fields, read with mono_field_static_get_value), or a
+// struct's or class's instance fields. Reads only.
+void describe_type_values(void* type,const char* label){
+    const int kind=type?fn<int(*)(void*)>(TypeKind)(type):-1;
+    void* k=type?fn<void*(*)(void*)>(ClassFromType)(type):nullptr;
+    note("TYPEDESC %s = %s kind=%d",label,type_name_of(type),kind);
+    if(!k)return;
+    bool is_enum=false;void* iter=nullptr;
+    for(int i=0;i<200;i++){void* f=fn<void*(*)(void*,void**)>(ClassFields)(k,&iter);if(!f)break;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(n&&!std::strcmp(n,"value__"))is_enum=true;}
+    void* vt=is_enum&&can_read_statics()?fn<void*(*)(void*,void*)>(ClassVtable)(domain,k):nullptr;
+    iter=nullptr;
+    for(int i=0;i<200;i++){
+        void* f=fn<void*(*)(void*,void**)>(ClassFields)(k,&iter);if(!f)break;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||!std::strcmp(n,"value__"))continue;
+        if(is_enum&&vt){std::int64_t v=0;fn<void(*)(void*,void*,void*)>(FieldStaticGetValue)(vt,f,&v);
+            note("TYPEDESC   %s.%s = %lld",label,n,(long long)v);}
+        else note("TYPEDESC   %s.%s : %s @%u",label,n,type_name_of(fn<void*(*)(void*)>(FieldType)(f)),
+                  fn<unsigned(*)(void*)>(FieldOffset)(f));}
+}
+// ShellUI's focus state, from LayerManager's and ShellAppManager's static fields (memory reads,
+// nothing invoked): logged at Service start, at HOLD and RELEASE, and by the focus test.
+void* class_layer_manager=nullptr;
+void* class_shell_app_manager=nullptr;
+// A static field's value into out (an int or enum: 4 bytes; an object reference: a pointer).
+bool static_read(void* klass,const char* name,void* out){
+    if(!klass||!out||!can_read_statics())return false;void* iter=nullptr;
+    for(int i=0;i<300;i++){
+        void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)return false;
+        const char* n=fn<const char*(*)(void*)>(FieldName)(f);if(!n||std::strcmp(n,name))continue;
+        void* vt=fn<void*(*)(void*,void*)>(ClassVtable)(domain,klass);if(!vt)return false;
+        fn<void(*)(void*,void*,void*)>(FieldStaticGetValue)(vt,f,out);return true;}
+    return false;
+}
+bool static_int(void* klass,const char* name,int* out){
+    int v=0;if(!static_read(klass,name,&v))return false;*out=v;return true;}
+// Taking the controller the way ShellUI does (13.60), as sceLncUtilSetControllerFocus alone answers
+// 0 and yet the game, the app or the home menu behind the open panel still get the buttons:
+// - other processes (a game, the Discord app): ShellUI's own ProcessFocusController
+//   (LayerManager.s_processFocusController).SetControllerFocus(ShellUI), which also keeps its HID
+//   focus; given back with LayerManager.ForceUpdateControllerFocus(), ShellUI's own choice again;
+// - ShellUI's own scenes (home menu, Control Center): PUI Application.SuspendInputEvents() and
+//   ResumeInputEvents(); the panel reads GamePad.GetData through the pad hook, not PUI's events.
+// focus-mode.bin (8 bytes) picks them without a rebuild: bit 0 the controller focus, bit 1 the
+// input events; no file: both.
+Method* method_pfc_set_controller=nullptr;
+Method* method_lm_force_controller=nullptr;
+Method* method_app_suspend_input=nullptr;
+Method* method_app_resume_input=nullptr;
+Method* method_app_focus_scene=nullptr;
+Method* method_scene_input_locked=nullptr;
+bool managed_focus_held=false,input_suspended=false;
+std::uint64_t focus_mode(){std::uint64_t m=3;(void)read_file(worker_dir,"focus-mode.bin",m);return m;}
+void* application_object(){return app_handle?fn<void*(*)(std::uint32_t)>(GcTarget)(app_handle):nullptr;}
+bool invoke_logged(const char* what,Method* m,void* instance,void** args){
+    if(!m)return false;
+    void* exception=nullptr;bool ok=false;invoke_ex(m,instance,args,ok,&exception);
+    if(!ok)describe_exception(what,exception);
+    return ok;
+}
+void take_focus_managed(){
+    const std::uint64_t mode=focus_mode();
+    void* pfc=nullptr;
+    if((mode&1)&&request.shell_app>0&&static_read(class_layer_manager,"s_processFocusController",&pfc)&&pfc){
+        int id=request.shell_app;void* args[1]={&id};
+        managed_focus_held=invoke_logged("ProcessFocusController.SetControllerFocus",method_pfc_set_controller,pfc,args);}
+    void* app=application_object();
+    if((mode&2)&&app&&!input_suspended)
+        input_suspended=invoke_logged("Application.SuspendInputEvents",method_app_suspend_input,app,nullptr);
+    note("HOLD managed mode=%llu pfc=%p controller=%d input_suspended=%d",(unsigned long long)mode,pfc,
+        int(managed_focus_held),int(input_suspended));
+}
+void give_focus_managed(){
+    if(input_suspended){
+        void* app=application_object();
+        if(app&&invoke_logged("Application.ResumeInputEvents",method_app_resume_input,app,nullptr))input_suspended=false;}
+    if(managed_focus_held){
+        invoke_logged("LayerManager.ForceUpdateControllerFocus",method_lm_force_controller,nullptr,nullptr);
+        managed_focus_held=false;}
+    note("RELEASE managed input_suspended=%d",int(input_suspended));
+}
+// ui: on ShellUI's UI thread, where the focused scene's InputLocked can be asked too.
+void log_focus_state(const char* when,bool ui=true){
+    if(!class_layer_manager)return;
+    int locked=-1;
+    if(ui){
+        void* app=application_object();void* exception=nullptr;bool ok=false;void* scene=nullptr;
+        if(app&&method_app_focus_scene){scene=invoke_ex(method_app_focus_scene,app,nullptr,ok,&exception);if(!ok)scene=nullptr;}
+        if(scene&&method_scene_input_locked){exception=nullptr;
+            void* r=invoke_ex(method_scene_input_locked,scene,nullptr,ok,&exception);
+            if(ok&&r)locked=*static_cast<bool*>(fn<void*(*)(void*)>(ObjectUnbox)(r))?1:0;}}
+    int app=-1,controller=-1,layer=-1,last_layer=-1,shell_layer=-1,shell_layer_app=-1;
+    static_int(class_layer_manager,"s_lastFocusedApplicationId",&app);
+    static_int(class_layer_manager,"s_lastControllerFocusedApplicationId",&controller);
+    static_int(class_layer_manager,"s_curFocusLayer",&layer);
+    static_int(class_layer_manager,"s_lastFocusLayer",&last_layer);
+    static_int(class_shell_app_manager,"s_focusLayer",&shell_layer);
+    static_int(class_shell_app_manager,"s_focusLayerAppId",&shell_layer_app);
+    note("FOCUSSTATE %s app=%x controller=%x layer=%d last_layer=%d shell_layer=%d shell_layer_app=%x pad=%llu locked=%d",
+        when,app,controller,layer,last_layer,shell_layer,shell_layer_app,(unsigned long long)pad_polls.load(),locked);
+    // PUI's own input-suspension state (Application's and its base classes' fields named *nput* or
+    // *uspend*): a counter back at its value after ResumeInputEvents shows the home menu has its
+    // buttons again. Plain reads of the Application object (bool/int fields only).
+    void* app_object=ui?application_object():nullptr;
+    if(!app_object)return;
+    char line[600];int at=std::snprintf(line,sizeof line,"APPINPUT %s",when);
+    void* klass=fn<void*(*)(void*)>(ObjectClass)(app_object);
+    for(int depth=0;klass&&depth<6;depth++,klass=fn<void*(*)(void*)>(ClassParent)(klass)){
+        void* iter=nullptr;
+        for(int i=0;i<200&&at>0&&at<int(sizeof line)-80;i++){
+            void* f=fn<void*(*)(void*,void**)>(ClassFields)(klass,&iter);if(!f)break;
+            const char* n=fn<const char*(*)(void*)>(FieldName)(f);
+            if(!n||(!std::strstr(n,"nput")&&!std::strstr(n,"uspend")))continue;
+            void* t=fn<void*(*)(void*)>(FieldType)(f);const int k=t?fn<int(*)(void*)>(TypeKind)(t):-1;
+            const unsigned off=fn<unsigned(*)(void*)>(FieldOffset)(f);
+            if((k==2||k==8||k==9)&&off>=16&&off<0x400){
+                int v=0;std::memcpy(&v,static_cast<char*>(app_object)+off,k==2?1:4);
+                at+=std::snprintf(line+at,sizeof line-at," %s=%d",n,v);}
+            else if((k==0x12||k==0x1c)&&off>=16&&off<0x400){ // a reference (a delegate): null or not
+                void* v=nullptr;std::memcpy(&v,static_cast<char*>(app_object)+off,sizeof v);
+                at+=std::snprintf(line+at,sizeof line-at," %s=%p",n,v);}
+            else at+=std::snprintf(line+at,sizeof line-at," %s(kind %d)",n,k);}}
+    note("%s",line);
+}
+void describe_focus_types(){
+    void* app_img=image("/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll");
+    void* lnc_img=image("/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll");
+    void* pui=image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+    class_layer_manager=app_img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager"):nullptr;
+    class_shell_app_manager=app_img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(app_img,"Sce.Vsh.ShellUI.AppSystem","ShellAppManager"):nullptr;
+    Method* force_app=method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","ForceAppFocus",3);
+    Method* get_layer=method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","GetFocusLayer",0);
+    Method* get_full=method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","GetFullScreenFocusLayer",0);
+    Method* focus_data=method(app_img,"Sce.Vsh.ShellUI.AppSystem","ProcessFocusController","GetAppFocusData",0);
+    note("FOCUSTYPES force=%p layer=%p full=%p data=%p lnc=%p",force_app,get_layer,get_full,focus_data,lnc_img);
+    describe_type_values(signature_type(force_app,1),"LncUtilWrapper.Flag");
+    describe_type_values(signature_type(force_app,2),"LayerManager.AppFocusLogData");
+    describe_type_values(signature_type(get_layer,-1),"LayerManager.FocusLayer");
+    describe_type_values(signature_type(get_full,-1),"LayerManager.LayerScene");
+    describe_type_values(signature_type(focus_data,-1),"ProcessFocusController.AppFocusData");
+    // PUI: how a scene becomes the focused one (LayerManager.OnFocusActiveSceneChanged follows it).
+    static const char* const scene_words[]={"Focus","focus","Active","Modal","Impose","Input","Pad",nullptr};
+    void* scene_base=pui?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(pui,"Sce.PlayStation.PUI","SceneBase"):nullptr;
+    note("CLASS Sce.PlayStation.PUI.SceneBase class=%p",scene_base);
+    describe_methods(class_application,"Application",scene_words);
+    describe_methods(scene_base,"SceneBase",scene_words);
+    describe_methods(class_scene,"Scene",scene_words);
+    describe_properties(class_application,"Application");
+    describe_properties(scene_base,"SceneBase");
+    // The managed focus API (take_focus_managed), each kept only with the signature it was read with.
+    auto checked=[](Method* m,bool instance,unsigned count,int ret)->Method*{return m&&signature(m,instance,count,ret)?m:nullptr;};
+    method_pfc_set_controller=checked(method(app_img,"Sce.Vsh.ShellUI.AppSystem","ProcessFocusController","SetControllerFocus",1),true,1,kind_void);
+    method_lm_force_controller=checked(method(app_img,"Sce.Vsh.ShellUI.AppSystem","LayerManager","ForceUpdateControllerFocus",0),false,0,kind_void);
+    auto from=[](void* klass,const char* name,int count)->Method*{
+        return klass?fn<Method*(*)(void*,const char*,int)>(MethodFromName)(klass,name,count):nullptr;};
+    method_app_suspend_input=checked(from(class_application,"SuspendInputEvents",0),true,0,kind_void);
+    method_app_resume_input=checked(from(class_application,"ResumeInputEvents",0),true,0,kind_void);
+    method_app_focus_scene=checked(from(class_application,"get_FocusActiveScene",0),true,0,kind_class);
+    method_scene_input_locked=from(scene_base,"get_InputLocked",0);
+    note("FOCUSAPI pfc_set=%p force=%p suspend=%p resume=%p focus_scene=%p locked=%p",method_pfc_set_controller,
+        method_lm_force_controller,method_app_suspend_input,method_app_resume_input,method_app_focus_scene,method_scene_input_locked);
+    log_focus_state("start",false);
+}
+void describe_focus(){
+    static const char* const focus_words[]={"Focus","focus","Impose","Block","Controller","HID",nullptr};
+    struct Probe{const char* path;const char* ns;const char* name;const char* const* words;};
+    static const Probe probes[]={
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","ProcessFocusController",nullptr},
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","FocusController",nullptr},
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","LayerManager",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.ShellUI.AppSystem.dll","Sce.Vsh.ShellUI.AppSystem","ShellAppManager",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll","Sce.Vsh.LncUtil","LncUtilWrapper",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll","Sce.Vsh.LncUtilWrapper","LncUtilWrapper",focus_words},
+        {"/system_ex/common_ex/lib/Sce.Vsh.LncUtilWrapper.dll","Sce.Vsh.LncUtil","LncUtil",focus_words}};
+    for(const Probe& p:probes){
+        void* img=image(p.path);
+        void* klass=img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img,p.ns,p.name):nullptr;
+        note("CLASS %s.%s image=%p class=%p",p.ns,p.name,img,klass);
+        if(!klass)continue;
+        describe_methods(klass,p.name,p.words);
+        describe_fields(klass,p.name,p.words);
+        if(!p.words)describe_properties(klass,p.name);}
+    describe_focus_types();
+}
 void describe_types(){
     describe_property(class_panel,"Panel","BackgroundColor");
     describe_property(class_label,"Label","TextColor");
@@ -287,6 +528,7 @@ void describe_types(){
     describe_properties(class_widget,"Widget");
     describe_properties(class_panel,"Panel");
     describe_properties(class_label,"Label");
+    describe_focus();
 }
 void* engine_add_panel(void*,const oui::Rect* r,const oui::Color* c){
     void* root=scene_root_handle?fn<void*(*)(std::uint32_t)>(GcTarget)(scene_root_handle):nullptr;
@@ -378,20 +620,33 @@ void hold_game(){
     int impose=request.functions[SetImposeStatus]?fn<int(*)(int)>(SetImposeStatus)(1):-1;
     int focus=request.shell_app>0?fn<int(*)(int)>(SetControllerFocus)(request.shell_app):-1;
     note("HOLD game=%x shell=%x impose=%x focus=%x",app,unsigned(request.shell_app),impose,focus);
+    take_focus_managed();
+    log_focus_state("hold");
     game_app.store(app);last_input_ms.store(now_ms());holding.store(true);
 }
-void release_game(const char* why){
+// ui: false only from the worker's own thread at teardown (the UI thread usually released first).
+void release_game(const char* why,bool ui=true){
     if(!holding.exchange(false))return;
     int app=game_app.load();
     int focus=app>0?fn<int(*)(int)>(SetControllerFocus)(app):-1;
     int impose=request.functions[SetImposeStatus]?fn<int(*)(int)>(SetImposeStatus)(0):-1;
     note("RELEASE (%s) game=%x focus=%x impose=%x",why,app,focus,impose);
+    give_focus_managed();
+    log_focus_state("release",ui);
 }
+// Closing the panel with a button still held (the press that closed it) would hand that button to
+// the game or menu the moment the controller goes back: the release waits until no button is
+// held (pad hook's last_buttons), at most 1.5 s. update_hook does it, on the UI thread.
+std::atomic<bool> release_pending{false};
+std::atomic<std::uint64_t> release_pending_since{0};
 bool engine_set_capture(void*,bool on){
     if(on)repeat_reset.store(true,std::memory_order_release);
     if(on&&!capture.load(std::memory_order_relaxed))pending_down.store(0,std::memory_order_relaxed);
     capture.store(on,std::memory_order_release);
-    if(on)hold_game();else release_game("closed");
+    if(on){release_pending.store(false);hold_game();}
+    else if(holding.load()&&last_buttons.load(std::memory_order_relaxed)){
+        release_pending_since.store(now_ms());release_pending.store(true);}
+    else release_game("closed");
     return true;}
 bool engine_send(void*,const char* text){
     if(!text)return false;
@@ -594,6 +849,25 @@ int remove_widgets(){
     note("WIDGET scene removed and handles freed");
     return 1;
 }
+// Focus test without a controller: focus-test.bin (8 bytes, a new value for each run, written over
+// FTP). With the panel closed it holds the game as opening the panel does, and logs ShellUI's focus
+// state before, after 1 s held, and 1 s after the release. Checked every 2 s on the UI thread.
+std::uint64_t focus_test_seen=0,focus_test_at=0;bool focus_test_primed=false;int focus_test_phase=0;
+void focus_test_tick(std::uint64_t tick){
+    if(focus_test_phase==0){
+        if(tick%120)return;
+        std::uint64_t v=0;const bool have=read_file(worker_dir,"focus-test.bin",v);
+        if(!focus_test_primed){focus_test_primed=true;focus_test_seen=have?v:0;return;} // an old file never runs
+        if(!have||v==focus_test_seen||capture.load()||holding.load())return;
+        focus_test_seen=v;note("FOCUSTEST %llu begin",(unsigned long long)v);log_focus_state("test-before");
+        hold_game();focus_test_phase=1;focus_test_at=now_ms();return;}
+    const std::uint64_t now=now_ms();
+    if(focus_test_phase==1&&now-focus_test_at>=1000){log_focus_state("test-held");focus_test_phase=2;focus_test_at=now;}
+    else if(focus_test_phase==2&&now-focus_test_at>=1000){
+        if(!capture.load())release_game("focus test"); // the panel opened meanwhile: it keeps the hold
+        focus_test_phase=3;focus_test_at=now;}
+    else if(focus_test_phase==3&&now-focus_test_at>=1000){log_focus_state("test-after");note("FOCUSTEST end");focus_test_phase=0;}
+}
 void update_hook(Object* instance){
     Update prior=original.load(std::memory_order_acquire);if(prior)prior(instance);
     if(!enabled.load(std::memory_order_acquire))return;
@@ -608,6 +882,9 @@ void update_hook(Object* instance){
     // Stop is checked first so no new widgets appear after a stop request, even
     // when creation never succeeded.
     if(teardown.load(std::memory_order_acquire)){
+        // The controller and PUI's input events go back here, on the UI thread, before the
+        // worker's own thread gets to it (its release_game is then a no-op).
+        if(holding.load()){capture.store(false);release_pending.store(false);release_game("teardown");}
         int state=widget_removed.load(std::memory_order_relaxed);
         // 0: poll every callback (queued removal may take frames). -1 with live
         // scene handles: one bounded retry. 1: done.
@@ -618,11 +895,15 @@ void update_hook(Object* instance){
             cleanup_retry_used=true;
             widget_removed.store(remove_widgets(),std::memory_order_release);}
         return;}
+    if(release_pending.load(std::memory_order_acquire)&&
+       (!last_buttons.load(std::memory_order_relaxed)||now_ms()-release_pending_since.load(std::memory_order_relaxed)>1500)){
+        release_pending.store(false);if(!capture.load())release_game("closed");}
     if(widgets_created.load(std::memory_order_acquire)<=0){
         if(tick>=create_delay_ticks&&create_attempts.load(std::memory_order_relaxed)<create_attempt_limit){
             if(try_create()&&widgets_created.load()>0)refresh_text();}
         return;}
     if((tick%text_period_ticks)==0)refresh_text();
+    focus_test_tick(tick);
     oui::Builder builder=ui_builder();
     oui::app::on_tick(tick,builder);
     if(gesture_requested.exchange(false,std::memory_order_acq_rel)){
@@ -749,19 +1030,31 @@ bool resolve_update_methods(){
     return entry&&now_ms()<request.deadline_ms;
 }
 void hook_step(const char* text){note("HOOKSTEP %s",text);}
+// The 16 bytes a hook found at its target, logged on refusal too: prepare_hook copies them
+// (read permission first on exec-only pages) before it can refuse at the decode step, so a
+// firmware's real prologue lands in worker.log instead of being guessed at. All zero when the
+// refusal came before the copy (alignment or protection). For a jump thunk, also where it leads
+// and that page's protection: a query only, no code is read there.
+void note_hook(const char* what,const Hook& h){
+    const std::uint8_t* b=h.before;
+    note("PROLOGUE %s bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%s",what,
+        b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15],
+        h.thunk?" (jump thunk)":"");
+    if(!h.thunk)return;
+    auto query=fn<ProtectionQuery>(QueryProtection);
+    void* lo=nullptr,*hi=nullptr;int prot=0;
+    int qrc=query?query(h.trampoline,&lo,&hi,&prot):-999;
+    note("HOOKDIAG %s thunk to=%p qrc=%d prot=%d lo=%p hi=%p",what,h.trampoline,qrc,prot,lo,hi);
+}
 bool prepare_update_hook(void* entry){
     auto query=fn<ProtectionQuery>(QueryProtection);
     note("HOOKSTEP prepare begin");
     if(!prepare_hook(update_hook_store,entry,reinterpret_cast<void*>(&update_hook),query,fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap),hook_step)){
+        note_hook("Update",update_hook_store);
         note("REFUSED Update alignment, permissions or relocatable prologue");return false;}
-    auto length=native_patch_length(update_hook_store.before);
-    note("HOOKSTEP prepared len=%zu bytes=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x tramp=%p",
-        (std::size_t)length,
-        update_hook_store.before[0],update_hook_store.before[1],update_hook_store.before[2],update_hook_store.before[3],
-        update_hook_store.before[4],update_hook_store.before[5],update_hook_store.before[6],update_hook_store.before[7],
-        update_hook_store.before[8],update_hook_store.before[9],update_hook_store.before[10],update_hook_store.before[11],
-        update_hook_store.before[12],update_hook_store.before[13],update_hook_store.before[14],update_hook_store.before[15],
-        update_hook_store.trampoline);
+    note_hook("Update",update_hook_store);
+    note("HOOKSTEP prepared %s len=%zu tramp=%p",update_hook_store.thunk?"thunk":"prologue",
+        update_hook_store.thunk?std::size_t(14):native_patch_length(update_hook_store.before),update_hook_store.trampoline);
     original.store(reinterpret_cast<Update>(update_hook_store.trampoline),std::memory_order_release);
     note("HOOKSTEP install begin");
     if(!install_hook(update_hook_store,query)){note("REFUSED hook installation/protection restore");return false;}
@@ -778,7 +1071,9 @@ bool install_pad_hook(){
     auto query=fn<ProtectionQuery>(QueryProtection);
     if(!prepare_hook(pad_hook_store,pad_entry,reinterpret_cast<void*>(&pad_hook),query,
                      fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap))){
+        note_hook("GamePad.GetData",pad_hook_store);
         note("REFUSED pad hook preparation");return false;}
+    note_hook("GamePad.GetData",pad_hook_store);
     pad_original.store(reinterpret_cast<PadCall>(pad_hook_store.trampoline),std::memory_order_release);
     if(!install_hook(pad_hook_store,query)){note("REFUSED pad hook installation");return false;}
     return true;
@@ -818,11 +1113,403 @@ void publish(State state){
     s.double_presses=double_presses.load();s.last_buttons=last_buttons.load();
     (void)write_file(worker_dir,"status.bin",s);
 }
+// Mode::AudioTest only: no Mono, no hooking, nothing shared with the rest
+// of this file. Just sceAudioOut from inside SceShellUI's own process, to
+// see whether it plays on, or is muted the moment a game takes the
+// console's audio/video ownership the way the app's own AudioOut is
+// (measured 2026-11-22: the app's sound stops the instant AvControl hands
+// AudioOut/VideoOut to another pid, and comes back when it regains focus).
+State run_audio_test(){
+    publish(State::Observing);
+    const auto init=fn<AudioOutInitCall>(AudioOutInit);
+    const auto open=fn<AudioOutOpenCall>(AudioOutOpen);
+    const auto output=fn<AudioOutOutputCall>(AudioOutOutput);
+    const auto close=fn<AudioOutCloseCall>(AudioOutClose);
+    const int init_rc=init();
+    note("AUDIOTEST init rc=0x%08x",unsigned(init_rc));
+    if(init_rc!=0&&init_rc!=static_cast<int>(0x8026000e)){publish(State::Failed);return State::Failed;}
+    const int handle=open(0xff,0,0,256,48000,1);
+    note("AUDIOTEST open rc=0x%08x",unsigned(handle));
+    if(handle<0){publish(State::Failed);return State::Failed;}
+    alignas(64) std::int16_t grain[256*2];
+    double phase=0.0;constexpr double freq=880.0,rate=48000.0;
+    int writes=0,errors=0;
+    const std::uint64_t until=now_ms()+60000;
+    while(now_ms()<until){
+        for(int i=0;i<256;i++){
+            const std::int16_t s=std::int16_t(std::sin(phase)*12000.0);
+            grain[i*2]=s;grain[i*2+1]=s;phase+=2.0*3.14159265358979*freq/rate;
+        }
+        const int rc=output(handle,grain);++writes;
+        if(rc<0){++errors;if(errors<=5||errors%100==0)note("AUDIOTEST write #%d rc=0x%08x",writes,unsigned(rc));}
+        if(writes%200==0){note("AUDIOTEST writes=%d errors=%d",writes,errors);publish(State::Observing);}
+        std::uint64_t stop=0;if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+    }
+    output(handle,nullptr);close(handle);
+    note("AUDIOTEST done writes=%d errors=%d",writes,errors);
+    const State result=errors==0&&writes>0?State::Passed:State::Failed;
+    publish(result);return result;
+}
+// Mode::AudioRelay only: like run_audio_test(), but the source is real voice
+// PCM piped from the app over a loopback socket (platform/ps5/audio_relay.hpp),
+// not a generated tone. Runs for as long as that connection stays up (the
+// app closing it, or stop.bin, end it cleanly), bounded by a safety ceiling.
+// The core's key (src/core_key.h): 64 hex characters the core writes next to the app
+// (/app0 on the app side). Whether SceShellUI sees that real path is one of the things this
+// lab measures; the key is never logged, only whether and from where it was read.
+bool read_core_key(char out[64],bool verbose){
+    static constexpr const char* paths[]={
+        // ShellUI's /data is not the one the app and the core see (measured 2026-11-23: ENOENT on
+        // /data/homebrew/PPSA99073/control.key), but its /user/data is the real partition (the
+        // overlay's own log and chat files live there). The edition's own folder only: the CI
+        // refuses any binary that names the stock one.
+        "/user/data/homebrew/PPSA99073/control.key",
+        "/data/homebrew/PPSA99073/control.key",
+        "/app0/control.key",
+    };
+    for(const char* p:paths){
+        FILE* f=std::fopen(p,"rb");
+        if(!f){if(verbose)note("AUDIODIRECT key %s open errno=%d",p,errno);continue;}
+        char buf[65]{};const std::size_t got=std::fread(buf,1,64,f);
+        const int extra=std::fgetc(f);std::fclose(f);
+        if(verbose)note("AUDIODIRECT key %s read %zu bytes trailing=%s",p,got,extra==EOF?"none":"some");
+        if(got==64){std::memcpy(out,buf,64);return true;}
+    }
+    return false;
+}
+// Connects to the core's tap listener (src/voice_audio.c VAU_TAP_PORT) and sends the key.
+int connect_tap(const char key[64]){
+    constexpr std::uint16_t tap_port=9044;
+    const int fd=socket(AF_INET,SOCK_STREAM,0);if(fd<0)return -1;
+#ifdef SO_NOSIGPIPE
+    {const int one=1;setsockopt(fd,SOL_SOCKET,SO_NOSIGPIPE,&one,sizeof one);} // never let a dead peer SIGPIPE SceShellUI
+#endif
+    // Without TCP_NODELAY, Nagle holds each 512-byte mic grain until the core's delayed ACK (~100 ms) lets it go whenever the
+    // core has nothing to send back (nobody talking): the mic reached the core in 100 ms bursts, which its 80 ms lag guard
+    // cut to 40% and replayed at double speed ("silence, then the sentence sped up"; measured 2026-11-23, 143872 samples
+    // dropped in one 5 s window while the worker was reading the mic at exactly real time).
+    {const int one=1;setsockopt(fd,IPPROTO_TCP,TCP_NODELAY,&one,sizeof one);}
+    sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(tap_port);a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    if(connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a)!=0){close(fd);return -1;}
+    // The key, then "TAP2" in the same write: a v2 client is never replaced by an older worker's reconnects.
+    char hello[68];std::memcpy(hello,key,64);std::memcpy(hello+64,"TAP2",4);
+    if(send(fd,hello,sizeof hello,0)!=ssize_t(sizeof hello)){close(fd);return -1;}
+    const int flags=fcntl(fd,F_GETFL,0);fcntl(fd,F_SETFL,flags|O_NONBLOCK);
+    return fd;
+}
+// Mode::AudioRelay, preferred path: the voice PCM comes straight from the core's tap
+// listener, so nothing depends on the app, which the console suspends when a real game
+// launches (measured 2026-11-23: the app-fed relay died at that instant). The output is
+// this worker's own sceAudioOut inside SceShellUI, which keeps playing under a game's AV
+// focus. Reconnects by itself (core restart, key change) once a second.
+State run_audio_direct(char key[64]){
+    publish(State::Observing);
+    const auto init=fn<AudioOutInitCall>(AudioOutInit);
+    const auto open=fn<AudioOutOpenCall>(AudioOutOpen);
+    const auto output=fn<AudioOutOutputCall>(AudioOutOutput);
+    const auto close_out=fn<AudioOutCloseCall>(AudioOutClose);
+    const int init_rc=init();
+    note("AUDIODIRECT init rc=0x%08x",unsigned(init_rc));
+    if(init_rc!=0&&init_rc!=static_cast<int>(0x8026000e)){publish(State::Failed);return State::Failed;}
+    const int handle=open(0xff,0,0,256,48000,1);
+    note("AUDIODIRECT open rc=0x%08x",unsigned(handle));
+    if(handle<0){publish(State::Failed);return State::Failed;}
+    // The microphone, captured inside ShellUI (type 0, 48 kHz, S16 mono, grain 256, the app's own arguments):
+    // the console kills the app when a game launches, and the app was the only thing that captured it. It is
+    // opened only while the core says the app is not delivering one (the marker file `tap-mic`, which the
+    // core creates and removes), so it never competes with the app's own capture in the call screen or the
+    // PS menu; an empty file `no-mic` next to worker.log turns the whole thing off.
+    int mic=-1;std::uint64_t mic_reads=0,mic_errors=0,mic_sent=0,next_mic_check=0,mic_open_fails=0;
+    int mic_peak=0;double mic_sq=0;std::uint64_t mic_n=0;
+    auto file_exists=[&](const char* name){
+        char fp[256];if(!path(fp,sizeof fp,worker_dir,name))return false;
+        FILE* ff=std::fopen(fp,"rb");if(!ff)return false;std::fclose(ff);return true;};
+    auto open_mic=[&]()->int{
+        if(!(request.functions[AudioInOpen]&&request.functions[AudioInInput]&&request.functions[AudioInClose])){
+            if(mic_open_fails++==0)note("AUDIOIN functions MISSING (libSceAudioIn not loaded in ShellUI?)");
+            return -1;}
+        int user=-1;
+        if(request.functions[UserGetForegroundUser]){
+            int u=-1;const int rc=fn<UserForegroundCall>(UserGetForegroundUser)(&u);
+            if(rc==0)user=u;}
+        const int users[2]={user,0xff};
+        for(int u:users){
+            if(u<0)continue;
+            const int h=fn<AudioInOpenCall>(AudioInOpen)(u,0,0,256,48000,1);
+            if(h>=0){note("AUDIOIN open user=0x%x handle=0x%x",unsigned(u),unsigned(h));return h;}
+            if(mic_open_fails<3||mic_open_fails%120==0)note("AUDIOIN open user=0x%x rc=0x%08x",unsigned(u),unsigned(h));
+        }
+        ++mic_open_fails;return -1;
+    };
+    alignas(64) std::int16_t mic_grain[256];
+    int fd=-1;std::uint64_t next_try=0,last_data=0,connects=0;
+    static std::uint8_t pending[32768];std::size_t pending_len=0; // ~170 ms of stereo, off the thread stack
+    alignas(64) std::int16_t grain[256*2];
+    int writes=0,errors=0;std::uint64_t recv_bytes=0;
+    const std::uint64_t began=now_ms();
+    const std::uint64_t until=began+86300000; // 24 h, under request.deadline_ms (parent.cpp); the core relaunches a dead worker
+    auto play_grain=[&]{
+        const int rc=output(handle,grain);++writes;
+        if(rc<0){++errors;if(errors<=5||errors%100==0)note("AUDIODIRECT write #%d rc=0x%08x",writes,unsigned(rc));}
+        if(writes%200==0){
+            note("AUDIODIRECT writes=%d errors=%d recv_bytes=%llu connects=%llu",writes,errors,
+                 static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(connects));
+            publish(State::Observing);}
+    };
+    // One grain of playback and one grain of mic per pass, never a burst of either: AudioOut and AudioIn each
+    // block for one 5.33 ms grain, and the old "play everything that arrived" loop spent ~20 ms in playback per
+    // core frame, so the mic was read at ~30% of real time and reached the core crackling and cut
+    // (measured 2026-11-23: 28 KB/s of the 96 KB/s a 48 kHz S16 mono mic makes).
+    std::uint64_t last_stop_check=0;
+    std::uint64_t pass_max=0,slow_passes=0,send_eagain=0,dropped_bytes=0,compressed=0; // timing evidence, logged with the mic level
+    bool compressing=false;
+    std::uint64_t last_beat=0,fail_streak=0;
+    // Playback queue marks (bytes of stereo S16): the console's audio clock runs 0.5-1.3 % slower than the
+    // core's 20 ms mix clock (measured 2026-11-23: the queue sat at its 32 KB cap and dropped 2-3 grains a
+    // second, each drop a click), so above kHigh the next grains are time-compressed by 1.6 % until the queue
+    // is under kLow again; kHardCap only guards against a stall.
+    constexpr std::size_t kHardCap=16384,kHigh=8192,kLow=6144;
+    while(now_ms()<until){
+        const std::uint64_t now=now_ms();
+        const std::uint64_t pass_began=now;
+        if(now-last_stop_check>1000){ // an empty marker file `stop-audio` ends this worker (it holds the lock until then)
+            last_stop_check=now;
+            char sp[256];FILE* sf=path(sp,sizeof sp,worker_dir,"stop-audio")?std::fopen(sp,"rb"):nullptr;
+            if(sf){std::fclose(sf);note("AUDIODIRECT stop-audio marker found: ending");break;}
+        }
+        if(now-last_beat>2000){ // a heartbeat the core looks at (src/overlay.c): a stale one gets the worker launched again
+            last_beat=now;
+            char hp[256];FILE* hf=path(hp,sizeof hp,worker_dir,"audio-alive")?std::fopen(hp,"wb"):nullptr;
+            if(hf){std::fputc('1',hf);std::fclose(hf);}
+        }
+        if(now>=next_mic_check){ // follow the core's `tap-mic` marker: the mic is ours only while the app has none
+            next_mic_check=now+(mic>=0?500:1000);
+            const bool wanted=file_exists("tap-mic")&&!file_exists("no-mic");
+            if(wanted&&mic<0)mic=open_mic();
+            else if(!wanted&&mic>=0){fn<AudioInCloseCall>(AudioInClose)(mic);mic=-1;note("AUDIOIN closed (the app delivers its own mic again)");}
+        }
+        if(fd<0&&now>=next_try){
+            // The core may not be running (app closed): retry every second at first, then every 5 s, and
+            // keep the log quiet (the first few failures, then one in 60).
+            next_try=now+(fail_streak<10?1000:5000);
+            char current[64];
+            const bool verbose=fail_streak<3||fail_streak%60==0;
+            if(read_core_key(current,verbose))std::memcpy(key,current,64); // the key is per boot: re-read it
+            fd=connect_tap(key);
+            ++connects;
+            if(fd>=0){fail_streak=0;note("AUDIODIRECT tap connect ok (attempt %llu)",static_cast<unsigned long long>(connects));}
+            else{++fail_streak;if(verbose)note("AUDIODIRECT tap connect failed (streak %llu)",static_cast<unsigned long long>(fail_streak));}
+            pending_len=0;
+        }
+        if(fd>=0){
+            std::uint8_t buf[4096];
+            const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
+            if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
+                note("AUDIODIRECT tap closed rc=%zd errno=%d",got,errno);close(fd);fd=-1;next_try=now+500;
+            } else if(got>0){
+                recv_bytes+=std::uint64_t(got);last_data=now;
+                if(pending_len+std::size_t(got)>kHardCap){ // far behind: the oldest whole grains go, frames stay aligned
+                    std::size_t drop=pending_len+std::size_t(got)-kHardCap;
+                    drop=(drop+sizeof grain-1)/sizeof grain*sizeof grain;
+                    if(drop>pending_len)drop=pending_len;
+                    dropped_bytes+=drop;
+                    std::memmove(pending,pending+drop,pending_len-drop);pending_len-=drop;
+                }
+                std::memcpy(pending+pending_len,buf,std::size_t(got));pending_len+=std::size_t(got);
+            }
+        }
+        bool busy=false;
+        if(pending_len>=sizeof grain){
+            if(pending_len>kHigh)compressing=true;else if(pending_len<kLow)compressing=false;
+            if(compressing&&pending_len>=261*4){
+                // 260 input frames become the 256 of this grain (linear interpolation, +1.6 % speed: below hearing).
+                alignas(64) std::int16_t src[264*2];
+                std::memcpy(src,pending,261*4);
+                for(int j=0;j<256;j++){
+                    const double pos=double(j)*260.0/256.0;const int i0=int(pos);const double fr=pos-double(i0);
+                    for(int c=0;c<2;c++){
+                        const double a=src[i0*2+c],b=src[(i0+1)*2+c];
+                        grain[j*2+c]=std::int16_t(a+(b-a)*fr);
+                    }
+                }
+                std::memmove(pending,pending+260*4,pending_len-260*4);pending_len-=260*4;++compressed;
+            } else {
+                std::memcpy(grain,pending,sizeof grain);
+                std::memmove(pending,pending+sizeof grain,pending_len-sizeof grain);pending_len-=sizeof grain;
+            }
+            play_grain();busy=true;
+        } else if(pending_len>0&&now-last_data>40){
+            // Idle: the last partial grain of a burst of speech is padded with silence and played
+            // rather than left to be glued onto the start of the next one.
+            std::memset(grain,0,sizeof grain);std::memcpy(grain,pending,pending_len);pending_len=0;play_grain();busy=true;
+        }
+        if(mic>=0){ // blocks for one 5.33 ms grain (usually already waiting after the playback call)
+            const int rc=fn<AudioInInputCall>(AudioInInput)(mic,mic_grain);++mic_reads;
+            if(rc<0){
+                ++mic_errors;
+                if(mic_errors<=5||mic_errors%200==0){
+                    note("AUDIOIN read #%llu rc=0x%08x",static_cast<unsigned long long>(mic_reads),unsigned(rc));
+                }
+                usleep(5000);
+            } else {
+                busy=true;
+                for(int i=0;i<256;i++){const int a=mic_grain[i]<0?-int(mic_grain[i]):int(mic_grain[i]);
+                    if(a>mic_peak)mic_peak=a;mic_sq+=double(mic_grain[i])*double(mic_grain[i]);}
+                mic_n+=256;
+                // Forward the grain to the core over the same socket (the core only uses it while the app
+                // is not delivering its own mic). Best effort: never blocks, a lost grain is a 5 ms gap.
+                if(fd>=0){
+                    const ssize_t sent=send(fd,mic_grain,sizeof mic_grain,MSG_DONTWAIT);
+                    if(sent>0&&sent<ssize_t(sizeof mic_grain))note("AUDIOIN partial send %zd",sent);
+                    else if(sent>0)mic_sent+=std::uint64_t(sent);
+                    else if(sent<0&&(errno==EAGAIN||errno==EWOULDBLOCK))++send_eagain;
+                }
+            }
+            if(mic_reads%200==0){
+                const double rms=mic_n?std::sqrt(mic_sq/double(mic_n)):0.0;
+                note("AUDIOIN reads=%llu errors=%llu peak=%d rms=%d sent=%llu passmax=%llums slow=%llu eagain=%llu dropped=%llu comp=%llu pending=%zu",
+                     static_cast<unsigned long long>(mic_reads),static_cast<unsigned long long>(mic_errors),mic_peak,int(rms),
+                     static_cast<unsigned long long>(mic_sent),static_cast<unsigned long long>(pass_max),
+                     static_cast<unsigned long long>(slow_passes),static_cast<unsigned long long>(send_eagain),
+                     static_cast<unsigned long long>(dropped_bytes),static_cast<unsigned long long>(compressed),pending_len);
+                mic_peak=0;mic_sq=0;mic_n=0;pass_max=0;}
+        }
+        {const std::uint64_t took=now_ms()-pass_began;if(took>pass_max)pass_max=took;if(took>15)++slow_passes;}
+        if(!busy)usleep(fd>=0?4000:(mic>=0?4000:100000)); // nothing to play or capture right now; do not spin
+    }
+    if(fd>=0)close(fd);
+    if(mic>=0)fn<AudioInCloseCall>(AudioInClose)(mic);
+    output(handle,nullptr);close_out(handle);
+    note("AUDIODIRECT done writes=%d errors=%d recv_bytes=%llu elapsed_ms=%llu",writes,errors,
+         static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(now_ms()-began));
+    const State result=writes>0?State::Passed:State::Failed;
+    publish(result);return result;
+}
+State run_audio_relay(){
+    {char key[64]{};
+     // Always the direct path now: the core may not be running yet (the worker is launched by the core
+     // itself, or by hand), and run_audio_direct() re-reads the key at every connection attempt.
+     (void)read_core_key(key,true);
+     return run_audio_direct(key);}
+    publish(State::Observing);
+    // Fixed and known to both ends at compile time (app/src/platform/ps5/
+    // audio_relay.hpp hardcodes the same value): no file handoff, which is
+    // what kept failing (measured 2026-11-22, several different ways,
+    // across both /data/... and /user/data/...: this worker's sandbox and
+    // the app's do not agree on a single path one can write and the other
+    // read). Loopback-only, single-user console: an unauthenticated local
+    // connection is an acceptable trade for not depending on that agreement.
+    constexpr std::uint16_t port=9043;
+    const int fd=socket(AF_INET,SOCK_STREAM,0);
+    note("AUDIORELAY socket fd=%d errno=%d",fd,errno);
+    if(fd<0){publish(State::Failed);return State::Failed;}
+    sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(port);a.sin_addr.s_addr=htonl(INADDR_LOOPBACK);
+    const int connect_rc=connect(fd,reinterpret_cast<sockaddr*>(&a),sizeof a);
+    note("AUDIORELAY connect port=%u rc=%d errno=%d",unsigned(port),connect_rc,errno);
+    if(connect_rc!=0){close(fd);publish(State::Failed);return State::Failed;}
+    const int flags=fcntl(fd,F_GETFL,0);fcntl(fd,F_SETFL,flags|O_NONBLOCK);
+
+    const auto init=fn<AudioOutInitCall>(AudioOutInit);
+    const auto open=fn<AudioOutOpenCall>(AudioOutOpen);
+    const auto output=fn<AudioOutOutputCall>(AudioOutOutput);
+    const auto close_out=fn<AudioOutCloseCall>(AudioOutClose);
+    const int init_rc=init();
+    note("AUDIORELAY init rc=0x%08x",unsigned(init_rc));
+    if(init_rc!=0&&init_rc!=static_cast<int>(0x8026000e)){close(fd);publish(State::Failed);return State::Failed;}
+    const int handle=open(0xff,0,0,256,48000,1);
+    note("AUDIORELAY open rc=0x%08x",unsigned(handle));
+    if(handle<0){close(fd);publish(State::Failed);return State::Failed;}
+
+    std::uint8_t pending[4096];std::size_t pending_len=0;
+    alignas(64) std::int16_t grain[256*2];
+    int writes=0,errors=0;std::uint64_t recv_bytes=0;
+    const std::uint64_t began=now_ms();
+    const std::uint64_t until=began+570000; // under the loader's deadline
+    bool link_closed=false;
+    const char* reason="until elapsed";
+    // Not stop.bin: measured 2026-11-22 that the external loader process
+    // (outside ShellUI, forked by parent.cpp's main()) reliably dies within
+    // ~150 ms of starting, for every mode, AudioTest included -- it just
+    // never mattered before, because run_audio_test()'s loop never checks
+    // stop.bin at all and keeps going regardless, independently, inside
+    // ShellUI. This loop used to check it too, and that is what was cutting
+    // every relay off almost immediately, long before the app's own side
+    // even finished dialing in. Left unsolved: why the loader dies that
+    // fast; nothing here or in parent.cpp sends it a signal that early.
+    while(!link_closed&&now_ms()<until){
+        std::uint8_t buf[4096];
+        const ssize_t got=recv(fd,buf,sizeof buf,MSG_DONTWAIT);
+        if(got==0||(got<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK)){
+            note("AUDIORELAY connection closed rc=%zd errno=%d",got,errno);link_closed=true;reason="recv closed/error";break;}
+        if(got>0){
+            recv_bytes+=std::uint64_t(got);
+            std::size_t at=0;
+            while(at<std::size_t(got)){
+                const std::size_t take=std::min(std::size_t(got)-at,sizeof pending-pending_len);
+                std::memcpy(pending+pending_len,buf+at,take);pending_len+=take;at+=take;
+                while(pending_len>=sizeof grain){
+                    std::memcpy(grain,pending,sizeof grain);
+                    std::memmove(pending,pending+sizeof grain,pending_len-sizeof grain);pending_len-=sizeof grain;
+                    const int rc=output(handle,grain);++writes;
+                    if(rc<0){++errors;if(errors<=5||errors%100==0)note("AUDIORELAY write #%d rc=0x%08x",writes,unsigned(rc));}
+                    if(writes%200==0){
+                        note("AUDIORELAY writes=%d errors=%d recv_bytes=%llu",writes,errors,
+                             static_cast<unsigned long long>(recv_bytes));
+                        publish(State::Observing);}
+                }
+            }
+        } else {
+            usleep(2000); // nothing waiting right now; do not spin
+        }
+    }
+    output(handle,nullptr);close_out(handle);close(fd);
+    note("AUDIORELAY done writes=%d errors=%d recv_bytes=%llu elapsed_ms=%llu reason=%s",writes,errors,
+         static_cast<unsigned long long>(recv_bytes),static_cast<unsigned long long>(now_ms()-began),reason);
+    const State result=writes>0?State::Passed:State::Failed;
+    publish(result);return result;
+}
+// Mode::PartyProbe only: read-only (no hooking, no AudioOut). The PS5's
+// own Party/mute tile in Game Base/Control Center survives a game taking
+// focus, for any third-party title's own voice chat, not just PSN's --
+// if that is a local, generic registration (not something tied to PSN
+// network infra this console cannot reach), finding which assembly
+// implements it is the first step toward using it for voice playback too.
+// "Game Base" is the console's own name for that hub (Parties, Messages,
+// Activities, Friends), per the user 2026-11-23.
+bool probe_party_assemblies(){
+    static constexpr const char* candidates[]={
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.GameBase.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.GameBase.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.Np.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Np.Party.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.ControlCenter.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ControlCenter.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.QuickMenu.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Communication.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Notification.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Toast.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.SystemUI.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Friend.dll",
+        "/system_ex/common_ex/lib/Sce.Vsh.ShellUI.Friends.dll",
+    };
+    bool any=false;
+    for(const char* path:candidates){
+        void* img=image(path);
+        note("PARTYPROBE %s -> %s",path,img?"FOUND":"missing");
+        any|=img!=nullptr;
+    }
+    return any;
+}
 State run(){
+    if(request.mode==Mode::AudioTest)return run_audio_test();
+    if(request.mode==Mode::AudioRelay)return run_audio_relay();
     domain=fn<void*(*)()>(RootDomain)();if(!domain){note("REFUSED root domain missing");return State::Refused;}
     void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);if(!thread){note("REFUSED Mono thread attach");return State::Refused;}
     State result=State::Refused;
     do {
+        if(request.mode==Mode::PartyProbe){result=probe_party_assemblies()?State::Resolved:State::Failed;break;}
         if(request.mode==Mode::Input){
             if(!resolve_input_methods())break;
             note("OBSERVING pad and share for at most60seconds; pure pass-through, no button changes");
@@ -875,7 +1562,7 @@ State run(){
     }while(false);
     enabled.store(false,std::memory_order_release);
     input_enabled.store(false,std::memory_order_release);
-    capture.store(false);release_game("teardown"); // never leave the game without its controller
+    capture.store(false);release_game("teardown",false); // never leave the game without its controller
     auto query=fn<ProtectionQuery>(QueryProtection);
     // Every installed hook gets its removal attempted; a failed one must not
     // short-circuit the rest.
@@ -895,10 +1582,15 @@ State run(){
 }
 }
 extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
-    char p[256];if(!path(p,sizeof p,worker_dir,"worker.lock"))return nullptr;
+    // The request first: it says which lock this worker takes. The audio modes never touch Mono
+    // or a hook and run for hours, so they have their own lock: with one shared lock the community
+    // build's always-running audio worker kept the visual overlay's worker from starting at all.
+    if(!read_file(worker_dir,"request.bin",request)||!valid(request,getpid(),OVERLAY_BUILD,request.epoch,now_ms()))
+        return nullptr;
+    const char* lock_name=request.mode==Mode::AudioTest||request.mode==Mode::AudioRelay?"audio.lock":"worker.lock";
+    char p[256];if(!path(p,sizeof p,worker_dir,lock_name))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
-    if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}
-    if(!read_file(worker_dir,"request.bin",request)||!valid(request,getpid(),OVERLAY_BUILD,request.epoch,now_ms())){
+    if(flock(lock,LOCK_EX|LOCK_NB)){note("REFUSED %s held by another worker in this ShellUI (mode=%u)",lock_name,unsigned(request.mode));
         close(lock);return nullptr;}
     note("START build=%016llx mode=%u",(unsigned long long)request.build,unsigned(request.mode));
     State result=run();

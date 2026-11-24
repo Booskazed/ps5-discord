@@ -31,6 +31,11 @@ inline std::string core_key()
 // library table through the kernel.
 std::uintptr_t core_dlsym(const char *lib, const char *sym);
 
+// Same, but for a module handle the app already resolved itself (e.g.
+// sceKernelGetModuleList2, sceSysmoduleGetModuleHandleInternal: those work
+// from the app; only sceKernelDlsym does not). Skips the by-name lookup.
+std::uintptr_t core_dlsym_handle(int handle, const char *sym);
+
 // One function: this process's dlsym first, then the core.
 template <typename F> void resolve(int handle, const char *lib, const char *sym, F &out)
 {

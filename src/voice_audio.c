@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -287,6 +288,26 @@ static int mic_head, mic_count, mic_carry = -1, mic_skip;
 static uint8_t out_buf[OUT_CAP * OUT_FRAME_BYTES];
 static size_t out_len;
 
+// LAB (branch lab/audio-out-probe only): a second, playback-only consumer of the same mixed
+// frames, for code hosted inside SceShellUI (overlay AudioRelay worker). The app's audio
+// socket dies the moment the console suspends the app for a real game, and ShellUI-hosted
+// sceAudioOut is the one output measured to survive the game taking AV focus; this lets that
+// worker pull the PCM straight from the core, which the app lifecycle does not touch.
+// Loopback only and key-authenticated like the other roles; the client sends the 64-byte
+// key and then only reads (stereo S16 48 kHz, 3840 B per 20 ms frame, best effort).
+static int tap_listen_fd = -1, tap_fd = -1, tap_pending_fd = -1;
+static char tap_pending_key[CORE_KEY_LEN + 4]; // the key, then (v2 clients) "TAP2"
+static size_t tap_pending_len;
+static int64_t tap_pending_ms;
+static uint8_t tap_buf[OUT_CAP * OUT_FRAME_BYTES];
+static size_t tap_len;
+static unsigned st_tap_bytes;
+static unsigned st_tap_mic_bytes;
+static int64_t tick_last_ms;
+static unsigned st_tick_max, st_tick_late, st_lag_drops, st_double_ticks; // LAB engine timing, per 5 s
+static int tap_v2; // the current tap client said "TAP2": a v1 client (older worker) never replaces it
+static int64_t app_mic_ms; // when the app's own socket last delivered mic bytes (tap mic yields to it)
+
 // The external device (vau_ext_*). Its thread must never wait on the engine, which
 // holds mu through Opus and DAVE, so the two meet only in these rings under ext_mu.
 static pthread_mutex_t ext_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -524,6 +545,8 @@ static void read_mic(void)
     uint8_t buf[4096];
     for (int i = 0; i < 8 && audio_clients.current >= 0; i++) {
         ssize_t r = recv(audio_clients.current, buf, sizeof buf, MSG_DONTWAIT);
+        if (r > 0 && !audio_clients.usb)
+            app_mic_ms = now_ms();
         if (r > 0 && ext_owner && !audio_clients.usb) { // drain app mic, retaining sample alignment
             mic_skip = ((mic_carry >= 0 || mic_skip) + (int)(r & 1)) & 1;
             mic_carry = -1;
@@ -569,6 +592,163 @@ static void out_push(const int16_t *stereo)
     }
     memcpy(out_buf + out_len, stereo, OUT_FRAME_BYTES);
     out_len += OUT_FRAME_BYTES;
+}
+
+static void tap_close(int *fd)
+{
+    if (*fd >= 0)
+        close(*fd);
+    *fd = -1;
+}
+
+#ifdef __PROSPERO__
+#define TAP_MIC_MARKER "/data/discord-overlay-poc/tap-mic"
+#endif
+static int tap_mic_marker;
+static int64_t tap_mic_want_since;
+// The worker captures the mic inside SceShellUI only while the app does not (the console kills the app when a game
+// launches), so the two never compete for the device: the core creates OVERLAY_DIR/tap-mic after the app has
+// delivered no mic for 2 s (or is gone) for 1 s, and removes it the moment the app delivers one again.
+static void tap_mic_marker_update(void)
+{
+#ifdef __PROSPERO__
+    const int64_t now = now_ms();
+    const int want = tap_fd >= 0 && tap_v2 && (audio_clients.current < 0 || now - app_mic_ms > 2000);
+    if (!want) {
+        tap_mic_want_since = 0;
+        if (tap_mic_marker) {
+            unlink(TAP_MIC_MARKER);
+            tap_mic_marker = 0;
+            LOG("voice audio: tap mic off");
+        }
+        return;
+    }
+    if (!tap_mic_want_since)
+        tap_mic_want_since = now;
+    if (!tap_mic_marker && now - tap_mic_want_since > 1000) {
+        FILE *f = fopen(TAP_MIC_MARKER, "wb");
+        if (f) {
+            fclose(f);
+            tap_mic_marker = 1;
+            LOG("voice audio: tap mic on");
+        }
+    }
+#else
+    (void)tap_mic_marker; // the host build has no worker and no marker file
+    (void)tap_mic_want_since;
+#endif
+}
+// Admits one tap client at a time (a new one replaces the old) and notices its departure.
+// poll() before accept(): a bare accept() on a descriptor this console may not keep
+// non-blocking must never be able to stall the engine thread.
+static void tap_service(void)
+{
+    if (tap_listen_fd >= 0 && tap_pending_fd < 0) {
+        struct pollfd lp = {.fd = tap_listen_fd, .events = POLLIN};
+        if (poll(&lp, 1, 0) > 0 && (lp.revents & POLLIN)) {
+            struct sockaddr_in a;
+            socklen_t l = sizeof a;
+            int fd = accept(tap_listen_fd, (struct sockaddr *)&a, &l);
+            if (fd >= 0) {
+                if (!vau_loopback(a.sin_addr.s_addr) || fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) != 0)
+                    close(fd);
+                else {
+                    tap_pending_fd = fd;
+                    tap_pending_len = 0;
+                    tap_pending_ms = now_ms();
+                }
+            }
+        }
+    }
+    if (tap_pending_fd >= 0) {
+        ssize_t r = recv(tap_pending_fd, tap_pending_key + tap_pending_len, sizeof tap_pending_key - tap_pending_len,
+                         MSG_DONTWAIT);
+        if (r > 0)
+            tap_pending_len += (size_t)r;
+        else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+            tap_close(&tap_pending_fd);
+        if (tap_pending_fd >= 0 && tap_pending_len < CORE_KEY_LEN && now_ms() - tap_pending_ms > 2000) {
+            LOG("voice audio: tap refused a connection that sent no key");
+            tap_close(&tap_pending_fd);
+        }
+        // The key is 64 bytes; a v2 client sends "TAP2" right behind it in the same write, so give those
+        // 4 bytes 50 ms to show up before taking the client for a v1 one.
+        if (tap_pending_fd >= 0 && tap_pending_len >= CORE_KEY_LEN &&
+            (tap_pending_len == sizeof tap_pending_key || now_ms() - tap_pending_ms > 50)) {
+            int v2 = tap_pending_len == sizeof tap_pending_key &&
+                     memcmp(tap_pending_key + CORE_KEY_LEN, "TAP2", 4) == 0;
+            if (!core_key_ok(tap_pending_key, CORE_KEY_LEN)) {
+                LOG("voice audio: tap refused a connection with the wrong key");
+                tap_close(&tap_pending_fd);
+            } else if (tap_fd >= 0 && tap_v2 && !v2) {
+                // An older worker that keeps reconnecting every second made two clients take the socket
+                // from each other (measured 2026-11-23): a v2 client is never replaced by a v1 one.
+                tap_close(&tap_pending_fd);
+            } else {
+                tap_close(&tap_fd);
+                tap_fd = tap_pending_fd;
+                tap_pending_fd = -1;
+                tap_len = 0;
+                tap_v2 = v2;
+                mic_carry = -1; // no half sample left from the previous client's stream
+                int one = 1;
+                setsockopt(tap_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+                LOG("voice audio: tap PCM active (%s)", v2 ? "v2" : "v1");
+            }
+        }
+    }    if (tap_fd >= 0) {
+        // After its key the client may send its microphone (mono S16 LE 48 kHz), captured inside
+        // SceShellUI where it survives the console killing the app for a game. It counts only while
+        // the app is not delivering a mic itself, so the two sources never mix.
+        uint8_t b[4096];
+        for (int i = 0; i < 4 && tap_fd >= 0; i++) { // a 48 kHz mono mic is ~1.9 KB per 20 ms tick
+            ssize_t r = recv(tap_fd, b, sizeof b, MSG_DONTWAIT);
+            if (r > 0) {
+                if (audio_clients.current < 0 || now_ms() - app_mic_ms > 300) {
+                    mic_push(b, (size_t)r);
+                    st_tap_mic_bytes += (unsigned)r;
+                }
+            } else if (r == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+                LOG("voice audio: tap disconnected");
+                tap_close(&tap_fd);
+                tap_len = 0;
+                tap_v2 = 0;
+            } else
+                break;
+        }
+    }
+    tap_mic_marker_update();
+}
+
+static void tap_push(const int16_t *stereo)
+{
+    if (tap_fd < 0)
+        return;
+    if (tap_len + OUT_FRAME_BYTES > sizeof tap_buf) { // behind: the oldest frame goes
+        memmove(tap_buf, tap_buf + OUT_FRAME_BYTES, tap_len - OUT_FRAME_BYTES);
+        tap_len -= OUT_FRAME_BYTES;
+    }
+    memcpy(tap_buf + tap_len, stereo, OUT_FRAME_BYTES);
+    tap_len += OUT_FRAME_BYTES;
+}
+
+static void tap_flush(void)
+{
+    while (tap_fd >= 0 && tap_len) {
+        ssize_t w = send(tap_fd, tap_buf, tap_len, MSG_DONTWAIT);
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+            return;
+        if (w <= 0) {
+            LOG("voice audio: tap send failed (%d)", errno);
+            tap_close(&tap_fd);
+            tap_len = 0;
+            tap_v2 = 0;
+            return;
+        }
+        st_tap_bytes += (unsigned)w;
+        memmove(tap_buf, tap_buf + w, tap_len - (size_t)w);
+        tap_len -= (size_t)w;
+    }
 }
 
 // Sends one Opus frame as a UDP packet. Nothing goes out while DAVE is up but not ready.
@@ -651,7 +831,10 @@ static void tx(void)
         int drop = mic_count - 2 * VAU_FRAME;
         mic_head = (mic_head + drop) % MIC_CAP;
         mic_count -= drop;
+        st_lag_drops += (unsigned)drop;
     }
+    if (mic_count >= 2 * VAU_FRAME)
+        st_double_ticks++;
     for (int k = 0; k < 2 && mic_count >= VAU_FRAME; k++) {
         for (int i = 0; i < VAU_FRAME; i++)
             f[i] = mic[(mic_head + i) % MIC_CAP];
@@ -676,6 +859,13 @@ static void stats(int64_t now)
         LOG("voice audio: 5 s rx %u (no peer %u, no key %u, open failed %u) decoded %u mixed %u to app %u B, "
             "mic %u B, sent %u (seal failed %u)", st_rx, st_nopeer, st_nokey, st_open_fail, st_decoded, st_mixed,
             st_out_bytes, st_mic_bytes, st_sent, st_seal_fail);
+    if (st_at && tap_fd >= 0)
+        LOG("voice audio: 5 s tap %u B out, mic %u B in", st_tap_bytes, st_tap_mic_bytes);
+    if (st_at)
+        LOG("voice audio: 5 s engine: tick max %u ms, late(>40) %u, mic lag drops %u samples, ticks with 2+ frames %u",
+            st_tick_max, st_tick_late, st_lag_drops, st_double_ticks);
+    st_tap_bytes = st_tap_mic_bytes = 0;
+    st_tick_max = st_tick_late = st_lag_drops = st_double_ticks = 0;
     st_rx = st_nopeer = st_nokey = st_open_fail = st_decoded = st_mixed = st_out_bytes = st_mic_bytes = st_sent = 0;
     st_seal_fail = 0;
     st_at = now;
@@ -791,12 +981,15 @@ static void play(void)
         pthread_mutex_unlock(&ext_mu);
         st_out_bytes += sizeof out;
         st_mixed++;
-    } else if (any && audio_clients.current >= 0) {
+    } else if (any && (audio_clients.current >= 0 || tap_fd >= 0)) {
         vau_mix_out(acc, out);
-        out_push(out);
+        if (audio_clients.current >= 0 && !(tap_fd >= 0 && tap_v2)) // a live worker plays it: the app would double it
+            out_push(out);
+        tap_push(out);
         st_mixed++;
     }
     out_flush();
+    tap_flush();
 }
 
 static void keepalive(int64_t now)
@@ -840,8 +1033,19 @@ static void read_ext_mic(void)
 
 static void tick(void)
 {
+    // LAB: how late the 20 ms engine ticks run while a game takes the CPU (stats() reports it).
+    int64_t tick_now = now_ms();
+    if (tick_last_ms) {
+        int64_t gap = tick_now - tick_last_ms;
+        if (gap > st_tick_max)
+            st_tick_max = (unsigned)gap;
+        if (gap > 40)
+            st_tick_late++;
+    }
+    tick_last_ms = tick_now;
     accept_client();
     check_pending();
+    tap_service();
     pcm_clients_discard_parked(&audio_clients);
     app_client = audio_clients.parked >= 0 || (audio_clients.current >= 0 && !audio_clients.usb);
     read_mic();
@@ -902,6 +1106,11 @@ void vau_init(void)
         LOG("voice audio: Opus encoder failed, no audio");
     listen_fd = listen_loopback(VAU_PORT);
     usb_listen_fd = listen_loopback(VAU_USB_PORT);
+    tap_listen_fd = listen_loopback(VAU_TAP_PORT);
+#ifdef __PROSPERO__
+    unlink(TAP_MIC_MARKER); // a marker left by a core that died
+#endif
+    LOG("voice audio: tap PCM listener %s on 127.0.0.1:%d", tap_listen_fd >= 0 ? "ready" : "unavailable", VAU_TAP_PORT);
     if (usb_listen_fd < 0)
         LOG("voice audio: USB PCM listener unavailable on 127.0.0.1:%d", VAU_USB_PORT);
     if (listen_fd < 0)

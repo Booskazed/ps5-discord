@@ -85,8 +85,67 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   red since 45c8b78 for that reason).
 - Settings > About > Source shows `github.com/Booskazed/ps5-discord`.
 - In-game overlay: `overlay/src/core/parent.cpp` allows firmware 13.60 next to 13.00 (an explicit list;
-  every other refusal and the Mono signature checks are unchanged). Colours, button bits, fonts and
-  labels are still unchecked on 13.60.
+  every other refusal and the Mono signature checks are unchanged). The injection into SceShellUI
+  itself works on 13.60, and carries the audio worker below.
+- In-game overlay on 13.60: the hook on `Application.Update` refused (`REFUSED Update alignment,
+  permissions or relocatable prologue`), so the app reported an error and "Not loaded". That
+  ShellUI had another homebrew's hook on the method: a 14-byte `jmp [rip+0]` plus its handler's
+  address (`ff2500000000 fb42446202000000 75f0`; the plain prologue, seen on a fresh ShellUI, is
+  `55488bec4883ec604c896de84c8975f0`), which the prologue decoder cannot relocate.
+  `overlay/src/core/hook.hpp` now recognises such a jump and chains in front of it by swapping its
+  address (the original is the other hook's handler, so no trampoline is needed); every other target
+  goes through the decoder as before. `worker.log` shows the bytes found for `Update` and
+  `GamePad.GetData`, refused or not, and where such a jump leads. `overlay/tests/safety.cpp` covers
+  it, and the `test` workflow now runs the overlay's safety and worker suites. On the console
+  (2026-11-24, 13.60, fresh ShellUI, plain prologue) the overlay loads: both hooks installed, the
+  scene added, Update running. Chaining behind another hook is covered by the host test only.
+  Colours, button bits, fonts and labels are still unchecked on 13.60.
+- Overlay on 13.60: with the panel open, the game, the Discord app or the home menu behind it still
+  got the buttons (`sceLncUtilSetControllerFocus` and the impose flag answered 0 with no effect). The
+  panel now also takes the controller the way ShellUI does: its `ProcessFocusController`
+  (`LayerManager.s_processFocusController`) `.SetControllerFocus(ShellUI)`, given back with
+  `LayerManager.ForceUpdateControllerFocus()`; and PUI's `Application.SuspendInputEvents()` /
+  `ResumeInputEvents()` for ShellUI's own scenes. `focus-mode.bin` (8 bytes, bit 0 controller focus,
+  bit 1 input events, both by default) selects them without a rebuild. The button that closes the
+  panel no longer reaches what is behind it: the controller goes back once no button is held (at most
+  1.5 s). `worker.log` shows ShellUI's focus state (`FOCUSSTATE`) at each hold and release, and
+  `focus-test.bin` runs a hold without a controller. Checked on the console (13.60, 2026-11-24):
+  with the panel open over a game, the Discord app and the home menu, only the panel reacts.
+- The visual overlay and the audio worker (below) no longer share their locks. The audio worker
+  holds its lock for hours, so the overlay's worker exited without a word; and the overlay's loader
+  holds `parent.lock` while the overlay runs, so the core could not relaunch the audio worker after
+  a system UI restart. The audio worker now takes `audio.lock` and its loader `audio-parent.lock`;
+  `inject.lock` keeps two loaders from injecting into SceShellUI or writing `request.bin` at once.
+- Voice while a game is in front, over a wireless controller (side-by-side `PPSA99073` build only;
+  measured on firmware 13.60). The console ends the app when a game starts (`[SceLncService]
+  KillApp()` in the kernel log; it does not suspend it) while the core keeps the call, and the sound
+  an ordinary app plays is removed when another title takes AV focus (`[AvControl] AudioOut:
+  shared`). Sound played and a microphone captured from inside SceShellUI survive both.
+  - The core listens on a third loopback port, `127.0.0.1:9044` (the "tap"), authenticated with the
+    control key like the other two. It streams the mixed call to its client as stereo S16 48 kHz PCM
+    (20 ms frames) and takes the client's microphone back as mono S16 48 kHz on the same socket. While
+    a tap client is connected the app is no longer sent the playback (no doubled sound); the tap
+    microphone counts only while the app delivers none, and the core creates
+    `/data/discord-overlay-poc/tap-mic` while the worker may capture. Mic gain, Call volume, Mute and
+    Deafen stay in the core and apply to this path too.
+  - The audio worker (`overlay/src/core/worker.cpp`, mode AudioRelay, `overlay-audiorelay.elf`) is a
+    thread injected into SceShellUI. It plays the tap with its own `sceAudioOutOpen` and captures the
+    foreground user's microphone with `sceAudioIn` (type 0, 48 kHz, grains of 256 samples). It does
+    not touch the Mono runtime or the overlay hook, so it is exempt from the one-attempt-per-ShellUI
+    guard. SceShellUI sees `/user/data` but not `/data/homebrew`, so it reads the key from
+    `/user/data/homebrew/<title>/control.key`.
+  - The core starts it (`voice_shell_keeper` in `src/overlay.c`: 15 seconds after start, then whenever
+    the worker's `audio-alive` heartbeat is older than 15 seconds; a live worker is never started
+    twice, as each launch maps another copy of the ELF into SceShellUI). Control files in
+    `/data/discord-overlay-poc/`: `stop-audio` ends the worker, `no-mic` stops its capture.
+  - Found while measuring it, all fixed: the capture is read in step with the playback (one grain of
+    each per pass), as playing every queued grain first read the mic at 30% of real time; the
+    console's audio clock runs 0.5 to 1.3% slower than the core's 20 ms mix, so the playback queue
+    is time-compressed by 1.6% above 8 KB instead of dropping grains (2 to 3 clicks a second); and
+    the tap socket sets `TCP_NODELAY`: with Nagle on, the mic reached the core in 100 ms bursts
+    whenever nobody was talking, which its 80 ms lag guard cut to 40% and replayed at double speed.
+  - Not covered: other firmware versions, other consoles, the stock `PPSA99072` build (it does not
+    ship the worker), sessions of several hours.
 - Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00 and 13.60, where the
   wireless hardware encoder works (13.60: see below; a viewer saw the picture live on one console). A saved
   choice wins.

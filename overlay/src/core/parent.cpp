@@ -22,8 +22,8 @@
 #ifndef OVERLAY_MODE
 #define OVERLAY_MODE 0
 #endif
-#if OVERLAY_MODE<0||OVERLAY_MODE>5
-#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service"
+#if OVERLAY_MODE<0||OVERLAY_MODE>8
+#error "OVERLAY_MODE must be 0 resolve, 1 observe, 2 widget, 3 input, 4 restart, 5 service, 6 audiotest, 7 audiorelay, 8 partyprobe"
 #endif
 extern "C" {extern const unsigned char overlay_worker_blob[];extern const unsigned int overlay_worker_blob_size;
 volatile sig_atomic_t overlay_abort_requested=0;
@@ -31,7 +31,7 @@ int sceKernelGetAppInfo(pid_t,void*);}
 using namespace overlay;
 // elfldr deploys every payload as payload.elf, so each mode keeps its own USB
 // xlog to keep runs attributable (workspace payload discipline).
-static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service"};
+static constexpr const char* mode_names[]{"resolve","observe","widget","input","restart","service","audiotest","audiorelay","partyprobe"};
 static FILE* logfile=nullptr,*usblog=nullptr;
 static void note(const char* fmt,...){
     char line[512];va_list ap;va_start(ap,fmt);std::vsnprintf(line,sizeof line,fmt,ap);va_end(ap);
@@ -79,26 +79,47 @@ static int run(){
     note("RESTART done; expect home screen to reload");
     return 0;
 #endif
+    // AudioTest/AudioRelay/PartyProbe never install a hook (no
+    // prepare_update_hook call at all): unlike every other mode, retrying
+    // one on the same ShellUI instance carries none of the risk this
+    // one-attempt marker exists to bound, so they are exempt from it.
+    const bool one_shot_only=r.mode!=Mode::AudioTest&&r.mode!=Mode::AudioRelay&&r.mode!=Mode::PartyProbe;
     Attempt prior;
-    if(read_file(parent_dir,"attempt.bin",prior)&&prior.signature==magic&&prior.pid==r.pid&&prior.epoch==r.epoch){
+    if(one_shot_only&&read_file(parent_dir,"attempt.bin",prior)&&prior.signature==magic&&prior.pid==r.pid&&prior.epoch==r.epoch){
         note("REFUSED: one attempt already recorded for this ShellUI instance; inspect evidence, do not delete marker to retry");return 1;}
     std::uint32_t mono=0,kernel=0;
     if(kernel_dynlib_handle(r.pid,"libmonosgen-2.0.sprx",&mono)||!mono){
         if(kernel_dynlib_handle(r.pid,"libmonosgen-2.0.0.sprx",&mono)||!mono){note("REFUSED Mono module missing");return 1;}}
     if(kernel_dynlib_handle(r.pid,"libkernel_sys.sprx",&kernel)||!kernel){note("REFUSED kernel module missing");return 1;}
-    std::uint32_t web=0,libc=0,system=0;
+    std::uint32_t web=0,libc=0,system=0,audioout=0,audioin=0,userservice=0;
     (void)kernel_dynlib_handle(r.pid,"libkernel_web.sprx",&web);
+    // Lab (mic from ShellUI): absent from ShellUI's module list is a valid answer; logged, not fatal.
+    if(kernel_dynlib_handle(r.pid,"libSceAudioIn.sprx",&audioin)||!audioin){audioin=0;note("lab: libSceAudioIn is not loaded in ShellUI");}
+    else note("lab: libSceAudioIn handle %u",unsigned(audioin));
+    if(kernel_dynlib_handle(r.pid,"libSceUserService.sprx",&userservice)||!userservice){userservice=0;note("lab: libSceUserService is not loaded in ShellUI");}
     (void)kernel_dynlib_handle(r.pid,"libSceSystemService.sprx",&system);
     (void)kernel_dynlib_handle(r.pid,"libSceLibcInternal.sprx",&libc);
+    // Required only for Mode::AudioTest, but resolved for every mode (cheap,
+    // and ShellUI always has its own system-sound output loaded) so the
+    // generic loop below need not special-case it by mode.
+    if(kernel_dynlib_handle(r.pid,"libSceAudioOut.sprx",&audioout)||!audioout){
+        note("REFUSED libSceAudioOut module missing");return 1;}
     for(unsigned i=0;i<FunctionCount;i++){
         std::uint64_t address_value=0;
         if(optional(i)){
-            if(system){address_value=kernel_dynlib_dlsym(r.pid,system,symbols[i]);
-                if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,system,nid);}}
+            // The mic and user-service lab functions live in their own modules, not in SystemService.
+            const std::uint32_t home=(i==AudioInOpen||i==AudioInInput||i==AudioInClose)?audioin:
+                                     (i==UserGetForegroundUser)?userservice:
+                                     (i==ClassVtable||i==FieldStaticGetValue)?mono:system;
+            if(home){address_value=kernel_dynlib_dlsym(r.pid,home,symbols[i]);
+                if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,home,nid);}}
             if(!address(address_value)){note("optional %s missing: the overlay cannot hold the game",symbols[i]);address_value=0;}
             r.functions[i]=address_value;continue;
         }
-        if(i==TargetMmap||i==TargetMunmap){
+        if(i==AudioOutInit||i==AudioOutOpen||i==AudioOutOutput||i==AudioOutClose){
+            address_value=kernel_dynlib_dlsym(r.pid,audioout,symbols[i]);
+            if(!address_value){char nid[12]{};if(nid_encode(symbols[i],nid))address_value=kernel_dynlib_resolve(r.pid,audioout,nid);}
+        } else if(i==TargetMmap||i==TargetMunmap){
             // Plain mmap/munmap live in whichever BSD-ish module ShellUI loaded.
             const std::uint32_t candidates[3]={web,libc,kernel};
             for(std::uint32_t handle:candidates){
@@ -117,15 +138,32 @@ static int run(){
     {alignas(16) unsigned char info[256]{};
      if(sceKernelGetAppInfo(r.pid,info)==0)std::memcpy(&r.shell_app,info,sizeof r.shell_app);
      note("ShellUI app id 0x%08x",unsigned(r.shell_app));}
-    r.token=(now_ms()<<17)^std::uint64_t(getpid());r.deadline_ms=now_ms()+75000;
+    r.token=(now_ms()<<17)^std::uint64_t(getpid());
+    // AudioRelay keeps running for as long as the app's relay connection
+    // stays up (minutes); everything else is a short, bounded one-shot.
+    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:75000);
+    // One loader at a time from request.bin to the worker having read it: the service's and the
+    // audio worker's loaders can start together after a system UI restart, and both trace ShellUI
+    // and write the one request.bin. Waits up to 30 s; held until 2 s after the injection.
+    int inject_lock=-1;
+    {char lp[256];path(lp,sizeof lp,parent_dir,"inject.lock");inject_lock=open(lp,O_CREAT|O_RDWR,0600);}
+    for(int waited=0;inject_lock>=0&&flock(inject_lock,LOCK_EX|LOCK_NB);waited++){
+        if(waited>=300){note("REFUSED: another loader kept inject.lock for 30 s");close(inject_lock);return 1;}
+        usleep(100000);}
+    struct InjectLock{int fd;~InjectLock(){if(fd>=0)close(fd);}} inject_guard{inject_lock};
     if(!write_file(parent_dir,"request.bin",r)){note("request write failed");return 1;}
-    Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;
-    if(!write_file(parent_dir,"attempt.bin",a))return 1;
+    if(one_shot_only){
+        Attempt a;a.pid=r.pid;a.epoch=r.epoch;a.token=r.token;
+        if(!write_file(parent_dir,"attempt.bin",a))return 1;}
     auto result=common_fps::ps5::inject_shellui_stable(r.pid,overlay_worker_blob,overlay_worker_blob_size);
     note("LOADER target=%d epoch=%llu mapped=%u thread=%u detached=%u auth_restored=%u unresolved=%u first=%s",r.pid,
         (unsigned long long)r.epoch,result.elf_loaded,result.pthread_create_ok,result.detached,result.auth_restored,result.imports_unresolved,
         result.first_unresolved?result.first_unresolved:"");
     if(!result.elf_loaded||!result.pthread_create_ok||!result.detached||!result.auth_restored||result.imports_unresolved)return 1;
+    usleep(2000000);close(inject_guard.fd);inject_guard.fd=-1; // the worker has read request.bin by now
+    // The audio worker runs on its own inside ShellUI (its own lock, heartbeat and 24 h window): this loader is
+    // done, so it frees parent.lock and a later launch (the core sends the worker again if the heartbeat goes stale) works.
+    if(r.mode==Mode::AudioRelay){note("LOADER: audio worker injected, loader exits");return 0;}
     int previous=999;
 #if OVERLAY_MODE==5
     // Service: no fixed end. A heartbeat every second keeps the worker; on SIGTERM (or a
@@ -176,7 +214,15 @@ int main(){
     sceKernelSetProcessName("discord-overlay-restart.elf");
 #endif
     if(mkdir(parent_dir,0700)&&errno!=EEXIST)return 1;
+    // The audio worker's loaders have their own lock: the service's loader keeps parent.lock for as
+    // long as the overlay runs, and the core relaunches the audio worker after every system UI
+    // restart, so with one lock the voice in a game was lost whenever the overlay was on.
+    // inject.lock (run) still keeps two loaders from injecting at the same time.
+#if OVERLAY_MODE==6||OVERLAY_MODE==7
+    char p[256];path(p,sizeof p,parent_dir,"audio-parent.lock");int lock=open(p,O_CREAT|O_RDWR,0600);
+#else
     char p[256];path(p,sizeof p,parent_dir,"parent.lock");int lock=open(p,O_CREAT|O_RDWR,0600);
+#endif
 #if OVERLAY_MODE!=4 // restart works with a service running: its worker dies with ShellUI, its loader then stops
     if(lock<0||flock(lock,LOCK_EX|LOCK_NB))return 1;
 #endif
