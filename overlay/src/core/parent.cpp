@@ -178,7 +178,7 @@ static int run(){
     r.token=(now_ms()<<17)^std::uint64_t(getpid());
     // AudioRelay keeps running for as long as the app's relay connection
     // stays up (minutes); everything else is a short, bounded one-shot.
-    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay?86400000:(r.mode==Mode::PartyProbe||r.mode==Mode::SceneProbe||r.mode==Mode::TileDiscord||r.mode==Mode::BundleDump)?600000:75000);
+    r.deadline_ms=now_ms()+(r.mode==Mode::AudioRelay||r.mode==Mode::NativeTileInject?86400000:(r.mode==Mode::PartyProbe||r.mode==Mode::SceneProbe||r.mode==Mode::TileDiscord||r.mode==Mode::BundleDump)?600000:75000);
     if(r.mode==Mode::PartyProbe){
         // Read-only census (lab): which party/voice libraries ShellUI already has loaded. Logged, never fatal.
         static const char* const party_modules[]={"libSceProprietaryVoiceChatHelper.native.sprx","libSceVoiceChat.sprx",

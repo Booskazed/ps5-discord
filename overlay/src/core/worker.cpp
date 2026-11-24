@@ -2271,29 +2271,12 @@ State run_native_tile_inject(){
                 if(ex)note("TILEINJECT emitDeviceEvent exception");
                 else note("TILEINJECT emitDeviceEvent ok (count=%d)",++emit_count);
             }
-            if(jobj&&vcm_inst){
-                // Path 2: Mono handler dictionary → PartyStatusMonitor (controls tile visibility).
-                // Mode::TileDiscord always runs BOTH paths; running only emitDeviceEvent (path 1)
-                // populates the JS side but PartyStatusMonitor never marks the party as active.
-                if(emit_count<=1) tile_observe(vcm_inst,"before");
-                void* dict=*(void**)((char*)vcm_inst+16);
-                void* dclass=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
-                void* mitem=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Item",1):nullptr;
-                void* key=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
-                void* iargs[1]={key};ex=nullptr;
-                void* handler=mitem?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mitem,dict,iargs,&ex):nullptr;
-                if(handler){
-                    void* hclass=fn<void*(*)(void*)>(ObjectClass)(handler);
-                    void* minvoke=hclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(hclass,"Invoke",2):nullptr;
-                    void* key2=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
-                    void* vargs[2]={key2,jobj};ex=nullptr;
-                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minvoke,handler,vargs,&ex);
-                    note("TILEINJECT handler.Invoke %s (count=%d)",ex?"exception":"ok",++emit_count);
-                    if(emit_count<=2) tile_observe(vcm_inst,"after");
-                } else if(emit_count<=1) note("TILEINJECT no handler for %s in VoiceChatModule dict",evt_name);
-            }
-            // Path 3: keep PartyStatusMonitor.m_isInParty=1 (the handler may reset it)
-            if(psm) *((unsigned char*)psm+32)=1;
+            // Path 2 (handler.Invoke) SKIPPED: the voiceChatChannelEvent handler (PartyStatusMonitor)
+            // parses the JObject expecting SceVoiceChatChannelEvent struct fields; our party-session
+            // JSON doesn't match, so the handler resets m_isInParty to 0, undoing our direct write.
+            // Path 3: keep PartyStatusMonitor.m_isInParty=1
+            if(psm){*((unsigned char*)psm+32)=1;
+                if(emit_count<=1) tile_observe(vcm_inst,"after-force");}
             // Path 4: also emit as partySessionListEventVshNMVoiceChat (the React-side event that
             // PartySessionListProvider / ActionCardRealTimeCommunication listen for)
             if(jobj&&m_emit&&ctx){
