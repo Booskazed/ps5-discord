@@ -884,6 +884,12 @@ static void dump_close(void)
 
 enum session_end { SESS_STOPPED, SESS_RECOVERABLE, SESS_FAILED };
 
+// Video-read errors a fresh session may get past, under the same RECOVERY_MAX-a-minute limit:
+// 0x81950009, the HDMI output mode changing (a game launch, RECOVERY.md); 0x81950002 (nothing to
+// read yet, read again in the loop below) only once it has lasted a whole NO_PICTURE_MS. An encoder
+// that keeps failing still ends with the error once the limit is reached.
+static int recoverable_read_error(uint32_t e) { return e == 0x81950009u || e == 0x81950002u; }
+
 // One capture session: attach, open the encoder, stream until the core stops it or something
 // fails, then tear everything down. `may_recover` lets the 0x81950009 path wait for a stable
 // output mode (RECOVERY.md); the caller decides whether to open another session.
@@ -1013,6 +1019,7 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
     uint64_t last_picture = segment.begin_ms;
     uint32_t observed_mode = c.output_mode;
     unsigned mode_misses = 0;
+    unsigned nothing_streak = 0; // consecutive ReadVideo answers 0x81950002 (nothing to read yet)
     while (!quit && !net_dead && !stop_requested) {
         net_poll(NULL, &(int){1}, 0);
         if (net_dead || stop_requested) break;
@@ -1051,14 +1058,37 @@ static enum session_end capture_session(const struct start_req *req, int may_rec
             last_key = now_ms();
             if (!good(REMOTE(&c, KEYFRAME, c.video))) goto done;
         }
-        if (now_ms() - last_picture >= NO_PICTURE_MS) { why("The picture stopped."); goto done; }
+        if (now_ms() - last_picture >= NO_PICTURE_MS) {
+            // Nothing but 0x81950002 for the whole time: a fresh session may get past it (under the
+            // usual RECOVERY_MAX-a-minute limit), as for 0x81950009.
+            if (nothing_streak && may_recover && segment.frames && !c.ctx.quarantined) {
+                log_line("ReadVideo: only 0x81950002 for %u ms (%u reads)", (unsigned)NO_PICTURE_MS, nothing_streak);
+                segment.api_error = 0x81950002u;
+                net_state(CAP_RECOVERING, "");
+                (void)wait_stable_mode(&c, &segment.stable_mode, MODE_WAIT_MS);
+            }
+            why("The picture stopped."); goto done;
+        }
         int64_t n = REMOTE(&c, READ_VIDEO, c.video, c.remote_frame, FRAME_CAP, base + 0x300, 0);
+        // 0x81950002: the encoder has nothing to read yet. The game-audio reads get the same code and
+        // take it as no data (tests/game_audio.cpp, kNothing). On 13.60 one came 80 ms after a keyframe
+        // request in the middle of a Go Live, with the output mode unchanged, and ended the stream
+        // (helper done rc=1). It is polled again like an empty read; a stall still ends at NO_PICTURE_MS.
+        if (n != SL_CALL_ERROR && (int32_t)n == (int32_t)0x81950002u) {
+            if (!nothing_streak++) log_line("ReadVideo: nothing to read yet (0x81950002); reading again");
+            usleep(1000);
+            continue;
+        }
+        if (nothing_streak && n >= 5) {
+            log_line("ReadVideo: a picture again after %u reads answered 0x81950002", nothing_streak);
+            nothing_streak = 0;
+        }
         if (n == SL_CALL_ERROR || n < 0 || n > FRAME_CAP) {
             log_line("ReadVideo failed: 0x%llx", (unsigned long long)n);
             if (n != SL_CALL_ERROR && (int32_t)n < 0) segment.api_error = (uint32_t)n;
             // Only the observed API error is a recovery candidate. Oversize frames, unknown
             // errors and quarantined transport never are.
-            if (may_recover && segment.frames && segment.api_error == 0x81950009u && !c.ctx.quarantined) {
+            if (may_recover && segment.frames && recoverable_read_error(segment.api_error) && !c.ctx.quarantined) {
                 net_state(CAP_RECOVERING, "");
                 (void)wait_stable_mode(&c, &segment.stable_mode, MODE_WAIT_MS);
             }
@@ -1120,7 +1150,7 @@ done:
     // the setup; only a failed cleanup makes it a failure.
     if (end == SESS_STOPPED || quit || net_dead || stop_requested)
         return segment.cleanup_ok ? SESS_STOPPED : SESS_FAILED;
-    if (segment.api_error == 0x81950009u && may_recover && segment.cleanup_ok && !segment.transport_failed &&
+    if (recoverable_read_error(segment.api_error) && may_recover && segment.cleanup_ok && !segment.transport_failed &&
         segment.stable_mode && (segment.stable_mode != 0x40 || ALLOW_MODE_40) && segment.frames)
         return SESS_RECOVERABLE;
     if (segment.stable_mode == 0x40 && !ALLOW_MODE_40)

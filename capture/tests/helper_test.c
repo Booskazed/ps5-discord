@@ -29,9 +29,9 @@ enum scenario { OK, VIDEO_OPEN_FAIL, VIDEO_START_FAIL, BAD_HEADERS, VIDEO_OVERSI
                 NO_IDR, MODE_120HZ, CLOSE_FAIL, MODE_TRANSITION, MODE_CHANGED, CORE_CLOSES, BAD_PROFILE,
                 HANDLE_READ_FAIL, STOP_SETUP, EOF_SETUP, STOP_HEADERS, SLOW_SETUP, MODE_OTHER, MODE_ZERO, STOP_ATTACH, EOF_ATTACH, STOP_MODE, EOF_MODE, MODE_QUERY_ONCE, MODE_QUERY_FAIL, RESTORED_ABORT,
                 SCENARIO_COUNT, OPEN_BUSY_ONCE, OPEN_BUSY_ALWAYS, FW1360_NATIVE_ONLY, FW1360_OLD_AFTER_SCAN, FW1360_REFUSED,
-                FW1360_START_RETRY, FW1360_START_NEEDS_RATE, FW1360_START_REFUSED,
+                FW1360_START_RETRY, FW1360_START_NEEDS_RATE, FW1360_START_REFUSED, READ_NOTHING_ONCE,
                 RECOVER_OK, RECOVER_ZERO_MODE, RECOVER_REOPEN_FAIL, RECOVER_SECOND_FAULT, RECOVER_BAD_CLEANUP,
-                RECOVER_TRANSPORT, RECOVER_120HZ, RECOVER_EARLY_MODE, RECOVER_LAST = RECOVER_EARLY_MODE };
+                RECOVER_TRANSPORT, RECOVER_120HZ, RECOVER_EARLY_MODE, RECOVER_NOTHING, RECOVER_LAST = RECOVER_NOTHING };
 static enum scenario scenario;
 static uint8_t scratch[0x4000], video_mem[FRAME_CAP];
 static const uint64_t video_handle = 0x1234567800000012ull;
@@ -200,7 +200,14 @@ int64_t inj_call_fast(sl_inject *ctx, intptr_t fn, const uint64_t a[6], int save
         reads_in_session++;
         if (scenario == RESTORED_ABORT) { ctx->quarantined = ctx->aborted_restored = 1; return SL_CALL_ERROR; }
         if (scenario == TRANSPORT_FAIL) { ctx->quarantined = 1; return SL_CALL_ERROR; }
-        if (recovery_scenario() && attachments == 1 && reads_in_session == 3) {
+        // 13.60: 0x81950002, nothing to read yet: once (the helper reads again in the same session), or
+        // for a whole NO_PICTURE_MS (a fresh session, as for 0x81950009).
+        if (scenario == READ_NOTHING_ONCE && reads_in_session == 3) return (int64_t)(int32_t)0x81950002u;
+        if (scenario == RECOVER_NOTHING && attachments == 1 && reads_in_session >= 3) {
+            error_fired = 1;
+            return (int64_t)(int32_t)0x81950002u;
+        }
+        if (recovery_scenario() && scenario != RECOVER_NOTHING && attachments == 1 && reads_in_session == 3) {
             error_fired = 1;
             if (scenario == RECOVER_TRANSPORT) { ctx->quarantined = 1; return SL_CALL_ERROR; }
             return (int64_t)(int32_t)0x81950009u;
@@ -307,7 +314,7 @@ static int run_helper(const struct start_req *req, struct seen *s, int *rc_out, 
         }
         fake_core_fd = fd;
         if (send_start_msg) send_start(fd, req);
-        unsigned want_videos = scenario == RECOVER_OK ? 6 : scenario == RECOVER_SECOND_FAULT ? 1000 : 8; // fault ends it
+        unsigned want_videos = scenario == RECOVER_OK || scenario == RECOVER_NOTHING ? 6 : scenario == RECOVER_SECOND_FAULT ? 1000 : 8; // fault ends it
         for (;;) {
             r = read_exact(fd, h, sizeof h, scenario == NO_IDR || scenario == MODE_TRANSITION ? 4000 : 3000);
             if (r <= 0) break;
@@ -341,7 +348,8 @@ static int run_helper(const struct start_req *req, struct seen *s, int *rc_out, 
             default: assert(0);
             }
             if (s->videos >= 2 && !keyed) { send_simple(fd, CAP_KEYFRAME); keyed = 1; }
-            if (!stopped && s->videos >= want_videos && (scenario != RECOVER_OK || s->frames_after_recovering >= 3) &&
+            if (!stopped && s->videos >= want_videos &&
+                ((scenario != RECOVER_OK && scenario != RECOVER_NOTHING) || s->frames_after_recovering >= 3) &&
                 s->last_state == CAP_LIVE) {
                 stopped = 1;
                 if (scenario == CORE_CLOSES) { close(fd); fd = -1; break; }
@@ -519,20 +527,21 @@ int main(void)
         cases++;
     }
 
-    // Recovery as RECOVERY.md: only 0x81950009, three equal nonzero mode readings, a clean
-    // teardown, a fresh session with its own SPS/PPS; at most RECOVERY_MAX reopens a minute.
+    // Recovery as RECOVERY.md: 0x81950009 (and 0x81950002, RECOVER_NOTHING), three equal nonzero mode
+    // readings, a clean teardown, a fresh session with its own SPS/PPS; at most RECOVERY_MAX reopens a minute.
     for (scenario = RECOVER_OK; scenario <= RECOVER_LAST; scenario++) {
         profile = profiles[0];
         reset_fake();
         struct seen s; int rc;
         run_helper(&profile, &s, &rc, 1, 1);
-        const int reopens = scenario == RECOVER_OK || scenario == RECOVER_EARLY_MODE || scenario == RECOVER_REOPEN_FAIL || scenario == RECOVER_SECOND_FAULT;
+        const int reopens = scenario == RECOVER_OK || scenario == RECOVER_EARLY_MODE || scenario == RECOVER_REOPEN_FAIL ||
+                            scenario == RECOVER_SECOND_FAULT || scenario == RECOVER_NOTHING;
         const unsigned expected = scenario == RECOVER_SECOND_FAULT ? RECOVERY_MAX + 1 : reopens ? 2 : 1;
         assert(s.hello);
         assert(attachments == expected && detached == expected && calls[OPEN_VIDEO] == expected);
         assert(calls[TERMINATE] == (scenario == RECOVER_TRANSPORT ? 0 : expected));
         for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
-        if (scenario == RECOVER_OK || scenario == RECOVER_EARLY_MODE) {
+        if (scenario == RECOVER_OK || scenario == RECOVER_EARLY_MODE || scenario == RECOVER_NOTHING) {
             assert(rc == 0 && s.states[CAP_RECOVERING] == 1 && s.states[CAP_LIVE] == 2 && !s.states[CAP_ERROR]);
             assert(s.headers == 2 && s.profiles == 2 && s.profile_mode == 0x13c); // re-read SPS/PPS, new mode
             assert(s.frames_after_recovering >= 3 && s.keys >= 1);
@@ -566,6 +575,18 @@ int main(void)
         assert(vclose == 0 && calls[TERMINATE] == 1 && calls[START] == 0 && attachments == 1 && detached == 1);
         for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
         cases += 2;
+    }
+
+    // Firmware 13.60: one ReadVideo answer 0x81950002 (nothing to read yet) in the middle of a Go Live
+    // ended it. The helper reads again: the same session goes on, no recovery, no error.
+    {
+        scenario = READ_NOTHING_ONCE; profile = profiles[0]; reset_fake();
+        struct seen s; int rc;
+        run_helper(&profile, &s, &rc, 1, 1);
+        assert(s.hello && rc == 0 && s.videos >= 8 && !s.states[CAP_ERROR] && !s.states[CAP_RECOVERING]);
+        assert(attachments == 1 && detached == 1 && calls[OPEN_VIDEO] == 1 && vstop == 1 && vclose == 1 && calls[TERMINATE] == 1);
+        for (size_t j = 0; j < sizeof scratch; j++) assert(scratch[j] == 0xab);
+        cases++;
     }
 
     // Firmware 13.60 (upstream issue #11): the 13.00 block is refused there. The helper registers as ever, then

@@ -149,6 +149,12 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
 - Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00 and 13.60, where the
   wireless hardware encoder works (13.60: see below; a viewer saw the picture live on one console). A saved
   choice wins.
+- Wireless Go Live on 13.60: a Go Live ended by itself (`ReadVideo failed: 0x81950002`, then `helper done rc=1`)
+  80 ms after a keyframe request, with the output mode unchanged and the 13.60 opening below in place.
+  0x81950002 is Avcap2's "nothing to read yet" (the game-audio reads get it too and take it as no data), so the
+  helper now reads again, as for an empty read; only if nothing but 0x81950002 comes for the whole no-picture
+  window does it open a fresh session, under the usual limit of four a minute. The opening and start on 13.60
+  are unchanged. `capture.log` says when it happens. Covered by the helper tests; not yet seen on the console.
 - Wireless Go Live diagnostic (`capture/src/diag_native.c`): when the encoder answers `0x81950008`, the
   helper reads (only reads) SceRemotePlay's code, finds where it calls `sceAvcap2Initialize`,
   `sceAvcap2EnableScanInEncode`, `sceAvcap2OpenVideo` and the resource arbitrator, and writes the code
