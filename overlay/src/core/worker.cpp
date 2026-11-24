@@ -1211,9 +1211,6 @@ State run_audio_direct(char key[64]){
     const int init_rc=init();
     note("AUDIODIRECT init rc=0x%08x",unsigned(init_rc));
     if(init_rc!=0&&init_rc!=static_cast<int>(0x8026000e)){publish(State::Failed);return State::Failed;}
-    const int handle=open(0xff,0,0,256,48000,1);
-    note("AUDIODIRECT open rc=0x%08x",unsigned(handle));
-    if(handle<0){publish(State::Failed);return State::Failed;}
     // The microphone, captured inside ShellUI (type 0, 48 kHz, S16 mono, grain 256, the app's own arguments):
     // the console kills the app when a game launches, and the app was the only thing that captured it. It is
     // opened only while the core says the app is not delivering one (the marker file `tap-mic`, which the
@@ -1241,6 +1238,26 @@ State run_audio_direct(char key[64]){
         }
         ++mic_open_fails;return -1;
     };
+    // The call's voices go out as chat audio, so the console's "Output to headphones: chat audio" sends
+    // them to the headset while the game stays on the TV: the foreground user's VOICE port (type 2),
+    // else PERSONAL (3), else the system user's MAIN port (0) as before. On MAIN the console took them
+    // for game audio (with "chat audio" they went to the TV). An empty file `audio-port-main` next to
+    // worker.log forces MAIN.
+    int handle=-1;
+    {
+        int user=-1;
+        if(request.functions[UserGetForegroundUser]){
+            int u=-1;if(fn<UserForegroundCall>(UserGetForegroundUser)(&u)==0)user=u;}
+        const bool force_main=file_exists("audio-port-main");
+        struct Port{int user,type;const char* name;};
+        const Port ports[3]={{user,2,"voice"},{user,3,"personal"},{0xff,0,"main"}};
+        for(const Port& p:ports){
+            if(p.user<0||(force_main&&p.type!=0))continue;
+            handle=open(p.user,p.type,0,256,48000,1);
+            note("AUDIODIRECT open %s user=0x%x rc=0x%08x",p.name,unsigned(p.user),unsigned(handle));
+            if(handle>=0)break;}
+    }
+    if(handle<0){publish(State::Failed);return State::Failed;}
     alignas(64) std::int16_t mic_grain[256];
     int fd=-1;std::uint64_t next_try=0,last_data=0,connects=0;
     static std::uint8_t pending[32768];std::size_t pending_len=0; // ~170 ms of stereo, off the thread stack
