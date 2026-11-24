@@ -1238,18 +1238,19 @@ State run_audio_direct(char key[64]){
         }
         ++mic_open_fails;return -1;
     };
-    // Which output port plays the call. The system user's MAIN port (type 0) keeps playing while a game
-    // or app is in front, but the console takes it for game audio: with "Output to headphones: chat
-    // audio" the voices go to the TV. The foreground user's VOICE port (2) goes to the headset, but on
-    // 13.60 it is silent as soon as an app is in front, the Discord app included (console, 2026-11-24).
-    // So MAIN by default; an empty file next to worker.log picks another to try, MAIN still the fallback:
-    // `audio-port-personal` (PERSONAL, 3: the headset on the controller) or `audio-port-voice` (VOICE).
+    // Which output port plays the call (console, 13.60, 2026-11-24):
+    // - the foreground user's PERSONAL port (type 3), the default: with "Output to headphones: chat
+    //   audio" the voices go to the headset while the game stays on the TV, in a game and in the app;
+    // - the system user's MAIN port (0), the fallback: it plays under any app, but the console takes it
+    //   for game audio (with "chat audio" the voices went to the TV);
+    // - the user's VOICE port (2): headset too, but silent as soon as an app is in front.
+    // An empty file next to worker.log picks one: `audio-port-main` or `audio-port-voice`.
     int handle=-1;
     {
         int user=-1;
         if(request.functions[UserGetForegroundUser]){
             int u=-1;if(fn<UserForegroundCall>(UserGetForegroundUser)(&u)==0)user=u;}
-        const int wanted=file_exists("audio-port-main")?0:file_exists("audio-port-personal")?3:file_exists("audio-port-voice")?2:0;
+        const int wanted=file_exists("audio-port-main")?0:file_exists("audio-port-voice")?2:3;
         struct Port{int user,type;const char* name;};
         const Port ports[2]={{user,wanted,wanted==3?"personal":wanted==2?"voice":"main"},{0xff,0,"main"}};
         for(const Port& p:ports){

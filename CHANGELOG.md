@@ -144,11 +144,12 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
     is time-compressed by 1.6% above 8 KB instead of dropping grains (2 to 3 clicks a second); and
     the tap socket sets `TCP_NODELAY`: with Nagle on, the mic reached the core in 100 ms bursts
     whenever nobody was talking, which its 80 ms lag guard cut to 40% and replayed at double speed.
-  - Output port: on the system MAIN port the console takes the voices for game audio, so with "Output to
-    headphones: chat audio" they go to the TV. The foreground user's VOICE port sends them to the headset,
-    but on 13.60 it is silent as soon as an app is in front, the Discord app included (checked on the
-    console). MAIN stays the default; an empty file `audio-port-personal` or `audio-port-voice` next to
-    `worker.log` picks PERSONAL or VOICE to try (MAIN as the fallback, `audio-port-main` forces it).
+  - Output port: the worker plays the call on the foreground user's PERSONAL port, so with "Output to
+    headphones: chat audio" the voices go to the headset and the game stays on the TV, in a game and in
+    the app (checked on the console, 13.60). It used the system MAIN port, which the console takes for
+    game audio (with "chat audio" the voices went to the TV); MAIN stays the fallback. The user's VOICE
+    port also reaches the headset but is silent as soon as an app is in front. An empty file
+    `audio-port-main` or `audio-port-voice` next to `worker.log` picks that port instead.
   - Not covered: other firmware versions, other consoles, the stock `PPSA99072` build (it does not
     ship the worker), sessions of several hours.
 - Go Live: the default capture method is Remote Play (legacy) on every firmware but 13.00 and 13.60, where the
