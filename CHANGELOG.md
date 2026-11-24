@@ -95,8 +95,8 @@ Changes of the community fork (`Booskazed/ps5-discord`, branch `community`), on 
   jump itself is untouched; the original is the old address, so no trampoline is needed); every
   other target goes through the decoder as before. `worker.log` shows the bytes found for `Update`
   and `GamePad.GetData`, refused or not, and where a thunk leads. `overlay/tests/safety.cpp` covers
-  the thunk. Not yet run on the console; colours, button bits, fonts and labels are still
-  unchecked on 13.60.
+  the thunk, and the `test` workflow now runs the overlay's safety and worker suites. Not yet run on
+  the console; colours, button bits, fonts and labels are still unchecked on 13.60.
 - Voice while a game is in front, over a wireless controller (side-by-side `PPSA99073` build only;
   measured on firmware 13.60). The console ends the app when a game starts (`[SceLncService]
   KillApp()` in the kernel log; it does not suspend it) while the core keeps the call, and the sound
