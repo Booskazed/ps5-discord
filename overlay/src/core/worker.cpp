@@ -2229,15 +2229,19 @@ State run_native_tile_inject(){
             void* jobj=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,cargs,&ex):nullptr;
             if(ex){note("TILEINJECT convert exception");ex=nullptr;}
             if(jobj&&m_emit&&ctx){
-                // Primary path: emitDeviceEvent (direct to JS, works for any event name)
+                // Path 1: emitDeviceEvent (direct to Hermes/JS — populates React component data)
                 void* name_str=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
                 void* eargs[3]={ctx,name_str,jobj};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,eargs,&ex);
                 if(ex)note("TILEINJECT emitDeviceEvent exception");
                 else note("TILEINJECT emitDeviceEvent ok (count=%d)",++emit_count);
-            } else if(jobj&&vcm_inst){
-                // Fallback: VoiceChatModule handler dictionary (only for voiceChat* events)
+            }
+            if(jobj&&vcm_inst){
+                // Path 2: Mono handler dictionary → PartyStatusMonitor (controls tile visibility).
+                // Mode::TileDiscord always runs BOTH paths; running only emitDeviceEvent (path 1)
+                // populates the JS side but PartyStatusMonitor never marks the party as active.
+                if(emit_count<=1) tile_observe(vcm_inst,"before");
                 void* dict=*(void**)((char*)vcm_inst+16);
                 void* dclass=dict?fn<void*(*)(void*)>(ObjectClass)(dict):nullptr;
                 void* mitem=dclass?fn<void*(*)(void*,const char*,int)>(MethodFromName)(dclass,"get_Item",1):nullptr;
@@ -2251,8 +2255,10 @@ State run_native_tile_inject(){
                     void* vargs[2]={key2,jobj};ex=nullptr;
                     fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minvoke,handler,vargs,&ex);
                     note("TILEINJECT handler.Invoke %s (count=%d)",ex?"exception":"ok",++emit_count);
-                } else note("TILEINJECT no handler for %s in VoiceChatModule dict",evt_name);
-            } else note("TILEINJECT convert failed or no emission path");
+                    if(emit_count<=2) tile_observe(vcm_inst,"after");
+                } else if(emit_count<=1) note("TILEINJECT no handler for %s in VoiceChatModule dict",evt_name);
+            }
+            if(!jobj) note("TILEINJECT convert failed or no emission path");
         }
         usleep(2000000); // 2s between reads
     }
