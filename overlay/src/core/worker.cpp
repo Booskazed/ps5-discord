@@ -2194,6 +2194,40 @@ State run_native_tile_inject(){
     void* ex=nullptr;
     void* vcm_inst=m_getinst?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_getinst,nullptr,nullptr,&ex):nullptr;
     note("TILEINJECT VoiceChatModule(Mono) inst=%p",vcm_inst);
+    // Locate PartyStatusMonitor and pre-seed it: set m_isInParty=1 and add "discord-1" to
+    // m_joinedTargetChannels.  Offsets verified by tile_observe (32=m_isInParty, 24=m_joinedTargetChannels).
+    void* psm=nullptr;
+    if(vcm_inst){
+        void* d0=*(void**)((char*)vcm_inst+16);
+        void* d0c=d0?fn<void*(*)(void*)>(ObjectClass)(d0):nullptr;
+        void* d0gi=d0c?fn<void*(*)(void*,const char*,int)>(MethodFromName)(d0c,"get_Item",1):nullptr;
+        void* k0=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEvent");
+        void* a0[1]={k0};ex=nullptr;
+        void* h0=d0gi?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(d0gi,d0,a0,&ex):nullptr;
+        if(h0){
+            void* gt=nullptr;
+            for(void* w=fn<void*(*)(void*)>(ObjectClass)(h0);w&&!gt;w=fn<void*(*)(void*)>(ClassParent)(w))
+                gt=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"get_Target",0);
+            ex=nullptr;
+            psm=gt?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(gt,h0,nullptr,&ex):nullptr;}
+        if(psm){
+            void* pc=fn<void*(*)(void*)>(ObjectClass)(psm);
+            const char* cn=pc?fn<const char*(*)(void*)>(ClassNameGet)(pc):nullptr;
+            if(!cn||std::strcmp(cn,"PartyStatusMonitor")){note("TILEINJECT PSM class=%s (not PartyStatusMonitor)",cn?cn:"?");psm=nullptr;}
+            else{
+                note("TILEINJECT PSM=%p m_isInParty=%d",psm,int(*((unsigned char*)psm+32)));
+                *((unsigned char*)psm+32)=1;
+                note("TILEINJECT PSM m_isInParty forced to 1");
+                void* ch=*(void**)((char*)psm+24);
+                if(ch){void* chc=fn<void*(*)(void*)>(ObjectClass)(ch);
+                    void* madd=chc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(chc,"Add",1):nullptr;
+                    if(madd){void* ds=fn<void*(*)(void*,const char*)>(StringNew)(domain,"discord-1");
+                        void* aa[1]={ds};ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(madd,ch,aa,&ex);
+                        note("TILEINJECT PSM m_joinedTargetChannels.Add ex=%p",ex);}}
+            }
+        } else note("TILEINJECT PSM not found");
+    }
     // Read the event name (configurable, default voiceChatChannelEvent)
     char evt_name[64]="voiceChatChannelEvent";
     {char pth[256];
@@ -2257,6 +2291,17 @@ State run_native_tile_inject(){
                     note("TILEINJECT handler.Invoke %s (count=%d)",ex?"exception":"ok",++emit_count);
                     if(emit_count<=2) tile_observe(vcm_inst,"after");
                 } else if(emit_count<=1) note("TILEINJECT no handler for %s in VoiceChatModule dict",evt_name);
+            }
+            // Path 3: keep PartyStatusMonitor.m_isInParty=1 (the handler may reset it)
+            if(psm) *((unsigned char*)psm+32)=1;
+            // Path 4: also emit as partySessionListEventVshNMVoiceChat (the React-side event that
+            // PartySessionListProvider / ActionCardRealTimeCommunication listen for)
+            if(jobj&&m_emit&&ctx){
+                void* ps_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionListEventVshNMVoiceChat");
+                void* ps_args[3]={ctx,ps_name,jobj};
+                ex=nullptr;
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ps_args,&ex);
+                if(emit_count<=2) note("TILEINJECT partySessionList emit %s",ex?"exception":"ok");
             }
             if(!jobj) note("TILEINJECT convert failed or no emission path");
         }
