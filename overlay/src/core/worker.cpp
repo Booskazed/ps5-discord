@@ -2247,9 +2247,15 @@ State run_native_tile_inject(){
     // to learn how to run our own JS (addActionCard) in it. Pure reflection logging, invokes nothing.
     note("TILEINJECT JSBRIDGE probe start contexts=%d",ninst);
     for(int ci=0;ci<ninst;++ci)if(all_ctx[ci]){note("TILE JSBRIDGE === ctx[%d]=%p ===",ci,all_ctx[ci]);tile_dump_js_bridge(all_ctx[ci]);break;}
-    // Build A.2: look for the JavaScript Executor's eval/RunScript entry point.
-    tile_dump_class_methods("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll","ReactNative.JavaScriptCore","Executor");
-    tile_dump_class_methods("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll","ReactNative.Bridge","CatalystInstance");
+    // Build A.3: ReactContextImp._reactInstance (offset 16) is a ReactNative.Bridge.ReactInstance;
+    // dump how IT reaches JavaScript (RunScript/CallFunction/eval) and the fields it holds.
+    tile_dump_class_methods("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll","ReactNative.Bridge","ReactInstance");
+    if(all_ctx[0]){
+        void* ri=*(void**)((char*)all_ctx[0]+16);
+        note("TILE JSBRIDGE _reactInstance=%p",ri);
+        if(ri){void* ric=fn<void*(*)(void*)>(ObjectClass)(ri);const char* rcn=ric?fn<const char*(*)(void*)>(ClassNameGet)(ric):"?";
+            note("TILE JSBRIDGE _reactInstance runtime class=%s",rcn?rcn:"?");tile_dump_js_bridge(ri);}
+    }
     // Resolve the emission tools: ConvertJsonStringToJObject, ReactContext, EventEmitterUtility.emitDeviceEvent
     void* m_convert=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"ConvertJsonStringToJObject",1);
     void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
