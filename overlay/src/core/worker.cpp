@@ -2188,7 +2188,6 @@ State run_native_tile_inject(){
     }
     // Resolve the emission tools: ConvertJsonStringToJObject, ReactContext, EventEmitterUtility.emitDeviceEvent
     void* m_convert=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"ConvertJsonStringToJObject",1);
-    void* ctx=all_ctx[0];
     void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
     void* eu=cimg?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(cimg,"ReactNative.Vsh.Common","EventEmitterUtility"):nullptr;
     void* m_emit=eu?tile_find_method(eu,"emitDeviceEvent",3,"ReactNative.Bridge.ReactContext"):nullptr;
