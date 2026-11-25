@@ -2257,55 +2257,74 @@ State run_native_tile_inject(){
         if(json_len>2&&std::strcmp(json_buf,last_json)!=0){
             note("TILEINJECT new state (%d bytes), emitting events",json_len);
             std::memcpy(last_json,json_buf,sizeof last_json);
-            // Convert JSON string to JObject
-            void* js=fn<void*(*)(void*,const char*)>(StringNew)(domain,json_buf);
-            void* cargs[1]={js};ex=nullptr;
-            void* jobj=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,cargs,&ex):nullptr;
-            if(ex){note("TILEINJECT convert exception");ex=nullptr;}
-            // Path 0: voiceChatDaemonEventForAutoMounter — tells the AutoMounter to create/show the
-            // voice chat action card (ActionCardRealTimeCommunication). Found in HBC at the same
-            // location as SCE_RNPS_ACTION_CARDS_ERROR_VOICE_CHAT. Without this event, the AutoMounter
-            // never mounts the tile component, so data events have nothing to render into.
-            if(jobj&&m_emit&&ctx){
+            ++emit_count;
+            // Build differentiated payloads per event type. Each JS handler (AutoMounter,
+            // PartySessionListEventHandler, PartySessionEventHandler) expects a specific envelope;
+            // sending raw session data to all of them triggers "unknown party session list event".
+            // --- jobj_raw: the raw tile-state.json as JObject (for voiceChatChannelEvent) ---
+            void* js_raw=fn<void*(*)(void*,const char*)>(StringNew)(domain,json_buf);
+            void* ra[1]={js_raw};ex=nullptr;
+            void* jobj_raw=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,ra,&ex):nullptr;
+            if(ex){note("TILEINJECT convert raw exception");ex=nullptr;}
+            // --- jobj_daemon: minimal signal for the AutoMounter ---
+            void* js_d=fn<void*(*)(void*,const char*)>(StringNew)(domain,"{}");
+            void* da[1]={js_d};ex=nullptr;
+            void* jobj_daemon=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,da,&ex):nullptr;
+            if(ex){note("TILEINJECT convert daemon exception");ex=nullptr;}
+            // --- jobj_list: event envelope for PartySessionListEventHandler ---
+            char list_json[8192];
+            std::snprintf(list_json,sizeof list_json,
+                "{\"eventType\":\"created\",\"partySessions\":[%s]}",json_buf);
+            void* js_l=fn<void*(*)(void*,const char*)>(StringNew)(domain,list_json);
+            void* la[1]={js_l};ex=nullptr;
+            void* jobj_list=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,la,&ex):nullptr;
+            if(ex){note("TILEINJECT convert list exception");ex=nullptr;}
+            // --- jobj_sess: event envelope for PartySessionEventHandler ---
+            char sess_json[8192];
+            std::snprintf(sess_json,sizeof sess_json,
+                "{\"eventType\":\"created\",\"partySession\":%s}",json_buf);
+            void* js_s=fn<void*(*)(void*,const char*)>(StringNew)(domain,sess_json);
+            void* sa[1]={js_s};ex=nullptr;
+            void* jobj_sess=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,sa,&ex):nullptr;
+            if(ex){note("TILEINJECT convert sess exception");ex=nullptr;}
+            if(emit_count<=2) note("TILEINJECT payloads raw=%p daemon=%p list=%p sess=%p",jobj_raw,jobj_daemon,jobj_list,jobj_sess);
+            // Path 0: voiceChatDaemonEventForAutoMounter — minimal signal to create/show the tile
+            if(jobj_daemon&&m_emit&&ctx){
                 void* am_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventForAutoMounter");
-                void* am_args[3]={ctx,am_name,jobj};
+                void* am_args[3]={ctx,am_name,jobj_daemon};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,am_args,&ex);
                 if(emit_count<=2) note("TILEINJECT autoMounter emit %s",ex?"exception":"ok");
             }
-            if(jobj&&m_emit&&ctx){
-                // Path 1: emitDeviceEvent (direct to Hermes/JS — populates React component data)
+            // Path 1: voiceChatChannelEvent with raw session data (PartyStatusMonitor via JS)
+            if(jobj_raw&&m_emit&&ctx){
                 void* name_str=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
-                void* eargs[3]={ctx,name_str,jobj};
+                void* eargs[3]={ctx,name_str,jobj_raw};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,eargs,&ex);
-                if(ex)note("TILEINJECT emitDeviceEvent exception");
-                else note("TILEINJECT emitDeviceEvent ok (count=%d)",++emit_count);
+                if(emit_count<=2) note("TILEINJECT voiceChatChannel emit %s",ex?"exception":"ok");
             }
-            // Path 2 (handler.Invoke) SKIPPED: the voiceChatChannelEvent handler (PartyStatusMonitor)
-            // parses the JObject expecting SceVoiceChatChannelEvent struct fields; our party-session
-            // JSON doesn't match, so the handler resets m_isInParty to 0, undoing our direct write.
+            // Path 2 (handler.Invoke) SKIPPED: resets m_isInParty
             // Path 3: keep PartyStatusMonitor.m_isInParty=1
             if(psm){*((unsigned char*)psm+32)=1;
                 if(emit_count<=1) tile_observe(vcm_inst,"after-force");}
-            // Path 4: partySessionListEventVshNMVoiceChat (PartySessionListProvider data)
-            if(jobj&&m_emit&&ctx){
+            // Path 4: partySessionListEventVshNMVoiceChat with "created" envelope
+            if(jobj_list&&m_emit&&ctx){
                 void* ps_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionListEventVshNMVoiceChat");
-                void* ps_args[3]={ctx,ps_name,jobj};
+                void* ps_args[3]={ctx,ps_name,jobj_list};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ps_args,&ex);
                 if(emit_count<=2) note("TILEINJECT partySessionList emit %s",ex?"exception":"ok");
             }
-            // Path 5: partySessionEventVshNMVoiceChat (individual session event, different handler
-            // than the List variant — found in HBC near PartySessionEventHandler)
-            if(jobj&&m_emit&&ctx){
+            // Path 5: partySessionEventVshNMVoiceChat with "created" envelope
+            if(jobj_sess&&m_emit&&ctx){
                 void* pe_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionEventVshNMVoiceChat");
-                void* pe_args[3]={ctx,pe_name,jobj};
+                void* pe_args[3]={ctx,pe_name,jobj_sess};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,pe_args,&ex);
                 if(emit_count<=2) note("TILEINJECT partySessionEvent emit %s",ex?"exception":"ok");
             }
-            if(!jobj) note("TILEINJECT convert failed or no emission path");
+            if(!jobj_raw&&!jobj_list) note("TILEINJECT convert failed or no emission path");
         }
         usleep(2000000); // 2s between reads
     }
