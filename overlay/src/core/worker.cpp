@@ -2194,6 +2194,50 @@ State run_native_tile_inject(){
     void* ex=nullptr;
     void* vcm_inst=m_getinst?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_getinst,nullptr,nullptr,&ex):nullptr;
     note("TILEINJECT VoiceChatModule(Mono) inst=%p",vcm_inst);
+    // Diagnostic: enumerate ALL keys in the voiceChatModuleEventHandlerDic (vcm_inst offset 16)
+    if(vcm_inst){
+        void* ehd=*(void**)((char*)vcm_inst+16);
+        if(ehd){
+            void* edc=fn<void*(*)(void*)>(ObjectClass)(ehd);
+            void* mgk=edc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(edc,"get_Keys",0):nullptr;
+            void* ex2=nullptr;
+            void* keys=mgk?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mgk,ehd,nullptr,&ex2):nullptr;
+            if(keys){
+                void* kc=fn<void*(*)(void*)>(ObjectClass)(keys);
+                void* me=kc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(kc,"GetEnumerator",0):nullptr;
+                ex2=nullptr;
+                void* en=me?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(me,keys,nullptr,&ex2):nullptr;
+                if(en){
+                    void* ec=fn<void*(*)(void*)>(ObjectClass)(en);
+                    void* mmn=nullptr;void* mcur=nullptr;
+                    for(void* w=ec;w;w=fn<void*(*)(void*)>(ClassParent)(w)){
+                        if(!mmn)mmn=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"MoveNext",0);
+                        if(!mcur)mcur=fn<void*(*)(void*,const char*,int)>(MethodFromName)(w,"get_Current",0);}
+                    int nk=0;
+                    while(mmn){
+                        ex2=nullptr;
+                        void* mr=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mmn,en,nullptr,&ex2);
+                        if(!mr||!*(unsigned char*)((char*)mr+16))break;
+                        ex2=nullptr;
+                        void* cur=mcur?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mcur,en,nullptr,&ex2):nullptr;
+                        if(cur){
+                            int slen=*(int*)((char*)cur+16);const unsigned short* su=(const unsigned short*)((char*)cur+20);
+                            char buf[128];int w2=0;for(int j=0;j<slen&&j<int(sizeof buf)-1;++j)buf[w2++]=(su[j]<0x80)?char(su[j]):'?';buf[w2]='\0';
+                            // Also get the handler for this key
+                            void* mgi=edc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(edc,"get_Item",1):nullptr;
+                            void* ka[1]={cur};ex2=nullptr;
+                            void* hv=mgi?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mgi,ehd,ka,&ex2):nullptr;
+                            const char* hcn="?";
+                            if(hv){void* hvc=fn<void*(*)(void*)>(ObjectClass)(hv);hcn=hvc?fn<const char*(*)(void*)>(ClassNameGet)(hvc):"?";}
+                            note("TILEINJECT dict[%d]=\"%s\" handler=%s",nk,buf,hcn);
+                        }
+                        ++nk;if(nk>20)break;
+                    }
+                    note("TILEINJECT dict has %d keys",nk);
+                }
+            } else note("TILEINJECT dict keys=null");
+        } else note("TILEINJECT dict=null");
+    }
     // Locate PartyStatusMonitor and pre-seed it: set m_isInParty=1 and add "discord-1" to
     // m_joinedTargetChannels.  Offsets verified by tile_observe (32=m_isInParty, 24=m_joinedTargetChannels).
     void* psm=nullptr;
@@ -2286,29 +2330,90 @@ State run_native_tile_inject(){
             void* jobj_channel=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,ca,&ex):nullptr;
             if(ex){note("TILEINJECT convert channel exception");ex=nullptr;}
             if(emit_count<=2) note("TILEINJECT payloads daemon=%p channel=%p",jobj_daemon,jobj_channel);
-            // Path A: voiceChatDaemonEvent "init" — tells JS the voice daemon is active
+            // Path A: voiceChatDaemonEvent "init" — tells Mono the voice daemon is active
             if(jobj_daemon&&m_emit&&ctx){
                 void* dn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEvent");
                 void* dargs[3]={ctx,dn,jobj_daemon};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,dargs,&ex);
-                if(emit_count<=2) note("TILEINJECT daemon init emit %s",ex?"exception":"ok");
+                if(emit_count<=2) note("TILEINJECT A daemon emit %s",ex?"exception":"ok");
             }
-            // Path B: voiceChatChannelEvent "sessionUpdated" with DISCORD channel
+            // Path B: voiceChatChannelEvent "sessionUpdated" — tells Mono about the Discord channel
             if(jobj_channel&&m_emit&&ctx){
-                void* cn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEvent");
-                void* cargs[3]={ctx,cn,jobj_channel};
+                void* cn2=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEvent");
+                void* cargs[3]={ctx,cn2,jobj_channel};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,cargs,&ex);
-                if(emit_count<=2) note("TILEINJECT channel sessionUpdated emit %s",ex?"exception":"ok");
+                if(emit_count<=2) note("TILEINJECT B channel emit %s",ex?"exception":"ok");
             }
-            // Path C: also emit to voiceChatDaemonEventForAutoMounter as fallback
+            // Path C: voiceChatDaemonEventForAutoMounter — JS AutoMounter trigger
             if(jobj_daemon&&m_emit&&ctx){
                 void* an=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventForAutoMounter");
                 void* aargs[3]={ctx,an,jobj_daemon};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,aargs,&ex);
-                if(emit_count<=2) note("TILEINJECT autoMounter fallback emit %s",ex?"exception":"ok");
+                if(emit_count<=2) note("TILEINJECT C autoMounter emit %s",ex?"exception":"ok");
+            }
+            // Path E: partySessionListEventVshNMVoiceChat — the JS event name for session list updates.
+            // This is the name JS actually subscribes to (confirmed: reached JS in a prior test).
+            // Use "sessionCreated" as header.type since we're declaring a new Discord session exists.
+            if(m_emit&&ctx&&m_convert){
+                static const char psl_json[]=
+                    "{\"header\":{\"type\":\"sessionCreated\"},\"data\":{\"channels\":["
+                    "{\"channelType\":\"DISCORD\",\"channelId\":\"discord-1\","
+                    "\"activeChannelId\":\"discord-1\"}]}}";
+                void* js_psl=fn<void*(*)(void*,const char*)>(StringNew)(domain,psl_json);
+                void* pa[1]={js_psl};ex=nullptr;
+                void* jobj_psl=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,pa,&ex);
+                if(jobj_psl){
+                    void* pn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionListEventVshNMVoiceChat");
+                    void* pargs[3]={ctx,pn,jobj_psl};
+                    ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,pargs,&ex);
+                    if(emit_count<=2) note("TILEINJECT E partySessionList emit %s",ex?"exception":"ok");
+                }
+            }
+            // Path F: partySessionEventVshNMVoiceChat — individual session event
+            if(m_emit&&ctx&&m_convert){
+                static const char pse_json[]=
+                    "{\"header\":{\"type\":\"sessionCreated\"},\"data\":{\"channels\":["
+                    "{\"channelType\":\"DISCORD\",\"channelId\":\"discord-1\","
+                    "\"activeChannelId\":\"discord-1\"}]}}";
+                void* js_pse=fn<void*(*)(void*,const char*)>(StringNew)(domain,pse_json);
+                void* qa[1]={js_pse};ex=nullptr;
+                void* jobj_pse=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,qa,&ex);
+                if(jobj_pse){
+                    void* qn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionEventVshNMVoiceChat");
+                    void* qargs[3]={ctx,qn,jobj_pse};
+                    ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,qargs,&ex);
+                    if(emit_count<=2) note("TILEINJECT F partySessionEvent emit %s",ex?"exception":"ok");
+                }
+            }
+            // Path G: invoke the voiceChatModuleEventHandlerDic handlers directly.
+            // This dispatches through the Sce.Vsh VoiceChatModule's OWN event system,
+            // which is how the real daemon events reach SharePlayManager and PartyStatusMonitor.
+            if(vcm_inst){
+                void* ehd=*(void**)((char*)vcm_inst+16);
+                void* edc=ehd?fn<void*(*)(void*)>(ObjectClass)(ehd):nullptr;
+                void* mgi2=edc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(edc,"get_Item",1):nullptr;
+                static const char* const dk[]={"voiceChatDaemonEvent","voiceChatChannelEvent"};
+                void* const dv[]={jobj_daemon,jobj_channel};
+                for(int di=0;di<2;++di){
+                    if(!dv[di]||!mgi2)continue;
+                    void* dkey=fn<void*(*)(void*,const char*)>(StringNew)(domain,dk[di]);
+                    void* dka[1]={dkey};ex=nullptr;
+                    void* handler=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mgi2,ehd,dka,&ex);
+                    if(!handler){if(emit_count<=2) note("TILEINJECT G %s no handler",dk[di]);continue;}
+                    void* minv=nullptr;
+                    for(void* wk=fn<void*(*)(void*)>(ObjectClass)(handler);wk&&!minv;wk=fn<void*(*)(void*)>(ClassParent)(wk))
+                        minv=fn<void*(*)(void*,const char*,int)>(MethodFromName)(wk,"Invoke",1);
+                    if(minv){
+                        void* iva[1]={dv[di]};ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minv,handler,iva,&ex);
+                        if(emit_count<=2) note("TILEINJECT G %s invoke %s",dk[di],ex?"exception":"ok");
+                    } else if(emit_count<=2) note("TILEINJECT G %s no Invoke method",dk[di]);
+                }
             }
             // Path D: keep PartyStatusMonitor.m_isInParty=1
             if(psm){*((unsigned char*)psm+32)=1;
