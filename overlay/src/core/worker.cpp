@@ -2255,13 +2255,24 @@ State run_native_tile_inject(){
                  if(n<0)n=0;json_buf[n]='\0';json_len=int(n);
                  std::fclose(f);}}}
         if(json_len>2&&std::strcmp(json_buf,last_json)!=0){
-            note("TILEINJECT new state (%d bytes), emitting event %s",json_len,evt_name);
+            note("TILEINJECT new state (%d bytes), emitting events",json_len);
             std::memcpy(last_json,json_buf,sizeof last_json);
             // Convert JSON string to JObject
             void* js=fn<void*(*)(void*,const char*)>(StringNew)(domain,json_buf);
             void* cargs[1]={js};ex=nullptr;
             void* jobj=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,cargs,&ex):nullptr;
             if(ex){note("TILEINJECT convert exception");ex=nullptr;}
+            // Path 0: voiceChatDaemonEventForAutoMounter — tells the AutoMounter to create/show the
+            // voice chat action card (ActionCardRealTimeCommunication). Found in HBC at the same
+            // location as SCE_RNPS_ACTION_CARDS_ERROR_VOICE_CHAT. Without this event, the AutoMounter
+            // never mounts the tile component, so data events have nothing to render into.
+            if(jobj&&m_emit&&ctx){
+                void* am_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventForAutoMounter");
+                void* am_args[3]={ctx,am_name,jobj};
+                ex=nullptr;
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,am_args,&ex);
+                if(emit_count<=2) note("TILEINJECT autoMounter emit %s",ex?"exception":"ok");
+            }
             if(jobj&&m_emit&&ctx){
                 // Path 1: emitDeviceEvent (direct to Hermes/JS — populates React component data)
                 void* name_str=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
@@ -2277,14 +2288,22 @@ State run_native_tile_inject(){
             // Path 3: keep PartyStatusMonitor.m_isInParty=1
             if(psm){*((unsigned char*)psm+32)=1;
                 if(emit_count<=1) tile_observe(vcm_inst,"after-force");}
-            // Path 4: also emit as partySessionListEventVshNMVoiceChat (the React-side event that
-            // PartySessionListProvider / ActionCardRealTimeCommunication listen for)
+            // Path 4: partySessionListEventVshNMVoiceChat (PartySessionListProvider data)
             if(jobj&&m_emit&&ctx){
                 void* ps_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionListEventVshNMVoiceChat");
                 void* ps_args[3]={ctx,ps_name,jobj};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ps_args,&ex);
                 if(emit_count<=2) note("TILEINJECT partySessionList emit %s",ex?"exception":"ok");
+            }
+            // Path 5: partySessionEventVshNMVoiceChat (individual session event, different handler
+            // than the List variant — found in HBC near PartySessionEventHandler)
+            if(jobj&&m_emit&&ctx){
+                void* pe_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionEventVshNMVoiceChat");
+                void* pe_args[3]={ctx,pe_name,jobj};
+                ex=nullptr;
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,pe_args,&ex);
+                if(emit_count<=2) note("TILEINJECT partySessionEvent emit %s",ex?"exception":"ok");
             }
             if(!jobj) note("TILEINJECT convert failed or no emission path");
         }
