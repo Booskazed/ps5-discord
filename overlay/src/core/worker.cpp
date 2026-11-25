@@ -2199,6 +2199,8 @@ State run_native_tile_inject(){
         void* ehd=*(void**)((char*)vcm_inst+16);
         if(ehd){
             void* edc=fn<void*(*)(void*)>(ObjectClass)(ehd);
+            const char* dcn=edc?fn<const char*(*)(void*)>(ClassNameGet)(edc):"?";
+            note("TILEINJECT dict class=%s",dcn);
             void* mgk=edc?fn<void*(*)(void*,const char*,int)>(MethodFromName)(edc,"get_Keys",0):nullptr;
             void* ex2=nullptr;
             void* keys=mgk?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mgk,ehd,nullptr,&ex2):nullptr;
@@ -2311,7 +2313,7 @@ State run_native_tile_inject(){
             // PartySessionList updates internally — we don't need to emit to secondary event names.
             // --- jobj_daemon: daemon init event (triggers AutoMounter + voice system) ---
             static const char daemon_json[]=
-                "{\"header\":{\"type\":\"init\"},\"data\":{\"errorCode\":0,\"daemonState\":1,"
+                "{\"header\":{\"type\":\"started\"},\"data\":{\"errorCode\":0,\"daemonState\":1,"
                 "\"isMicConnected\":true,\"isMicMuted\":false,\"isConnectionLost\":false,"
                 "\"connectionStateChanged\":false,\"sharePartyAudio\":false,"
                 "\"sharePartyAudioForGls\":false,\"sharePartyAudioForRec\":false}}";
@@ -2391,8 +2393,6 @@ State run_native_tile_inject(){
                 }
             }
             // Path G: invoke the voiceChatModuleEventHandlerDic handlers directly.
-            // This dispatches through the Sce.Vsh VoiceChatModule's OWN event system,
-            // which is how the real daemon events reach SharePlayManager and PartyStatusMonitor.
             if(vcm_inst){
                 void* ehd=*(void**)((char*)vcm_inst+16);
                 void* edc=ehd?fn<void*(*)(void*)>(ObjectClass)(ehd):nullptr;
@@ -2405,14 +2405,50 @@ State run_native_tile_inject(){
                     void* dka[1]={dkey};ex=nullptr;
                     void* handler=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(mgi2,ehd,dka,&ex);
                     if(!handler){if(emit_count<=2) note("TILEINJECT G %s no handler",dk[di]);continue;}
-                    void* minv=nullptr;
-                    for(void* wk=fn<void*(*)(void*)>(ObjectClass)(handler);wk&&!minv;wk=fn<void*(*)(void*)>(ClassParent)(wk))
-                        minv=fn<void*(*)(void*,const char*,int)>(MethodFromName)(wk,"Invoke",1);
-                    if(minv){
+                    void* hclass=fn<void*(*)(void*)>(ObjectClass)(handler);
+                    const char* hcn=hclass?fn<const char*(*)(void*)>(ClassNameGet)(hclass):"?";
+                    if(emit_count<=2) note("TILEINJECT G %s handler class=%s",dk[di],hcn);
+                    // Try Invoke with 0, 1, 2 params and DynamicInvoke
+                    void* minv0=nullptr;void* minv1=nullptr;void* minv2=nullptr;void* mdyn=nullptr;
+                    for(void* wk=hclass;wk;wk=fn<void*(*)(void*)>(ClassParent)(wk)){
+                        if(!minv0)minv0=fn<void*(*)(void*,const char*,int)>(MethodFromName)(wk,"Invoke",0);
+                        if(!minv1)minv1=fn<void*(*)(void*,const char*,int)>(MethodFromName)(wk,"Invoke",1);
+                        if(!minv2)minv2=fn<void*(*)(void*,const char*,int)>(MethodFromName)(wk,"Invoke",2);
+                        if(!mdyn)mdyn=fn<void*(*)(void*,const char*,int)>(MethodFromName)(wk,"DynamicInvoke",1);}
+                    if(emit_count<=2) note("TILEINJECT G %s Invoke(0)=%p (1)=%p (2)=%p DynInvoke=%p",dk[di],minv0,minv1,minv2,mdyn);
+                    if(minv2){
+                        void* iva[2]={nullptr,dv[di]};ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minv2,handler,iva,&ex);
+                        if(emit_count<=2) note("TILEINJECT G %s Invoke(2) %s",dk[di],ex?"exception":"ok");
+                    }
+                    if(minv1){
                         void* iva[1]={dv[di]};ex=nullptr;
-                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minv,handler,iva,&ex);
-                        if(emit_count<=2) note("TILEINJECT G %s invoke %s",dk[di],ex?"exception":"ok");
-                    } else if(emit_count<=2) note("TILEINJECT G %s no Invoke method",dk[di]);
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minv1,handler,iva,&ex);
+                        if(emit_count<=2) note("TILEINJECT G %s Invoke(1) %s",dk[di],ex?"exception":"ok");
+                    }
+                    if(minv0&&!minv1&&!minv2){
+                        ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(minv0,handler,nullptr,&ex);
+                        if(emit_count<=2) note("TILEINJECT G %s Invoke(0) %s",dk[di],ex?"exception":"ok");
+                    }
+                    if(mdyn&&emit_count<=2) note("TILEINJECT G %s DynamicInvoke available but array alloc not impl",dk[di]);
+                }
+            }
+            // Path H: call OnDaemonEvent / OnChannelEvent on the Sce.Vsh VoiceChatModule directly.
+            // This is the managed entry point that the native P/Invoke callback triggers.
+            if(vcm_inst&&vcm_class){
+                void* m_ode=fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,"OnDaemonEvent",1);
+                void* m_oce=fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,"OnChannelEvent",1);
+                if(emit_count<=2) note("TILEINJECT H OnDaemonEvent=%p OnChannelEvent=%p",m_ode,m_oce);
+                if(m_ode&&jobj_daemon){
+                    void* ha[1]={jobj_daemon};ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_ode,vcm_inst,ha,&ex);
+                    if(emit_count<=2) note("TILEINJECT H OnDaemonEvent %s",ex?"exception":"ok");
+                }
+                if(m_oce&&jobj_channel){
+                    void* ha[1]={jobj_channel};ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_oce,vcm_inst,ha,&ex);
+                    if(emit_count<=2) note("TILEINJECT H OnChannelEvent %s",ex?"exception":"ok");
                 }
             }
             // Path D: keep PartyStatusMonitor.m_isInParty=1
