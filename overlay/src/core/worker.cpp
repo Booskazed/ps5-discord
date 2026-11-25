@@ -2392,6 +2392,26 @@ State run_native_tile_inject(){
                     if(emit_count<=2) note("TILEINJECT F partySessionEvent emit %s",ex?"exception":"ok");
                 }
             }
+            // Path I: voiceChatDaemonEventVshNMVoiceChat — the REAL JS event name with VshNM module suffix.
+            // All 9 confirmed JS event names use this suffix pattern. The native module emits
+            // "voiceChatDaemonEvent" and the RN bridge adds "VshNMVoiceChat". Since we bypass the
+            // bridge, we must add the suffix ourselves. This name doesn't appear as a literal in HBC
+            // because JS constructs it dynamically from the module name.
+            if(jobj_daemon&&m_emit&&ctx){
+                void* in1=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventVshNMVoiceChat");
+                void* ia1[3]={ctx,in1,jobj_daemon};
+                ex=nullptr;
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ia1,&ex);
+                if(emit_count<=2) note("TILEINJECT I daemonVshNM emit %s",ex?"exception":"ok");
+            }
+            // Path J: voiceChatChannelEventVshNMVoiceChat — channel event with VshNM suffix
+            if(jobj_channel&&m_emit&&ctx){
+                void* jn1=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEventVshNMVoiceChat");
+                void* ja1[3]={ctx,jn1,jobj_channel};
+                ex=nullptr;
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ja1,&ex);
+                if(emit_count<=2) note("TILEINJECT J channelVshNM emit %s",ex?"exception":"ok");
+            }
             // Path G: invoke the voiceChatModuleEventHandlerDic handlers directly.
             if(vcm_inst){
                 void* ehd=*(void**)((char*)vcm_inst+16);
@@ -2436,19 +2456,31 @@ State run_native_tile_inject(){
             }
             // Path H: call OnDaemonEvent / OnChannelEvent on the Sce.Vsh VoiceChatModule directly.
             // This is the managed entry point that the native P/Invoke callback triggers.
+            // Try with 0, 1, and 2 params since we don't know the exact signature.
             if(vcm_inst&&vcm_class){
-                void* m_ode=fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,"OnDaemonEvent",1);
-                void* m_oce=fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,"OnChannelEvent",1);
-                if(emit_count<=2) note("TILEINJECT H OnDaemonEvent=%p OnChannelEvent=%p",m_ode,m_oce);
-                if(m_ode&&jobj_daemon){
-                    void* ha[1]={jobj_daemon};ex=nullptr;
-                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_ode,vcm_inst,ha,&ex);
-                    if(emit_count<=2) note("TILEINJECT H OnDaemonEvent %s",ex?"exception":"ok");
-                }
-                if(m_oce&&jobj_channel){
-                    void* ha[1]={jobj_channel};ex=nullptr;
-                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_oce,vcm_inst,ha,&ex);
-                    if(emit_count<=2) note("TILEINJECT H OnChannelEvent %s",ex?"exception":"ok");
+                static const char* const hnames[]={"OnDaemonEvent","OnChannelEvent"};
+                void* const hdata[]={jobj_daemon,jobj_channel};
+                for(int hi=0;hi<2;++hi){
+                    if(!hdata[hi])continue;
+                    void* m0=fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,hnames[hi],0);
+                    void* m1=fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,hnames[hi],1);
+                    void* m2=fn<void*(*)(void*,const char*,int)>(MethodFromName)(vcm_class,hnames[hi],2);
+                    if(emit_count<=2) note("TILEINJECT H %s (0)=%p (1)=%p (2)=%p",hnames[hi],m0,m1,m2);
+                    if(m1){
+                        void* ha[1]={hdata[hi]};ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m1,vcm_inst,ha,&ex);
+                        if(emit_count<=2) note("TILEINJECT H %s(1) %s",hnames[hi],ex?"exception":"ok");
+                    }
+                    if(m2){
+                        void* ha[2]={nullptr,hdata[hi]};ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m2,vcm_inst,ha,&ex);
+                        if(emit_count<=2) note("TILEINJECT H %s(2) %s",hnames[hi],ex?"exception":"ok");
+                    }
+                    if(m0&&!m1&&!m2){
+                        ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m0,vcm_inst,nullptr,&ex);
+                        if(emit_count<=2) note("TILEINJECT H %s(0) %s",hnames[hi],ex?"exception":"ok");
+                    }
                 }
             }
             // Path D: keep PartyStatusMonitor.m_isInParty=1
