@@ -2408,13 +2408,26 @@ State run_native_tile_inject(){
                     }
                 }
             }
-            // Also emit bare-name events (original Path A/B) on ctx[0] for backward compat
-            if(jobj_daemon&&m_emit&&ctx){
-                void* dn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEvent");
-                void* dargs[3]={ctx,dn,jobj_daemon};
-                ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,dargs,&ex);
-                if(emit_count<=2) note("TILEINJECT A daemon emit %s",ex?"exception":"ok");
+            // Bare-name emission (the CORRECT event names for JS — the VshNM-suffixed versions
+            // voiceChatDaemonEventVshNMVoiceChat / voiceChatChannelEventVshNMVoiceChat do NOT exist
+            // in the HBC string table, so the JS code never listens on them).
+            for(int ci=0;ci<ninst;++ci){
+                void* cctx=all_ctx[ci];
+                if(!cctx)continue;
+                if(jobj_daemon&&m_emit){
+                    void* dn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEvent");
+                    void* dargs[3]={cctx,dn,jobj_daemon};
+                    ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,dargs,&ex);
+                    if(emit_count<=2) note("TILEINJECT A ctx[%d] daemon %s",ci,ex?"exception":"ok");
+                }
+                if(jobj_channel&&m_emit){
+                    void* cn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEvent");
+                    void* cargs2[3]={cctx,cn,jobj_channel};
+                    ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,cargs2,&ex);
+                    if(emit_count<=2) note("TILEINJECT B ctx[%d] channel %s",ci,ex?"exception":"ok");
+                }
             }
             // Path G: invoke the voiceChatModuleEventHandlerDic handlers directly.
             if(vcm_inst){
