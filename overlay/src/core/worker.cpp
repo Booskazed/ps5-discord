@@ -1851,6 +1851,39 @@ void tile_dump_js_bridge(void* ctx){
                 if(pt)p0=fn<const char*(*)(void*)>(TypeName)(pt);}
             note("TILE JSBRIDGE %s::%s(%u) p0=%s",cn?cn:"?",n,pc,p0?p0:"");
         }
+        // Fields that may point to the bridge / JS executor / catalyst instance (how to reach the JS engine).
+        void* fiter=nullptr;
+        for(int i=0;i<1024;++i){
+            void* f=fn<void*(*)(void*,void**)>(ClassFields)(w,&fiter);if(!f)break;
+            const char* fnm=fn<const char*(*)(void*)>(FieldName)(f);if(!fnm)continue;
+            if(!(std::strstr(fnm,"atalyst")||std::strstr(fnm,"xecutor")||std::strstr(fnm,"ridge")||
+                 std::strstr(fnm,"nstance")||std::strstr(fnm,"ngine")||std::strstr(fnm,"untime")))continue;
+            void* ft=fn<void*(*)(void*)>(FieldType)(f);
+            const char* ftn=ft?fn<const char*(*)(void*)>(TypeName)(ft):"";
+            note("TILE JSBRIDGE field %s::%s @%u type=%s",cn?cn:"?",fnm,fn<unsigned(*)(void*)>(FieldOffset)(f),ftn?ftn:"");
+        }
+    }
+}
+// Build A.2 (read-only): log every method of a named class (e.g. the JavaScript Executor), to find an
+// eval/RunScript entry point we can call with a JS string. Logs only.
+void tile_dump_class_methods(const char* asm_path,const char* ns,const char* name){
+    void* img=image(asm_path);
+    void* k=img?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(img,ns,name):nullptr;
+    note("TILE EXECDUMP %s.%s img=%p class=%p",ns,name,img,k);
+    if(!k)return;
+    for(void* w=k;w;w=fn<void*(*)(void*)>(ClassParent)(w)){
+        const char* cn=fn<const char*(*)(void*)>(ClassNameGet)(w);
+        void* it=nullptr;
+        for(int i=0;i<1024;++i){
+            void* m=fn<void*(*)(void*,void**)>(ClassMethods)(w,&it);if(!m)break;
+            const char* n=fn<const char*(*)(void*)>(MethodName)(m);if(!n)continue;
+            void* sig=fn<void*(*)(void*)>(MethodSignature)(m);
+            unsigned pc=sig?fn<unsigned(*)(void*)>(SignatureCount)(sig):0u;
+            const char* p0="";
+            if(sig&&pc){void* it2=nullptr;void* pt=fn<void*(*)(void*,void**)>(SignatureParams)(sig,&it2);
+                if(pt)p0=fn<const char*(*)(void*)>(TypeName)(pt);}
+            note("TILE EXECDUMP %s::%s(%u) p0=%s",cn?cn:"?",n,pc,p0?p0:"");
+        }
     }
 }
 // Ground-truth native event: instead of guessing the layout, let the runtime build it. A managed
@@ -2214,6 +2247,9 @@ State run_native_tile_inject(){
     // to learn how to run our own JS (addActionCard) in it. Pure reflection logging, invokes nothing.
     note("TILEINJECT JSBRIDGE probe start contexts=%d",ninst);
     for(int ci=0;ci<ninst;++ci)if(all_ctx[ci]){note("TILE JSBRIDGE === ctx[%d]=%p ===",ci,all_ctx[ci]);tile_dump_js_bridge(all_ctx[ci]);break;}
+    // Build A.2: look for the JavaScript Executor's eval/RunScript entry point.
+    tile_dump_class_methods("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll","ReactNative.JavaScriptCore","Executor");
+    tile_dump_class_methods("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll","ReactNative.Bridge","CatalystInstance");
     // Resolve the emission tools: ConvertJsonStringToJObject, ReactContext, EventEmitterUtility.emitDeviceEvent
     void* m_convert=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"ConvertJsonStringToJObject",1);
     void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
