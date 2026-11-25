@@ -2663,7 +2663,7 @@ std::atomic<RunScriptFn> cc_runscript_original{nullptr};
 std::atomic<ConsoleLogFn> cc_consolelog_original{nullptr};
 void* cc_eval_method=nullptr; // JSJavaScriptExecutor.EvalScript (private), resolved before install
 int cc_eval_argc=2;
-std::atomic<int> cc_injected{0},cc_console_lines{0};
+std::atomic<int> cc_injected{0},cc_console_lines{0},cc_runscript_seen{0};
 // The method's prologue already carries a detour: a foreign "jmp [rip+0]" (FF 25, ZhiThemes
 // style) or our own "movabs rax,imm64; jmp rax" (48 B8 ... FF E0). Either way we must not hook
 // again (a second worker over a live one, or ZhiThemes still loaded): it would chain and crash.
@@ -2731,10 +2731,13 @@ void cc_eval_file(Object* self){
     note("CCTILE EvalScript ok src=%ld esc=%zu executor=%p",sz,elen,(void*)self);}
 void cc_runscript_hook(Object* self,Object* bundle){
     RunScriptFn prior=cc_runscript_original.load(std::memory_order_acquire);
-    if(bundle&&self&&cc_eval_method){
+    if(bundle&&self){
         void* bp=cc_bundle_path(bundle);
-        if(bp&&cc_string_has(bp,"NPXS40003")){
-            char b[160];cc_string_ascii(bp,b,sizeof b);note("CCTILE RunScript CC bundle=%s",b);
+        char b[200];cc_string_ascii(bp,b,sizeof b);
+        int seen=cc_runscript_seen.fetch_add(1,std::memory_order_relaxed)+1;
+        if(seen<=40)note("CCTILE RunScript[#%d] self=%p bundle=%s",seen,(void*)self,b);
+        if(cc_eval_method&&bp&&cc_string_has(bp,"NPXS40003")){
+            note("CCTILE >>> Control Center detected, injecting cc-tile.js");
             cc_eval_file(self);}}
     if(prior)prior(self,bundle);}
 void cc_consolelog_hook(Object* msg,int level,Object* err,Object* arg){
