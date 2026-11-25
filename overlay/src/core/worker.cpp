@@ -1829,6 +1829,30 @@ void* tile_find_method(void* klass,const char* name,int count,const char* first_
         return m;}
     return nullptr;
 }
+// Build A (read-only): log the JavaScript-bridge surface of a ReactContext — every method its class and
+// base classes expose whose name hints at reaching JavaScript (GetJavaScriptModule, the JS Executor,
+// Call/Invoke/Eval/RunScript...). Logs only, invokes nothing: this finds the door to run our own JS
+// (ensureActionCardHost/addActionCard) inside the Control Center, with no PSN and no native Discord.
+void tile_dump_js_bridge(void* ctx){
+    if(!ctx)return;
+    for(void* w=fn<void*(*)(void*)>(ObjectClass)(ctx);w;w=fn<void*(*)(void*)>(ClassParent)(w)){
+        const char* cn=fn<const char*(*)(void*)>(ClassNameGet)(w);
+        void* iter=nullptr;
+        for(int i=0;i<1024;++i){
+            void* m=fn<void*(*)(void*,void**)>(ClassMethods)(w,&iter);if(!m)break;
+            const char* n=fn<const char*(*)(void*)>(MethodName)(m);if(!n)continue;
+            if(!(std::strstr(n,"Java")||std::strstr(n,"JS")||std::strstr(n,"Script")||std::strstr(n,"Module")||
+                 std::strstr(n,"Executor")||std::strstr(n,"Call")||std::strstr(n,"Eval")||std::strstr(n,"Run")||
+                 std::strstr(n,"Catalyst")||std::strstr(n,"Bridge")||std::strstr(n,"Invoke")))continue;
+            void* sig=fn<void*(*)(void*)>(MethodSignature)(m);
+            unsigned pc=sig?fn<unsigned(*)(void*)>(SignatureCount)(sig):0u;
+            const char* p0="";
+            if(sig&&pc){void* it=nullptr;void* pt=fn<void*(*)(void*,void**)>(SignatureParams)(sig,&it);
+                if(pt)p0=fn<const char*(*)(void*)>(TypeName)(pt);}
+            note("TILE JSBRIDGE %s::%s(%u) p0=%s",cn?cn:"?",n,pc,p0?p0:"");
+        }
+    }
+}
 // Ground-truth native event: instead of guessing the layout, let the runtime build it. A managed
 // IpcTypes.SceVoiceChat<Kind>Event (nested type, found through mono_class_get_nested_types) gets its dataJsonString set,
 // Marshal.StructureToPtr writes it into unmanaged memory exactly as the module's own marshalling expects, the pure
@@ -2186,6 +2210,10 @@ State run_native_tile_inject(){
         all_ctx[ci]=tile_get_context(all_insts[ci]);
         note("TILEINJECT inst[%d]=%p ctx=%p",ci,all_insts[ci],all_ctx[ci]);
     }
+    // Build A (read-only): dump the JS-bridge surface of the first live Control Center ReactContext,
+    // to learn how to run our own JS (addActionCard) in it. Pure reflection logging, invokes nothing.
+    note("TILEINJECT JSBRIDGE probe start contexts=%d",ninst);
+    for(int ci=0;ci<ninst;++ci)if(all_ctx[ci]){note("TILE JSBRIDGE === ctx[%d]=%p ===",ci,all_ctx[ci]);tile_dump_js_bridge(all_ctx[ci]);break;}
     // Resolve the emission tools: ConvertJsonStringToJObject, ReactContext, EventEmitterUtility.emitDeviceEvent
     void* m_convert=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"ConvertJsonStringToJObject",1);
     void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
