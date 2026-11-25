@@ -2645,7 +2645,155 @@ State run_bundle_dump(){
     const State result=wrote?State::Passed:State::Failed;
     publish(result);return result;
 }
+// ---- Mode::CCTileInject (lab): run OUR OWN JavaScript inside the Control Center's
+// Hermes runtime, the same door ZhiThemes uses to theme the Home. Every ShellUI
+// React Native app runs through ReactNative.JavaScriptCore.Executor.JSJavaScriptExecutor
+// (assembly ReactNative.PUI); we hook its RunScript(IJSBundle) and, for the bundle
+// whose path contains NPXS40003, call the private EvalScript(source,url) with
+// worker_dir/cc-tile.js BEFORE the bundle runs. A second hook on the private static
+// ConsoleLog(msg,level,error,userarg) copies our JS's "CCTILE ..." console lines to
+// worker.log. No PSN, no native Discord: only our JS, fed later by the homebrew core.
+// Once this ELF is installed, cc-tile.js can be iterated by FTP alone (read fresh on
+// every Control Center open). See overlay/cc-tile/cc-tile.js and homeui_js_inject.cpp
+// of ZhiThemes (github.com/Booskazed/ZhiThemess) for the mechanism.
+Hook cc_runscript_store,cc_consolelog_store;
+using RunScriptFn=void(*)(Object*,Object*);
+using ConsoleLogFn=void(*)(Object*,int,Object*,Object*);
+std::atomic<RunScriptFn> cc_runscript_original{nullptr};
+std::atomic<ConsoleLogFn> cc_consolelog_original{nullptr};
+void* cc_eval_method=nullptr; // JSJavaScriptExecutor.EvalScript (private), resolved before install
+int cc_eval_argc=2;
+std::atomic<int> cc_injected{0},cc_console_lines{0};
+// The method's prologue already carries a detour: a foreign "jmp [rip+0]" (FF 25, ZhiThemes
+// style) or our own "movabs rax,imm64; jmp rax" (48 B8 ... FF E0). Either way we must not hook
+// again (a second worker over a live one, or ZhiThemes still loaded): it would chain and crash.
+bool cc_prehooked(const std::uint8_t* b){
+    return (b[0]==0xFF&&b[1]==0x25)||(b[0]==0x48&&b[1]==0xB8&&b[10]==0xFF&&b[11]==0xE0);}
+// A MonoString's chars live at offset 20 (UTF-16), its length (int) at offset 16.
+bool cc_string_has(void* str,const char* needle){
+    if(!str)return false;int len=*(int*)((char*)str+16);
+    const unsigned short* u=(const unsigned short*)((char*)str+20);
+    int nl=(int)std::strlen(needle);if(nl<=0||len<nl)return false;
+    for(int i=0;i+nl<=len;++i){int j=0;for(;j<nl;++j){unsigned short c=u[i+j];if(c>=0x80||char(c)!=needle[j])break;}if(j==nl)return true;}
+    return false;}
+int cc_string_ascii(void* str,char* out,int cap){
+    if(!str||cap<=0){if(out&&cap>0)out[0]='\0';return 0;}int len=*(int*)((char*)str+16);
+    const unsigned short* u=(const unsigned short*)((char*)str+20);
+    int w=0;for(int i=0;i<len&&w<cap-1;++i)out[w++]=(u[i]<0x80)?char(u[i]):'?';out[w]='\0';return w;}
+// get_BundlePath, walking the bundle's class chain (BundlePath is declared on the concrete class).
+void* cc_bundle_path(void* bundle){
+    for(void* k=fn<void*(*)(void*)>(ObjectClass)(bundle);k;k=fn<void*(*)(void*)>(ClassParent)(k)){
+        void* prop=fn<void*(*)(void*,const char*)>(ClassProperty)(k,"BundlePath");if(!prop)continue;
+        Method* g=fn<Method*(*)(void*)>(PropertyGetter)(prop);if(!g)continue;
+        void* exc=nullptr;bool ok=false;void* r=invoke_ex(g,bundle,nullptr,ok,&exc);return ok?r:nullptr;}
+    return nullptr;}
+// UTF-8 -> \uXXXX for every non-ASCII byte: EvalScript sizes its buffer in UTF-16 units,
+// so UTF-8 accents would arrive truncated. Pure ASCII reads identically to Hermes.
+std::size_t cc_ascii_js(const char* in,std::size_t n,char* out,std::size_t cap){
+    static const char* hex="0123456789abcdef";std::size_t w=0;
+    auto put=[&](unsigned u){if(w+6<cap){out[w++]='\\';out[w++]='u';out[w++]=hex[(u>>12)&0xf];out[w++]=hex[(u>>8)&0xf];out[w++]=hex[(u>>4)&0xf];out[w++]=hex[u&0xf];}};
+    for(std::size_t i=0;i<n&&w<cap-1;){
+        unsigned char c=(unsigned char)in[i];
+        if(c<0x80){out[w++]=(char)c;++i;continue;}
+        std::size_t len=c>=0xf0?4:c>=0xe0?3:c>=0xc0?2:0;unsigned cp=len==4?c&7u:len==3?c&0xfu:c&0x1fu;
+        bool good=len&&i+len<=n;for(std::size_t k=1;good&&k<len;++k){unsigned char cc=(unsigned char)in[i+k];good=(cc&0xc0)==0x80;cp=(cp<<6)|(cc&0x3f);}
+        if(!good){out[w++]='?';++i;continue;}
+        if(cp>0xffff){cp-=0x10000;put(0xd800+(cp>>10));put(0xdc00+(cp&0x3ff));}else put(cp);
+        i+=len;}
+    out[w]='\0';return w;}
+// Read cc-tile.js fresh, escape to ASCII, and EvalScript it into this executor (JS thread).
+void cc_eval_file(Object* self){
+    if(!cc_eval_method||!self)return;
+    char p[256];if(!path(p,sizeof p,worker_dir,"cc-tile.js")){note("CCTILE path too long");return;}
+    FILE* f=std::fopen(p,"rb");if(!f){note("CCTILE no cc-tile.js (errno=%d)",errno);return;}
+    std::fseek(f,0,SEEK_END);long sz=std::ftell(f);std::fseek(f,0,SEEK_SET);
+    if(sz<=0||sz>(1<<20)){std::fclose(f);note("CCTILE cc-tile.js bad size %ld",sz);return;}
+    auto do_mmap=fn<MmapCall>(TargetMmap);auto do_munmap=fn<MunmapCall>(TargetMunmap);
+    if(!do_mmap||!do_munmap){std::fclose(f);note("CCTILE mmap unavailable");return;}
+    void* fail=reinterpret_cast<void*>(-1);
+    const std::size_t rawcap=((std::size_t)sz+0xffff)&~(std::size_t)0xffff;
+    const std::size_t esccap=((std::size_t)sz*6+0xffff)&~(std::size_t)0xffff;
+    char* raw=(char*)do_mmap(nullptr,rawcap,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    char* esc=(char*)do_mmap(nullptr,esccap,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+    if(!raw||raw==fail||!esc||esc==fail){std::fclose(f);note("CCTILE buffer mmap failed");
+        if(raw&&raw!=fail)do_munmap(raw,rawcap);if(esc&&esc!=fail)do_munmap(esc,esccap);return;}
+    std::size_t got=std::fread(raw,1,(std::size_t)sz,f);std::fclose(f);
+    if(got!=(std::size_t)sz){note("CCTILE read %zu/%ld",got,sz);do_munmap(raw,rawcap);do_munmap(esc,esccap);return;}
+    std::size_t elen=cc_ascii_js(raw,got,esc,esccap);
+    void* src=fn<void*(*)(void*,const char*)>(StringNew)(domain,esc);
+    void* url=fn<void*(*)(void*,const char*)>(StringNew)(domain,"cc-tile.js");
+    do_munmap(raw,rawcap);do_munmap(esc,esccap);
+    if(!src||!url){note("CCTILE string alloc failed");return;}
+    unsigned char is_js_module=0;void* args[3]={src,url,&is_js_module};
+    void* exc=nullptr;bool ok=false;invoke_ex((Method*)cc_eval_method,self,args,ok,&exc);
+    if(!ok){describe_exception("EvalScript",exc);note("CCTILE EvalScript threw");return;}
+    cc_injected.fetch_add(1,std::memory_order_relaxed);
+    note("CCTILE EvalScript ok src=%ld esc=%zu executor=%p",sz,elen,(void*)self);}
+void cc_runscript_hook(Object* self,Object* bundle){
+    RunScriptFn prior=cc_runscript_original.load(std::memory_order_acquire);
+    if(bundle&&self&&cc_eval_method){
+        void* bp=cc_bundle_path(bundle);
+        if(bp&&cc_string_has(bp,"NPXS40003")){
+            char b[160];cc_string_ascii(bp,b,sizeof b);note("CCTILE RunScript CC bundle=%s",b);
+            cc_eval_file(self);}}
+    if(prior)prior(self,bundle);}
+void cc_consolelog_hook(Object* msg,int level,Object* err,Object* arg){
+    if(msg){int len=*(int*)((char*)msg+16);const unsigned short* u=(const unsigned short*)((char*)msg+20);
+        static const char* tag="CCTILE";bool ours=len>=6;for(int i=0;ours&&i<6;++i)ours=(u[i]<0x80&&char(u[i])==tag[i]);
+        if(ours&&cc_console_lines.fetch_add(1,std::memory_order_relaxed)<4000){
+            char b[640];int w=0;for(int i=0;i<len&&w<(int)sizeof b-1;++i)b[w++]=(u[i]<0x80)?char(u[i]):'?';b[w]='\0';note("%s",b);}}
+    ConsoleLogFn prior=cc_consolelog_original.load(std::memory_order_acquire);
+    if(prior)prior(msg,level,err,arg);}
+State run_cc_tile_inject(){
+    publish(State::Observing);
+    note("CCTILE start pid=%d build=0x%016llx",int(getpid()),(unsigned long long)OVERLAY_BUILD);
+    domain=fn<void*(*)()>(RootDomain)();
+    if(!domain){note("CCTILE refused: Mono root domain missing");publish(State::Failed);return State::Failed;}
+    void* thread=fn<void*(*)(void*)>(ThreadAttach)(domain);
+    if(!thread){note("CCTILE refused: Mono thread attach");publish(State::Failed);return State::Failed;}
+    void* pui=image("/system_ex/common_ex/lib/ReactNative.PUI.dll");
+    const char* ns="ReactNative.JavaScriptCore.Executor";
+    void* ec=pui?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(pui,ns,"JSJavaScriptExecutor"):nullptr;
+    if(!ec&&pui)ec=fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(pui,ns,"JSCJavaScriptExecutor");
+    note("CCTILE PUI image=%p executor=%p",pui,ec);
+    if(!ec){note("CCTILE refused: executor class not found");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    void* m_run=method_inherited(ec,"RunScript",1);
+    cc_eval_method=method_inherited(ec,"EvalScript",2);cc_eval_argc=2;
+    if(!cc_eval_method){cc_eval_method=method_inherited(ec,"EvalScript",3);cc_eval_argc=3;}
+    void* m_log=method_inherited(ec,"ConsoleLog",4);
+    note("CCTILE methods run=%p eval=%p(argc=%d) consolelog=%p",m_run,cc_eval_method,cc_eval_argc,m_log);
+    if(!m_run||!cc_eval_method){note("CCTILE refused: RunScript/EvalScript missing");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    void* run_entry=fn<void*(*)(void*)>(CompileMethod)(m_run);
+    void* log_entry=m_log?fn<void*(*)(void*)>(CompileMethod)(m_log):nullptr;
+    note("CCTILE jit run=%p log=%p",run_entry,log_entry);
+    if(!run_entry){note("CCTILE refused: RunScript JIT entry null");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    auto query=fn<ProtectionQuery>(QueryProtection);
+    if(!prepare_hook(cc_runscript_store,run_entry,reinterpret_cast<void*>(&cc_runscript_hook),query,fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap),hook_step)){
+        note("CCTILE refused: RunScript prepare_hook failed");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    if(cc_prehooked(cc_runscript_store.before)){
+        note("CCTILE refused: RunScript already hooked (live worker or ZhiThemes still loaded)");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    cc_runscript_original.store(reinterpret_cast<RunScriptFn>(cc_runscript_store.trampoline),std::memory_order_release);
+    if(!install_hook(cc_runscript_store,query)){note("CCTILE refused: RunScript install failed");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    note("CCTILE RunScript hook installed");
+    if(log_entry&&prepare_hook(cc_consolelog_store,log_entry,reinterpret_cast<void*>(&cc_consolelog_hook),query,fn<MprotectCall>(TargetMprotect),fn<MmapCall>(TargetMmap),fn<MunmapCall>(TargetMunmap),hook_step)){
+        if(cc_prehooked(cc_consolelog_store.before)){note("CCTILE ConsoleLog already hooked; console capture off");}
+        else{cc_consolelog_original.store(reinterpret_cast<ConsoleLogFn>(cc_consolelog_store.trampoline),std::memory_order_release);
+            if(install_hook(cc_consolelog_store,query))note("CCTILE ConsoleLog hook installed");else note("CCTILE ConsoleLog install failed; console capture off");}}
+    else note("CCTILE ConsoleLog hook unavailable; console capture off");
+    note("CCTILE ready; open the Control Center. JS from %s/cc-tile.js",worker_dir);
+    for(;;){
+        std::uint64_t stop=0;if(read_file(worker_dir,"stop.bin",stop)&&stop==request.token)break;
+        if(now_ms()>=request.deadline_ms)break;
+        publish(State::Observing);usleep(200000);}
+    bool removed=true;
+    if(cc_consolelog_store.installed)removed&=remove_hook(cc_consolelog_store,query);
+    if(cc_runscript_store.installed)removed&=remove_hook(cc_runscript_store,query);
+    note("CCTILE stopping injected=%d console_lines=%d hooks_removed=%d",cc_injected.load(),cc_console_lines.load(),removed?1:0);
+    fn<void(*)(void*)>(ThreadDetach)(thread);
+    State result=cc_runscript_store.was_installed?(removed?State::Passed:State::RemoveFailed):State::Failed;
+    publish(result);return result;}
 State run(){
+    if(request.mode==Mode::CCTileInject)return run_cc_tile_inject();
     if(request.mode==Mode::AudioTest)return run_audio_test();
     if(request.mode==Mode::AudioRelay)return run_audio_relay();
     if(request.mode==Mode::PartyProbe)return run_party_probe();
@@ -2732,7 +2880,7 @@ extern "C" __attribute__((visibility("default"))) void* elf_main(void*){
     // The party probe (a lab tool) has its own lock: the audio worker holds worker.lock for hours, and a second
     // worker that does not get its lock returns without a word.
     Request peek;
-    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe||peek.mode==Mode::TileDiscord||peek.mode==Mode::BundleDump||peek.mode==Mode::NativeTileInject);
+    const bool probe=read_file(worker_dir,"request.bin",peek)&&(peek.mode==Mode::PartyProbe||peek.mode==Mode::SceneProbe||peek.mode==Mode::TileDiscord||peek.mode==Mode::BundleDump||peek.mode==Mode::NativeTileInject||peek.mode==Mode::CCTileInject);
     char p[256];if(!path(p,sizeof p,worker_dir,probe?"probe.lock":"worker.lock"))return nullptr;
     int lock=open(p,O_CREAT|O_RDWR,0600);if(lock<0)return nullptr;
     if(flock(lock,LOCK_EX|LOCK_NB)){close(lock);return nullptr;}
