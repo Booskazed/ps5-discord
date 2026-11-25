@@ -44,5 +44,6 @@ jobs:
             overlay/build/overlay-sceneprobe.elf
             overlay/build/overlay-tilediscord.elf
             overlay/build/overlay-nativetileinject.elf
+            overlay/build/overlay-restart.elf
           if-no-files-found: warn
           retention-days: 14
