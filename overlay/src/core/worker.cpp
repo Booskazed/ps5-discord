@@ -2157,8 +2157,11 @@ State run_native_tile_inject(){
     void* rnk=rn?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(rn,"ReactNative.Modules.ShellUI.VoiceChat","VoiceChatModule"):nullptr;
     note("TILEINJECT RN VoiceChatModule class=%p",rnk);
     if(!rnk){fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
-    // Find instance through static m_cblist → GCCallBackList → enumerate delegates → target is VoiceChatModule
+    // Find ALL instances through static m_cblist → GCCallBackList → enumerate delegates.
+    // ShellUI has multiple React instances (home, control center, settings, etc.); the tile
+    // handler may live in any of them, so we collect all and emit to every context.
     void* inst_rn=nullptr;
+    void* all_insts[16];int ninst=0;
     {void* it=nullptr;
      for(int i=0;i<256;++i){
          void* f=fn<void*(*)(void*,void**)>(ClassFields)(rnk,&it);if(!f)break;
@@ -2173,18 +2176,24 @@ State run_native_tile_inject(){
          fn<void(*)(void*,void*,void*)>(MonoFieldStaticGet)(vt,f,&val);
          note("TILEINJECT m_cblist=%p",val);
          if(!val)break;
-         inst_rn=tile_enum_callbacks(*(void**)((char*)val+16),rnk);
-         note("TILEINJECT RN module instance=%p",inst_rn);
+         inst_rn=tile_enum_callbacks(*(void**)((char*)val+16),rnk,all_insts,&ninst,16);
+         note("TILEINJECT RN instances=%d first=%p",ninst,inst_rn);
          break;}}
     if(!inst_rn){note("TILEINJECT no VoiceChatModule instance found");fn<void(*)(void*)>(ThreadDetach)(thread);publish(State::Failed);return State::Failed;}
+    // Collect contexts for ALL instances and log them
+    void* all_ctx[16]={};
+    for(int ci=0;ci<ninst;++ci){
+        all_ctx[ci]=tile_get_context(all_insts[ci]);
+        note("TILEINJECT inst[%d]=%p ctx=%p",ci,all_insts[ci],all_ctx[ci]);
+    }
     // Resolve the emission tools: ConvertJsonStringToJObject, ReactContext, EventEmitterUtility.emitDeviceEvent
     void* m_convert=fn<void*(*)(void*,const char*,int)>(MethodFromName)(rnk,"ConvertJsonStringToJObject",1);
-    void* ctx=tile_get_context(inst_rn);
+    void* ctx=all_ctx[0];
     void* cimg=image("/system_ex/common_ex/lib/ReactNative.Vsh.Common.dll");
     void* eu=cimg?fn<void*(*)(void*,const char*,const char*)>(ClassFromName)(cimg,"ReactNative.Vsh.Common","EventEmitterUtility"):nullptr;
     void* m_emit=eu?tile_find_method(eu,"emitDeviceEvent",3,"ReactNative.Bridge.ReactContext"):nullptr;
-    note("TILEINJECT convert=%p ctx=%p emitter=%p emit=%p",m_convert,ctx,eu,m_emit);
-    if(!m_convert||!ctx||!m_emit){
+    note("TILEINJECT convert=%p emitter=%p emit=%p",m_convert,eu,m_emit);
+    if(!m_convert||!m_emit){
         note("TILEINJECT emission pipeline incomplete, falling back to handler path");
     }
     // Also resolve the VoiceChatModule handler dictionary path (fallback / voiceChat events)
@@ -2332,85 +2341,80 @@ State run_native_tile_inject(){
             void* jobj_channel=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,ca,&ex):nullptr;
             if(ex){note("TILEINJECT convert channel exception");ex=nullptr;}
             if(emit_count<=2) note("TILEINJECT payloads daemon=%p channel=%p",jobj_daemon,jobj_channel);
-            // Path A: voiceChatDaemonEvent "init" — tells Mono the voice daemon is active
+            // ---- MULTI-CONTEXT EMISSION: emit to ALL React contexts, not just the first. ----
+            // ShellUI has multiple React instances (home screen, control center, etc.); only one
+            // has the active VoiceChat listener. Emitting to all avoids guessing the right one.
+            // On the first emission round, also send a test event per context (type "probe_N") to
+            // identify which context has the daemon handler (it logs "unknown daemon event" for
+            // unrecognised types).
+            for(int ci=0;ci<ninst;++ci){
+                void* cctx=all_ctx[ci];
+                if(!cctx)continue;
+                // On the first round only, emit a per-context probe to identify the listening context
+                if(emit_count==1&&jobj_daemon&&m_emit&&m_convert){
+                    char probe_json[256];
+                    std::snprintf(probe_json,sizeof probe_json,
+                        "{\"header\":{\"type\":\"probe_%d\"},\"data\":{\"errorCode\":0}}",ci);
+                    void* js_p=fn<void*(*)(void*,const char*)>(StringNew)(domain,probe_json);
+                    void* pa2[1]={js_p};ex=nullptr;
+                    void* jobj_probe=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,all_insts[ci],pa2,&ex);
+                    if(jobj_probe){
+                        void* pn2=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventVshNMVoiceChat");
+                        void* pargs2[3]={cctx,pn2,jobj_probe};
+                        ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,pargs2,&ex);
+                        note("TILEINJECT PROBE ctx[%d]=%p daemon emit %s",ci,cctx,ex?"exception":"ok");
+                    }
+                }
+                // Path I: voiceChatDaemonEventVshNMVoiceChat to this context
+                if(jobj_daemon&&m_emit){
+                    void* in1=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventVshNMVoiceChat");
+                    void* ia1[3]={cctx,in1,jobj_daemon};
+                    ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ia1,&ex);
+                    if(emit_count<=2) note("TILEINJECT I ctx[%d] daemonVshNM %s",ci,ex?"exception":"ok");
+                }
+                // Path J: voiceChatChannelEventVshNMVoiceChat to this context
+                if(jobj_channel&&m_emit){
+                    void* jn1=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEventVshNMVoiceChat");
+                    void* ja1[3]={cctx,jn1,jobj_channel};
+                    ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ja1,&ex);
+                    if(emit_count<=2) note("TILEINJECT J ctx[%d] channelVshNM %s",ci,ex?"exception":"ok");
+                }
+                // Path C: voiceChatDaemonEventForAutoMounter to this context
+                if(jobj_daemon&&m_emit){
+                    void* an=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventForAutoMounter");
+                    void* aargs[3]={cctx,an,jobj_daemon};
+                    ex=nullptr;
+                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,aargs,&ex);
+                    if(emit_count<=2) note("TILEINJECT C ctx[%d] autoMounter %s",ci,ex?"exception":"ok");
+                }
+                // Path E: partySessionListEventVshNMVoiceChat to this context
+                if(m_emit&&m_convert){
+                    static const char psl_json[]=
+                        "{\"header\":{\"type\":\"sessionCreated\"},\"data\":{\"channels\":["
+                        "{\"channelType\":\"DISCORD\",\"channelId\":\"discord-1\","
+                        "\"activeChannelId\":\"discord-1\"}]}}";
+                    void* js_psl=fn<void*(*)(void*,const char*)>(StringNew)(domain,psl_json);
+                    void* pa[1]={js_psl};ex=nullptr;
+                    void* jobj_psl=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,all_insts[ci],pa,&ex);
+                    if(jobj_psl){
+                        void* pn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionListEventVshNMVoiceChat");
+                        void* pargs[3]={cctx,pn,jobj_psl};
+                        ex=nullptr;
+                        fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,pargs,&ex);
+                        if(emit_count<=2) note("TILEINJECT E ctx[%d] partySessionList %s",ci,ex?"exception":"ok");
+                    }
+                }
+            }
+            // Also emit bare-name events (original Path A/B) on ctx[0] for backward compat
             if(jobj_daemon&&m_emit&&ctx){
                 void* dn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEvent");
                 void* dargs[3]={ctx,dn,jobj_daemon};
                 ex=nullptr;
                 fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,dargs,&ex);
                 if(emit_count<=2) note("TILEINJECT A daemon emit %s",ex?"exception":"ok");
-            }
-            // Path B: voiceChatChannelEvent "sessionUpdated" — tells Mono about the Discord channel
-            if(jobj_channel&&m_emit&&ctx){
-                void* cn2=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEvent");
-                void* cargs[3]={ctx,cn2,jobj_channel};
-                ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,cargs,&ex);
-                if(emit_count<=2) note("TILEINJECT B channel emit %s",ex?"exception":"ok");
-            }
-            // Path C: voiceChatDaemonEventForAutoMounter — JS AutoMounter trigger
-            if(jobj_daemon&&m_emit&&ctx){
-                void* an=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventForAutoMounter");
-                void* aargs[3]={ctx,an,jobj_daemon};
-                ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,aargs,&ex);
-                if(emit_count<=2) note("TILEINJECT C autoMounter emit %s",ex?"exception":"ok");
-            }
-            // Path E: partySessionListEventVshNMVoiceChat — the JS event name for session list updates.
-            // This is the name JS actually subscribes to (confirmed: reached JS in a prior test).
-            // Use "sessionCreated" as header.type since we're declaring a new Discord session exists.
-            if(m_emit&&ctx&&m_convert){
-                static const char psl_json[]=
-                    "{\"header\":{\"type\":\"sessionCreated\"},\"data\":{\"channels\":["
-                    "{\"channelType\":\"DISCORD\",\"channelId\":\"discord-1\","
-                    "\"activeChannelId\":\"discord-1\"}]}}";
-                void* js_psl=fn<void*(*)(void*,const char*)>(StringNew)(domain,psl_json);
-                void* pa[1]={js_psl};ex=nullptr;
-                void* jobj_psl=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,pa,&ex);
-                if(jobj_psl){
-                    void* pn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionListEventVshNMVoiceChat");
-                    void* pargs[3]={ctx,pn,jobj_psl};
-                    ex=nullptr;
-                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,pargs,&ex);
-                    if(emit_count<=2) note("TILEINJECT E partySessionList emit %s",ex?"exception":"ok");
-                }
-            }
-            // Path F: partySessionEventVshNMVoiceChat — individual session event
-            if(m_emit&&ctx&&m_convert){
-                static const char pse_json[]=
-                    "{\"header\":{\"type\":\"sessionCreated\"},\"data\":{\"channels\":["
-                    "{\"channelType\":\"DISCORD\",\"channelId\":\"discord-1\","
-                    "\"activeChannelId\":\"discord-1\"}]}}";
-                void* js_pse=fn<void*(*)(void*,const char*)>(StringNew)(domain,pse_json);
-                void* qa[1]={js_pse};ex=nullptr;
-                void* jobj_pse=fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,qa,&ex);
-                if(jobj_pse){
-                    void* qn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionEventVshNMVoiceChat");
-                    void* qargs[3]={ctx,qn,jobj_pse};
-                    ex=nullptr;
-                    fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,qargs,&ex);
-                    if(emit_count<=2) note("TILEINJECT F partySessionEvent emit %s",ex?"exception":"ok");
-                }
-            }
-            // Path I: voiceChatDaemonEventVshNMVoiceChat — the REAL JS event name with VshNM module suffix.
-            // All 9 confirmed JS event names use this suffix pattern. The native module emits
-            // "voiceChatDaemonEvent" and the RN bridge adds "VshNMVoiceChat". Since we bypass the
-            // bridge, we must add the suffix ourselves. This name doesn't appear as a literal in HBC
-            // because JS constructs it dynamically from the module name.
-            if(jobj_daemon&&m_emit&&ctx){
-                void* in1=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventVshNMVoiceChat");
-                void* ia1[3]={ctx,in1,jobj_daemon};
-                ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ia1,&ex);
-                if(emit_count<=2) note("TILEINJECT I daemonVshNM emit %s",ex?"exception":"ok");
-            }
-            // Path J: voiceChatChannelEventVshNMVoiceChat — channel event with VshNM suffix
-            if(jobj_channel&&m_emit&&ctx){
-                void* jn1=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEventVshNMVoiceChat");
-                void* ja1[3]={ctx,jn1,jobj_channel};
-                ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ja1,&ex);
-                if(emit_count<=2) note("TILEINJECT J channelVshNM emit %s",ex?"exception":"ok");
             }
             // Path G: invoke the voiceChatModuleEventHandlerDic handlers directly.
             if(vcm_inst){
