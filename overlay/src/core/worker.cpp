@@ -2258,73 +2258,62 @@ State run_native_tile_inject(){
             note("TILEINJECT new state (%d bytes), emitting events",json_len);
             std::memcpy(last_json,json_buf,sizeof last_json);
             ++emit_count;
-            // Build differentiated payloads per event type. Each JS handler (AutoMounter,
-            // PartySessionListEventHandler, PartySessionEventHandler) expects a specific envelope;
-            // sending raw session data to all of them triggers "unknown party session list event".
-            // --- jobj_raw: the raw tile-state.json as JObject (for voiceChatChannelEvent) ---
-            void* js_raw=fn<void*(*)(void*,const char*)>(StringNew)(domain,json_buf);
-            void* ra[1]={js_raw};ex=nullptr;
-            void* jobj_raw=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,ra,&ex):nullptr;
-            if(ex){note("TILEINJECT convert raw exception");ex=nullptr;}
-            // --- jobj_daemon: minimal signal for the AutoMounter ---
-            void* js_d=fn<void*(*)(void*,const char*)>(StringNew)(domain,"{}");
+            // Build payloads matching the REAL VoiceChatModule JObject format discovered from
+            // Sce.Vsh.ShellUI.VoiceChat.dll.sprx UTF-16 string analysis:
+            //   {header:{type:"<string>"},data:{...}}
+            // Event names: voiceChatDaemonEvent (daemon state) and voiceChatChannelEvent (session data).
+            // Channel types include "DISCORD" — a first-class value in Sony's enum.
+            // The JS code that listens for these events handles the AutoMounter trigger and
+            // PartySessionList updates internally — we don't need to emit to secondary event names.
+            // --- jobj_daemon: daemon init event (triggers AutoMounter + voice system) ---
+            static const char daemon_json[]=
+                "{\"header\":{\"type\":\"init\"},\"data\":{\"errorCode\":0,\"daemonState\":1,"
+                "\"isMicConnected\":true,\"isMicMuted\":false,\"isConnectionLost\":false,"
+                "\"connectionStateChanged\":false,\"sharePartyAudio\":false,"
+                "\"sharePartyAudioForGls\":false,\"sharePartyAudioForRec\":false}}";
+            void* js_d=fn<void*(*)(void*,const char*)>(StringNew)(domain,daemon_json);
             void* da[1]={js_d};ex=nullptr;
             void* jobj_daemon=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,da,&ex):nullptr;
             if(ex){note("TILEINJECT convert daemon exception");ex=nullptr;}
-            // --- jobj_list: event envelope for PartySessionListEventHandler ---
-            char list_json[8192];
-            std::snprintf(list_json,sizeof list_json,
-                "{\"eventType\":\"created\",\"partySessions\":[%s]}",json_buf);
-            void* js_l=fn<void*(*)(void*,const char*)>(StringNew)(domain,list_json);
-            void* la[1]={js_l};ex=nullptr;
-            void* jobj_list=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,la,&ex):nullptr;
-            if(ex){note("TILEINJECT convert list exception");ex=nullptr;}
-            // --- jobj_sess: event envelope for PartySessionEventHandler ---
-            char sess_json[8192];
-            std::snprintf(sess_json,sizeof sess_json,
-                "{\"eventType\":\"created\",\"partySession\":%s}",json_buf);
-            void* js_s=fn<void*(*)(void*,const char*)>(StringNew)(domain,sess_json);
-            void* sa[1]={js_s};ex=nullptr;
-            void* jobj_sess=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,sa,&ex):nullptr;
-            if(ex){note("TILEINJECT convert sess exception");ex=nullptr;}
-            if(emit_count<=2) note("TILEINJECT payloads raw=%p daemon=%p list=%p sess=%p",jobj_raw,jobj_daemon,jobj_list,jobj_sess);
-            // Path 0: voiceChatDaemonEventForAutoMounter — minimal signal to create/show the tile
+            // --- jobj_channel: channel sessionUpdated event (Discord channel data) ---
+            char channel_json[8192];
+            std::snprintf(channel_json,sizeof channel_json,
+                "{\"header\":{\"type\":\"sessionUpdated\"},\"data\":{\"channels\":["
+                "{\"channelType\":\"DISCORD\",\"channelId\":\"discord-1\","
+                "\"activeChannelId\":\"discord-1\"}]}}");
+            void* js_c=fn<void*(*)(void*,const char*)>(StringNew)(domain,channel_json);
+            void* ca[1]={js_c};ex=nullptr;
+            void* jobj_channel=m_convert?fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_convert,inst_rn,ca,&ex):nullptr;
+            if(ex){note("TILEINJECT convert channel exception");ex=nullptr;}
+            if(emit_count<=2) note("TILEINJECT payloads daemon=%p channel=%p",jobj_daemon,jobj_channel);
+            // Path A: voiceChatDaemonEvent "init" — tells JS the voice daemon is active
             if(jobj_daemon&&m_emit&&ctx){
-                void* am_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventForAutoMounter");
-                void* am_args[3]={ctx,am_name,jobj_daemon};
+                void* dn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEvent");
+                void* dargs[3]={ctx,dn,jobj_daemon};
                 ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,am_args,&ex);
-                if(emit_count<=2) note("TILEINJECT autoMounter emit %s",ex?"exception":"ok");
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,dargs,&ex);
+                if(emit_count<=2) note("TILEINJECT daemon init emit %s",ex?"exception":"ok");
             }
-            // Path 1: voiceChatChannelEvent with raw session data (PartyStatusMonitor via JS)
-            if(jobj_raw&&m_emit&&ctx){
-                void* name_str=fn<void*(*)(void*,const char*)>(StringNew)(domain,evt_name);
-                void* eargs[3]={ctx,name_str,jobj_raw};
+            // Path B: voiceChatChannelEvent "sessionUpdated" with DISCORD channel
+            if(jobj_channel&&m_emit&&ctx){
+                void* cn=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatChannelEvent");
+                void* cargs[3]={ctx,cn,jobj_channel};
                 ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,eargs,&ex);
-                if(emit_count<=2) note("TILEINJECT voiceChatChannel emit %s",ex?"exception":"ok");
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,cargs,&ex);
+                if(emit_count<=2) note("TILEINJECT channel sessionUpdated emit %s",ex?"exception":"ok");
             }
-            // Path 2 (handler.Invoke) SKIPPED: resets m_isInParty
-            // Path 3: keep PartyStatusMonitor.m_isInParty=1
+            // Path C: also emit to voiceChatDaemonEventForAutoMounter as fallback
+            if(jobj_daemon&&m_emit&&ctx){
+                void* an=fn<void*(*)(void*,const char*)>(StringNew)(domain,"voiceChatDaemonEventForAutoMounter");
+                void* aargs[3]={ctx,an,jobj_daemon};
+                ex=nullptr;
+                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,aargs,&ex);
+                if(emit_count<=2) note("TILEINJECT autoMounter fallback emit %s",ex?"exception":"ok");
+            }
+            // Path D: keep PartyStatusMonitor.m_isInParty=1
             if(psm){*((unsigned char*)psm+32)=1;
                 if(emit_count<=1) tile_observe(vcm_inst,"after-force");}
-            // Path 4: partySessionListEventVshNMVoiceChat with "created" envelope
-            if(jobj_list&&m_emit&&ctx){
-                void* ps_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionListEventVshNMVoiceChat");
-                void* ps_args[3]={ctx,ps_name,jobj_list};
-                ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,ps_args,&ex);
-                if(emit_count<=2) note("TILEINJECT partySessionList emit %s",ex?"exception":"ok");
-            }
-            // Path 5: partySessionEventVshNMVoiceChat with "created" envelope
-            if(jobj_sess&&m_emit&&ctx){
-                void* pe_name=fn<void*(*)(void*,const char*)>(StringNew)(domain,"partySessionEventVshNMVoiceChat");
-                void* pe_args[3]={ctx,pe_name,jobj_sess};
-                ex=nullptr;
-                fn<void*(*)(void*,void*,void**,void**)>(RuntimeInvoke)(m_emit,nullptr,pe_args,&ex);
-                if(emit_count<=2) note("TILEINJECT partySessionEvent emit %s",ex?"exception":"ok");
-            }
-            if(!jobj_raw&&!jobj_list) note("TILEINJECT convert failed or no emission path");
+            if(!jobj_daemon&&!jobj_channel) note("TILEINJECT convert failed or no emission path");
         }
         usleep(2000000); // 2s between reads
     }
