@@ -38,7 +38,8 @@ jobs:
         run: make overlay
       - name: Overlay worker self-test (pad hook + resampler, sanitized host build)
         run: |
-          make -C overlay build/worker-test
+          # The overlay host tests use Clang-only sanitizer flags (-fno-sanitize=function).
+          make -C overlay build/worker-test CXX=clang++
           ./overlay/build/worker-test
       - name: Check the files were built for PPSA99073
         run: |
