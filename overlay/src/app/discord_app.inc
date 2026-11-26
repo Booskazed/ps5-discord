@@ -7,7 +7,7 @@
 //  - the talking-only card (C): up to three talkers, avatars, rings, names and bars;
 //    no empty card. Its own corner has 31/34 px edge insets. When both share a corner,
 //    the card sits 14 px inward from the pill. Bottom cards grow upward.
-//  - the call panel (A): holding Options or L3+R3 opens it on the right edge: the call and
+//  - the call panel (A): holding Options opens it on the right edge: the call and
 //    its timer, up to four people (avatar, talking ring and bars, muted marks), the four
 //    actions as tiles (Mute, Deafen, Go Live, Leave) and the button hints. D-pad left/right
 //    or the stick moves, Cross acts, Circle closes. The game does not get those presses.
