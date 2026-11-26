@@ -30,6 +30,11 @@ All notable changes to this project are documented here. The format follows
   with the new standalone pill lab (`overlay/`, `make pill-lab`).
 
 ### Fixed
+- In-game overlay: the panel opens on **Hold Options only**; the L3+R3 chord is removed (it
+  fired by accident in games, where L3 and R3 are the sticks).
+- The ShellUI voice worker's playback resampler now carries its interpolation phase across
+  grains, so a steady ~187 Hz crackle no longer appears while the call audio is continuous
+  (many speakers, or someone speaking loudly); the drain rate is unchanged.
 - Controller audio forwards the physical PS button so the console can open its
   control center while USB microphone and speaker capture stays active.
 - Wireless Go Live keeps streaming through a game launch (each HDMI change recovers), attaches
