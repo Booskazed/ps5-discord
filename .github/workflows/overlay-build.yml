@@ -1,0 +1,60 @@
+# Overlay-only community build (fast): compiles just the in-game overlay for the side-by-side
+# edition (PPSA99073) and uploads the files you hot-swap into the app's assets/ without rebuilding
+# the core or the app -- the visual overlay (overlay-service.elf, packaged as assets/overlay.elf),
+# overlay-restart.elf, overlay.build, and the standalone voice worker overlay-audiorelay.elf.
+# No libdave, no FFmpeg, no core, no app package, so it finishes in a few minutes. Manual only.
+name: overlay-build
+
+on:
+  push:
+    branches: ['fix/**', 'lab/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Read by the Makefiles (root + overlay): build the overlay for the side-by-side edition so it
+  # reads its art from /user/data/homebrew/PPSA99073 instead of falling back to the stock PPSA99072.
+  EDITION_TITLE_ID: PPSA99073
+  EDITION_DATA_DIR: /data/ps5-discord-community
+
+jobs:
+  overlay:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang lld llvm cmake ninja-build perl unzip curl wget python3 git xz-utils ca-certificates
+          for t in ar ranlib; do
+            command -v llvm-$t >/dev/null || sudo ln -s "$(ls /usr/bin/llvm-$t-* | sort -V | tail -1)" /usr/local/bin/llvm-$t
+          done
+      - name: make deps (pinned SDK and sources)
+        run: make deps
+      - name: Build the overlay (side-by-side edition)
+        run: make overlay
+      - name: Check the files were built for PPSA99073
+        run: |
+          for f in overlay/build/overlay-service.elf overlay/build/overlay-restart.elf overlay/build/overlay.build overlay/build/overlay-audiorelay.elf; do
+            test -s "$f" || { echo "::error::$f was not built"; exit 1; }
+          done
+          grep -a -q -F "/user/data/homebrew/PPSA99073" overlay/build/overlay-service.elf || { echo "::error::the overlay was not built for the PPSA99073 edition"; exit 1; }
+          ls -l overlay/build/overlay-service.elf overlay/build/overlay-restart.elf overlay/build/overlay.build overlay/build/overlay-audiorelay.elf
+      - name: Lay the files out the way they install into assets/ (overlay-service.elf -> overlay.elf)
+        run: |
+          mkdir -p out/assets
+          cp overlay/build/overlay-service.elf    out/assets/overlay.elf
+          cp overlay/build/overlay-restart.elf     out/assets/overlay-restart.elf
+          cp overlay/build/overlay.build           out/assets/overlay.build
+          cp overlay/build/overlay-audiorelay.elf  out/assets/overlay-audiorelay.elf
+          (cd out/assets && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+      - name: Upload the overlay files
+        uses: actions/upload-artifact@v4
+        with:
+          name: overlay-PPSA99073-run${{ github.run_number }}
+          path: out/assets/
+          if-no-files-found: error
+          retention-days: 14
