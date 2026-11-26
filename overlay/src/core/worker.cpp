@@ -935,11 +935,10 @@ PadData pad_hook(int device){
     pad_polls.fetch_add(1,std::memory_order_relaxed);
     std::uint32_t buttons=data.buttons;
     last_buttons.store(buttons,std::memory_order_relaxed);
-    if((buttons&(bit_l3|bit_r3))==(bit_l3|bit_r3)){
-        if(!chord_held.exchange(true,std::memory_order_relaxed)){
-            chords.fetch_add(1,std::memory_order_relaxed);
-            gesture_requested.store(true,std::memory_order_release);}}
-    else chord_held.store(false,std::memory_order_relaxed);
+    // The L3+R3 chord is intentionally disabled: it fired by accident inside games (L3 and R3
+    // are the sticks). Holding Options is the only way to open/close the panel now. bit_l3/bit_r3
+    // stay defined because the captured pad below still excludes them. chord_held is now unused.
+    (void)chord_held;
     if(buttons&bit_options){
         const std::uint64_t now=now_ms(),since=options_since.load(std::memory_order_relaxed);
         if(!since)options_since.store(now,std::memory_order_relaxed);
@@ -1282,6 +1281,7 @@ State run_audio_direct(char key[64]){
     std::uint64_t last_stop_check=0;
     std::uint64_t pass_max=0,slow_passes=0,send_eagain=0,dropped_bytes=0,compressed=0; // timing evidence, logged with the mic level
     bool compressing=false;
+    double resample_phase=0.0; // carried across compressing grains so the boundary never steps (no crackle)
     std::uint64_t last_beat=0,fail_streak=0;
     // Playback queue marks (bytes of stereo S16): the console's audio clock runs 0.5-1.3 % slower than the
     // core's 20 ms mix clock (measured 2026-11-23: the queue sat at its 32 KB cap and dropped 2-3 grains a
@@ -1340,19 +1340,27 @@ State run_audio_direct(char key[64]){
         bool busy=false;
         if(pending_len>=sizeof grain){
             if(pending_len>kHigh)compressing=true;else if(pending_len<kLow)compressing=false;
-            if(compressing&&pending_len>=261*4){
-                // 260 input frames become the 256 of this grain (linear interpolation, +1.6 % speed: below hearing).
-                alignas(64) std::int16_t src[264*2];
-                std::memcpy(src,pending,261*4);
+            if(compressing&&pending_len>=262*4){
+                // Drain 1.6 % faster by resampling 260 input frames into this grain's 256, but carry the
+                // fractional read phase across grains (resample_phase). The old code reset the phase to 0
+                // every grain, so each grain boundary was a tiny step -- a steady ~187 Hz crackle while the
+                // queue stayed full (many speakers / someone loud = continuous audio). Linear interpolation.
+                alignas(64) std::int16_t src[262*2];
+                std::memcpy(src,pending,262*4); // 262 frames: enough look-ahead for the carried phase
+                double pos=resample_phase;
                 for(int j=0;j<256;j++){
-                    const double pos=double(j)*260.0/256.0;const int i0=int(pos);const double fr=pos-double(i0);
+                    const int i0=int(pos);const double fr=pos-double(i0);
                     for(int c=0;c<2;c++){
                         const double a=src[i0*2+c],b=src[(i0+1)*2+c];
                         grain[j*2+c]=std::int16_t(a+(b-a)*fr);
                     }
+                    pos+=260.0/256.0;
                 }
-                std::memmove(pending,pending+260*4,pending_len-260*4);pending_len-=260*4;++compressed;
+                const std::size_t consumed=std::size_t(pos); // whole input frames used this grain (~260)
+                resample_phase=pos-double(consumed);          // keep the fraction for the next grain
+                std::memmove(pending,pending+consumed*4,pending_len-consumed*4);pending_len-=consumed*4;++compressed;
             } else {
+                resample_phase=0.0; // not compressing: a whole grain is copied as-is, the phase does not carry
                 std::memcpy(grain,pending,sizeof grain);
                 std::memmove(pending,pending+sizeof grain,pending_len-sizeof grain);pending_len-=sizeof grain;
             }
