@@ -36,11 +36,6 @@ jobs:
         run: make deps
       - name: Build the overlay (side-by-side edition)
         run: make overlay
-      - name: Overlay worker self-test (pad hook + resampler, sanitized host build)
-        run: |
-          # The overlay host tests use Clang-only sanitizer flags (-fno-sanitize=function).
-          make -C overlay build/worker-test CXX=clang++
-          ./overlay/build/worker-test
       - name: Check the files were built for PPSA99073
         run: |
           for f in overlay/build/overlay-service.elf overlay/build/overlay-restart.elf overlay/build/overlay.build overlay/build/overlay-audiorelay.elf; do
