@@ -1053,7 +1053,8 @@ State run_audio_direct(char key[64]){
                 // fractional read phase across grains (resample_phase). The old code reset the phase to 0
                 // every grain, so each grain boundary was a tiny step -- a steady ~187 Hz crackle while the
                 // queue stayed full (many speakers / someone loud = continuous audio). Linear interpolation.
-                const std::int16_t* src=reinterpret_cast<const std::int16_t*>(pending);
+                alignas(64) std::int16_t src[262*2];
+                std::memcpy(src,pending,262*4); // 262 frames: enough look-ahead for the carried phase
                 double pos=resample_phase;
                 for(int j=0;j<256;j++){
                     const int i0=int(pos);const double fr=pos-double(i0);
